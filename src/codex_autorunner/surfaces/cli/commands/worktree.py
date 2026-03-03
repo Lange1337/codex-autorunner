@@ -1,4 +1,5 @@
 import json
+import shlex
 from pathlib import Path
 from typing import Callable, List, Optional
 
@@ -8,7 +9,21 @@ from ....core.config import HubConfig
 from ....core.hub import HubSupervisor
 
 
-def _worktree_snapshot_payload(snapshot) -> dict:
+def _worktree_recommended_actions(
+    worktree_repo_id: str, *, hub_path: Optional[Path] = None
+) -> list[str]:
+    hub_suffix = ""
+    if hub_path is not None:
+        hub_suffix = f" --path {shlex.quote(str(hub_path))}"
+    return [
+        f"car hub worktree archive {worktree_repo_id}{hub_suffix}",
+        f"car hub worktree cleanup {worktree_repo_id}{hub_suffix}",
+        f"car hub destination show {worktree_repo_id}{hub_suffix}",
+    ]
+
+
+def _worktree_snapshot_payload(snapshot, *, hub_path: Optional[Path] = None) -> dict:
+    recommended_actions = _worktree_recommended_actions(snapshot.id, hub_path=hub_path)
     return {
         "id": snapshot.id,
         "worktree_of": snapshot.worktree_of,
@@ -17,6 +32,8 @@ def _worktree_snapshot_payload(snapshot) -> dict:
         "initialized": snapshot.initialized,
         "exists_on_disk": snapshot.exists_on_disk,
         "status": snapshot.status.value,
+        "recommended_command": recommended_actions[0],
+        "recommended_actions": recommended_actions,
     }
 
 
@@ -61,6 +78,7 @@ def register_worktree_commands(
             help="Optional git ref to branch from (default: origin/<default-branch>)",
         ),
     ):
+        """Create a new worktree from a base repo branch."""
         config = require_hub_config(hub)
         supervisor = build_supervisor(config)
         try:
@@ -83,6 +101,7 @@ def register_worktree_commands(
         ),
         output_json: bool = typer.Option(False, "--json", help="Emit JSON output"),
     ):
+        """List hub worktrees and print canonical lifecycle commands."""
         config = require_hub_config(hub)
         supervisor = build_supervisor(config)
         snapshots = [
@@ -90,7 +109,10 @@ def register_worktree_commands(
             for snapshot in supervisor.list_repos(use_cache=False)
             if snapshot.kind == "worktree"
         ]
-        payload = [_worktree_snapshot_payload(snapshot) for snapshot in snapshots]
+        payload = [
+            _worktree_snapshot_payload(snapshot, hub_path=config.root)
+            for snapshot in snapshots
+        ]
         if output_json:
             typer.echo(json.dumps({"worktrees": payload}, indent=2))
             return
@@ -104,6 +126,7 @@ def register_worktree_commands(
                     **item
                 )
             )
+            typer.echo(f"    recommended: {item['recommended_command']}")
 
     @worktree_app.command("scan")
     def hub_worktree_scan(
@@ -112,10 +135,14 @@ def register_worktree_commands(
         ),
         output_json: bool = typer.Option(False, "--json", help="Emit JSON output"),
     ):
+        """Rescan hub worktrees from disk and print canonical lifecycle commands."""
         config = require_hub_config(hub)
         supervisor = build_supervisor(config)
         snapshots = [snap for snap in supervisor.scan() if snap.kind == "worktree"]
-        payload = [_worktree_snapshot_payload(snapshot) for snapshot in snapshots]
+        payload = [
+            _worktree_snapshot_payload(snapshot, hub_path=config.root)
+            for snapshot in snapshots
+        ]
         if output_json:
             typer.echo(json.dumps({"worktrees": payload}, indent=2))
             return
@@ -129,6 +156,7 @@ def register_worktree_commands(
                     **item
                 )
             )
+            typer.echo(f"    recommended: {item['recommended_command']}")
 
     @worktree_app.command("cleanup")
     def hub_worktree_cleanup(
@@ -159,6 +187,12 @@ def register_worktree_commands(
             None, "--archive-note", help="Optional archive note"
         ),
     ):
+        """Cleanup a worktree repo and optionally delete branches.
+
+        Safety:
+        This removes the worktree from disk. Keep archive enabled unless you are
+        intentionally discarding artifacts.
+        """
         config = require_hub_config(hub)
         supervisor = build_supervisor(config)
         try:
@@ -199,6 +233,12 @@ def register_worktree_commands(
             None, "--archive-note", help="Optional archive note"
         ),
     ):
+        """Archive and cleanup a worktree (canonical lifecycle command).
+
+        Safety:
+        This removes the worktree after archiving. Use `--force` only when the
+        worktree is intentionally bound to an active chat thread.
+        """
         config = require_hub_config(hub)
         supervisor = build_supervisor(config)
         try:

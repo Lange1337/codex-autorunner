@@ -1,4 +1,5 @@
 import json
+import shlex
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -26,7 +27,9 @@ def register_hub_commands(
     request_json: Callable,
     normalize_base_path: Callable,
 ) -> None:
-    destination_app = typer.Typer(add_completion=False)
+    destination_app = typer.Typer(
+        add_completion=False, help="Inspect and set per-repo runtime destinations."
+    )
     hub_app.add_typer(destination_app, name="destination")
 
     def _resolve_repo_entry(config: HubConfig, repo_id: str):
@@ -67,6 +70,9 @@ def register_hub_commands(
         if sep != "=" or not key:
             raise_exit(f"Invalid --env-map value: {value!r}. Expected format KEY=VALUE")
         return key, raw_value
+
+    def _with_hub_path(command: str, hub_root: Path) -> str:
+        return f"{command} --path {shlex.quote(str(hub_root))}"
 
     @destination_app.command("show")
     def hub_destination_show(
@@ -273,6 +279,7 @@ def register_hub_commands(
             True, "--git-init/--no-git-init", help="Run git init in the new repo"
         ),
     ):
+        """Create and register a new hub repo workspace."""
         config = require_hub_config(path)
         supervisor = build_supervisor(config)
         try:
@@ -299,6 +306,7 @@ def register_hub_commands(
         path: Optional[Path] = typer.Option(None, "--path", help="Hub root path"),
         force: bool = typer.Option(False, "--force", help="Allow existing directory"),
     ):
+        """Clone a repository into the hub and register it in the manifest."""
         config = require_hub_config(path)
         supervisor = build_supervisor(config)
         try:
@@ -320,6 +328,7 @@ def register_hub_commands(
             None, "--base-path", help="Base path for the server"
         ),
     ):
+        """Start the hub API/UI server for repo and PMA operations."""
         config = require_hub_config(path)
         normalized_base = (
             normalize_base_path(base_path)
@@ -344,13 +353,19 @@ def register_hub_commands(
     def hub_scan(
         path: Optional[Path] = typer.Option(None, "--path", help="Hub root path"),
     ):
+        """Scan repos/worktrees from disk and print canonical follow-up commands."""
         config = require_hub_config(path)
         supervisor = build_supervisor(config)
         snapshots = supervisor.scan()
         typer.echo(f"Scanned hub at {config.root} (repos_root={config.repos_root})")
         for snap in snapshots:
+            hint = (
+                _with_hub_path(f"car hub worktree archive {snap.id}", config.root)
+                if snap.kind == "worktree"
+                else _with_hub_path(f"car hub destination show {snap.id}", config.root)
+            )
             typer.echo(
-                f"- {snap.id}: {snap.status.value}, initialized={snap.initialized}, exists={snap.exists_on_disk}"
+                f"- {snap.id}: {snap.status.value}, initialized={snap.initialized}, exists={snap.exists_on_disk}, recommended={hint}"
             )
 
     @hub_app.command("snapshot")
@@ -364,6 +379,7 @@ def register_hub_commands(
             None, "--base-path", help="Override hub server base path (e.g. /car)"
         ),
     ):
+        """Fetch a compact hub snapshot (repos + inbox + run-state recommendations)."""
         config = require_hub_config(path)
         repos_url = build_server_url(config, "/hub/repos", base_path_override=base_path)
         messages_url = build_server_url(
