@@ -94,6 +94,16 @@ def _install_fake_successful_chat_supervisor(
     app.state.app_server_supervisor = FakeSupervisor()
 
 
+def test_build_pma_routes_does_not_construct_async_primitives_on_route_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _lock_ctor() -> object:
+        raise AssertionError("async primitives must be lazily initialized")
+
+    monkeypatch.setattr(pma_routes.asyncio, "Lock", _lock_ctor)
+    pma_routes.build_pma_routes()
+
+
 @pytest.mark.parametrize(
     ("method", "endpoint", "body"),
     [
@@ -1101,6 +1111,26 @@ def test_pma_docs_put(hub_env) -> None:
     assert resp.json()["content"] == new_content
 
 
+def test_pma_docs_put_writes_via_to_thread(
+    hub_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seed_hub_files(hub_env.hub_root, force=True)
+    _enable_pma(hub_env.hub_root)
+    app = create_hub_app(hub_env.hub_root)
+    client = TestClient(app)
+    to_thread_calls: list[tuple[object, tuple[Any, ...], dict[str, Any]]] = []
+
+    async def _fake_to_thread(func, /, *args, **kwargs):
+        to_thread_calls.append((func, args, kwargs))
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(pma_routes.asyncio, "to_thread", _fake_to_thread)
+
+    resp = client.put("/hub/pma/docs/AGENTS.md", json={"content": "# AGENTS\n\nText"})
+    assert resp.status_code == 200
+    assert any(func is pma_routes.atomic_write for func, _, _ in to_thread_calls)
+
+
 def test_pma_docs_put_invalid_name(hub_env) -> None:
     seed_hub_files(hub_env.hub_root, force=True)
     _enable_pma(hub_env.hub_root)
@@ -1164,6 +1194,33 @@ def test_pma_context_snapshot(hub_env) -> None:
     assert "## Snapshot:" in log_content
     assert active_content in log_content
     assert active_path.read_text(encoding="utf-8") == pma_active_context_content()
+
+
+def test_pma_context_snapshot_writes_via_to_thread(
+    hub_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seed_hub_files(hub_env.hub_root, force=True)
+    _enable_pma(hub_env.hub_root)
+    app = create_hub_app(hub_env.hub_root)
+    client = TestClient(app)
+    to_thread_calls: list[tuple[object, tuple[Any, ...], dict[str, Any]]] = []
+
+    async def _fake_to_thread(func, /, *args, **kwargs):
+        to_thread_calls.append((func, args, kwargs))
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(pma_routes.asyncio, "to_thread", _fake_to_thread)
+
+    pma_dir = hub_env.hub_root / ".codex-autorunner" / "pma"
+    docs_dir = pma_dir / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    active_path = docs_dir / "active_context.md"
+    active_path.write_text("# Active Context\n\n- alpha\n", encoding="utf-8")
+
+    resp = client.post("/hub/pma/context/snapshot", json={"reset": True})
+    assert resp.status_code == 200
+    assert any(func is pma_routes.ensure_pma_docs for func, _, _ in to_thread_calls)
+    assert any(func is pma_routes.atomic_write for func, _, _ in to_thread_calls)
 
 
 def test_pma_docs_disabled(hub_env) -> None:

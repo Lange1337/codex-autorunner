@@ -104,8 +104,10 @@ def build_pma_routes() -> APIRouter:
             raise HTTPException(status_code=404, detail="PMA is disabled")
 
     router = APIRouter(prefix="/hub/pma", dependencies=[Depends(_require_pma_enabled)])
-    pma_lock = asyncio.Lock()
+    pma_lock: Optional[asyncio.Lock] = None
+    pma_lock_loop: Optional[asyncio.AbstractEventLoop] = None
     pma_event: Optional[asyncio.Event] = None
+    pma_event_loop: Optional[asyncio.AbstractEventLoop] = None
     pma_active = False
     pma_current: Optional[dict[str, Any]] = None
     pma_last_result: Optional[dict[str, Any]] = None
@@ -532,10 +534,27 @@ def build_pma_routes() -> APIRouter:
             f"{message}"
         )
 
+    async def _get_pma_lock() -> asyncio.Lock:
+        nonlocal pma_lock, pma_lock_loop, pma_event, pma_event_loop
+        loop = asyncio.get_running_loop()
+        lock = pma_lock
+        if (
+            lock is None
+            or pma_lock_loop is None
+            or pma_lock_loop is not loop
+            or pma_lock_loop.is_closed()
+        ):
+            lock = asyncio.Lock()
+            pma_lock = lock
+            pma_lock_loop = loop
+            pma_event = None
+            pma_event_loop = None
+        return lock
+
     async def _persist_state(store: Optional[PmaStateStore]) -> None:
         if store is None:
             return
-        async with pma_lock:
+        async with await _get_pma_lock():
             state = {
                 "version": 1,
                 "active": bool(pma_active),
@@ -547,6 +566,36 @@ def build_pma_routes() -> APIRouter:
             store.save(state)
         except Exception:
             logger.exception("Failed to persist PMA state")
+
+    async def _append_text_file(path: Path, content: str) -> None:
+        def _append() -> None:
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(content)
+
+        await asyncio.to_thread(_append)
+
+    async def _atomic_write_async(path: Path, content: str) -> None:
+        await asyncio.to_thread(atomic_write, path, content)
+
+    def _consume_task_result(task: asyncio.Task[Any], *, name: str) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception("PMA task failed: %s", name)
+
+    def _cancel_background_task(task: asyncio.Task[Any], *, name: str) -> None:
+        if task.done():
+            _consume_task_result(task, name=name)
+            return
+
+        def _on_done(done_task: asyncio.Future[Any]) -> None:
+            if isinstance(done_task, asyncio.Task):
+                _consume_task_result(done_task, name=name)
+
+        task.add_done_callback(_on_done)
+        task.cancel()
 
     def _truncate_text(value: Any, limit: int) -> str:
         if not isinstance(value, str):
@@ -681,17 +730,25 @@ def build_pma_routes() -> APIRouter:
         }
 
     async def _get_interrupt_event() -> asyncio.Event:
-        nonlocal pma_event
-        async with pma_lock:
-            if pma_event is None or pma_event.is_set():
+        nonlocal pma_event, pma_event_loop
+        async with await _get_pma_lock():
+            loop = asyncio.get_running_loop()
+            if (
+                pma_event is None
+                or pma_event.is_set()
+                or pma_event_loop is None
+                or pma_event_loop is not loop
+                or pma_event_loop.is_closed()
+            ):
                 pma_event = asyncio.Event()
+                pma_event_loop = loop
             return pma_event
 
     async def _set_active(
         active: bool, *, store: Optional[PmaStateStore] = None
     ) -> None:
         nonlocal pma_active
-        async with pma_lock:
+        async with await _get_pma_lock():
             pma_active = active
         await _persist_state(store)
 
@@ -702,7 +759,7 @@ def build_pma_routes() -> APIRouter:
         lane_id: Optional[str] = None,
     ) -> bool:
         nonlocal pma_active, pma_current
-        async with pma_lock:
+        async with await _get_pma_lock():
             if pma_active:
                 return False
             pma_active = True
@@ -719,15 +776,16 @@ def build_pma_routes() -> APIRouter:
         return True
 
     async def _clear_interrupt_event() -> None:
-        nonlocal pma_event
-        async with pma_lock:
+        nonlocal pma_event, pma_event_loop
+        async with await _get_pma_lock():
             pma_event = None
+            pma_event_loop = None
 
     async def _update_current(
         *, store: Optional[PmaStateStore] = None, **updates: Any
     ) -> None:
         nonlocal pma_current
-        async with pma_lock:
+        async with await _get_pma_lock():
             if pma_current is None:
                 pma_current = {}
             pma_current.update(updates)
@@ -743,13 +801,14 @@ def build_pma_routes() -> APIRouter:
         model: Optional[str] = None,
         reasoning: Optional[str] = None,
     ) -> None:
-        nonlocal pma_current, pma_last_result, pma_active, pma_event
-        async with pma_lock:
+        nonlocal pma_current, pma_last_result, pma_active, pma_event, pma_event_loop
+        async with await _get_pma_lock():
             current_snapshot = dict(pma_current or {})
             pma_last_result = _format_last_result(result or {}, current_snapshot)
             pma_current = None
             pma_active = False
             pma_event = None
+            pma_event_loop = None
 
         status = result.get("status") or "error"
         started_at = current_snapshot.get("started_at")
@@ -826,7 +885,7 @@ def build_pma_routes() -> APIRouter:
         await _persist_state(store)
 
     async def _get_current_snapshot() -> dict[str, Any]:
-        async with pma_lock:
+        async with await _get_pma_lock():
             return dict(pma_current or {})
 
     async def _interrupt_active(
@@ -1160,7 +1219,7 @@ def build_pma_routes() -> APIRouter:
     async def pma_active_status(
         request: Request, client_turn_id: Optional[str] = None
     ) -> dict[str, Any]:
-        async with pma_lock:
+        async with await _get_pma_lock():
             current = dict(pma_current or {})
             last_result = dict(pma_last_result or {})
             active = bool(pma_active)
@@ -2177,19 +2236,21 @@ def build_pma_routes() -> APIRouter:
                     await codex_harness.interrupt(hub_root, thread_id, handle.turn_id)
                 except Exception:
                     logger.exception("Failed to interrupt Codex turn")
-                turn_task.cancel()
+                _cancel_background_task(turn_task, name="pma.app_server.turn.wait")
                 return {"status": "error", "detail": "PMA chat timed out"}
             if interrupt_task in done:
                 try:
                     await codex_harness.interrupt(hub_root, thread_id, handle.turn_id)
                 except Exception:
                     logger.exception("Failed to interrupt Codex turn")
-                turn_task.cancel()
+                _cancel_background_task(turn_task, name="pma.app_server.turn.wait")
                 return {"status": "interrupted", "detail": "PMA chat interrupted"}
             turn_result = await turn_task
         finally:
-            timeout_task.cancel()
-            interrupt_task.cancel()
+            _cancel_background_task(timeout_task, name="pma.app_server.timeout.wait")
+            _cancel_background_task(
+                interrupt_task, name="pma.app_server.interrupt.wait"
+            )
 
         if getattr(turn_result, "errors", None):
             errors = turn_result.errors
@@ -2295,7 +2356,7 @@ def build_pma_routes() -> APIRouter:
                 prompt_response = await prompt_task
             except Exception as exc:
                 interrupt_event.set()
-                output_task.cancel()
+                _cancel_background_task(output_task, name="pma.opencode.output.collect")
                 await opencode_harness.interrupt(hub_root, session_id, None)
                 raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -2304,11 +2365,11 @@ def build_pma_routes() -> APIRouter:
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if timeout_task in done:
-                output_task.cancel()
+                _cancel_background_task(output_task, name="pma.opencode.output.collect")
                 await opencode_harness.interrupt(hub_root, session_id, None)
                 return {"status": "error", "detail": "PMA chat timed out"}
             if interrupt_task in done:
-                output_task.cancel()
+                _cancel_background_task(output_task, name="pma.opencode.output.collect")
                 await opencode_harness.interrupt(hub_root, session_id, None)
                 return {"status": "interrupted", "detail": "PMA chat interrupted"}
             output_result = await output_task
@@ -2319,8 +2380,8 @@ def build_pma_routes() -> APIRouter:
                         text=fallback.text, error=fallback.error
                     )
         finally:
-            timeout_task.cancel()
-            interrupt_task.cancel()
+            _cancel_background_task(timeout_task, name="pma.opencode.timeout.wait")
+            _cancel_background_task(interrupt_task, name="pma.opencode.interrupt.wait")
             await supervisor.mark_turn_finished(hub_root)
 
         if output_result.error:
@@ -2755,10 +2816,12 @@ def build_pma_routes() -> APIRouter:
         return {"status": "ok"}
 
     @router.post("/context/snapshot")
-    def snapshot_pma_context(request: Request, body: Optional[dict[str, Any]] = None):
+    async def snapshot_pma_context(
+        request: Request, body: Optional[dict[str, Any]] = None
+    ):
         hub_root = request.app.state.config.root
         try:
-            ensure_pma_docs(hub_root)
+            await asyncio.to_thread(ensure_pma_docs, hub_root)
         except Exception as exc:
             raise HTTPException(
                 status_code=500, detail=f"Failed to ensure PMA docs: {exc}"
@@ -2769,16 +2832,23 @@ def build_pma_routes() -> APIRouter:
             reset = bool(body.get("reset", False))
 
         docs_dir = _pma_docs_dir(hub_root)
-        docs_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            await asyncio.to_thread(docs_dir.mkdir, parents=True, exist_ok=True)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500, detail=f"Failed to prepare PMA docs directory: {exc}"
+            ) from exc
         active_context_path = docs_dir / "active_context.md"
-        if not active_context_path.exists():
+        if not await asyncio.to_thread(active_context_path.exists):
             raise HTTPException(
                 status_code=404, detail="Doc not found: active_context.md"
             )
         context_log_path = docs_dir / "context_log.md"
 
         try:
-            active_content = active_context_path.read_text(encoding="utf-8")
+            active_content = await asyncio.to_thread(
+                active_context_path.read_text, encoding="utf-8"
+            )
         except Exception as exc:
             raise HTTPException(
                 status_code=500, detail=f"Failed to read active_context.md: {exc}"
@@ -2797,8 +2867,7 @@ def build_pma_routes() -> APIRouter:
             )
 
         try:
-            with context_log_path.open("a", encoding="utf-8") as f:
-                f.write(snapshot_content)
+            await _append_text_file(context_log_path, snapshot_content)
         except Exception as exc:
             raise HTTPException(
                 status_code=500, detail=f"Failed to append context_log.md: {exc}"
@@ -2806,7 +2875,9 @@ def build_pma_routes() -> APIRouter:
 
         if reset:
             try:
-                atomic_write(active_context_path, pma_active_context_content())
+                await _atomic_write_async(
+                    active_context_path, pma_active_context_content()
+                )
             except Exception as exc:
                 raise HTTPException(
                     status_code=500, detail=f"Failed to reset active_context.md: {exc}"
@@ -2820,7 +2891,7 @@ def build_pma_routes() -> APIRouter:
             "reset": reset,
         }
         try:
-            context_log_bytes = context_log_path.stat().st_size
+            context_log_bytes = (await asyncio.to_thread(context_log_path.stat)).st_size
             response["context_log_bytes"] = context_log_bytes
             if context_log_bytes > PMA_CONTEXT_LOG_SOFT_LIMIT_BYTES:
                 response["warning"] = (
@@ -2879,17 +2950,21 @@ def build_pma_routes() -> APIRouter:
         ordered.extend(remaining)
         return ordered
 
-    def _write_doc_history(
+    async def _write_doc_history(
         hub_root: Path, doc_name: str, content: str
     ) -> Optional[Path]:
         docs_dir = _pma_docs_dir(hub_root)
         history_root = docs_dir / "_history" / doc_name
-        try:
+
+        def _write() -> Path:
             history_root.mkdir(parents=True, exist_ok=True)
             timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
             history_path = history_root / f"{timestamp}.md"
             atomic_write(history_path, content)
             return history_path
+
+        try:
+            return await asyncio.to_thread(_write)
         except Exception:
             logger.exception("Failed to write PMA doc history for %s", doc_name)
             return None
@@ -2959,7 +3034,7 @@ def build_pma_routes() -> APIRouter:
         return {"name": name, "content": content}
 
     @router.put("/docs/{name}")
-    def update_pma_doc(
+    async def update_pma_doc(
         name: str, request: Request, body: dict[str, str]
     ) -> dict[str, str]:
         name = _normalize_doc_name(name)
@@ -2978,12 +3053,12 @@ def build_pma_routes() -> APIRouter:
         docs_dir.mkdir(parents=True, exist_ok=True)
         doc_path = docs_dir / name
         try:
-            atomic_write(doc_path, content)
+            await _atomic_write_async(doc_path, content)
         except Exception as exc:
             raise HTTPException(
                 status_code=500, detail=f"Failed to write doc: {exc}"
             ) from exc
-        _write_doc_history(hub_root, name, content)
+        await _write_doc_history(hub_root, name, content)
         details = {
             "name": name,
             "size": len(content.encode("utf-8")),
