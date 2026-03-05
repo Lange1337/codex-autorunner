@@ -129,6 +129,7 @@ from ..telegram.helpers import (
     _coerce_thread_list,
     _extract_context_usage_percent,
     _extract_thread_list_cursor,
+    _format_skills_list,
     _format_turn_metrics,
     _parse_review_commit_log,
 )
@@ -3867,12 +3868,87 @@ class DiscordBotService:
         *,
         workspace_root: Path,
     ) -> None:
+        try:
+            client = await self._client_for_workspace(str(workspace_root))
+        except AppServerUnavailableError:
+            await self._respond_ephemeral(
+                interaction_id,
+                interaction_token,
+                "Workspace unavailable. Re-bind this channel and try again.",
+            )
+            return
+
+        if client is None:
+            await self._respond_ephemeral(
+                interaction_id,
+                interaction_token,
+                "Workspace unavailable. Re-bind this channel and try again.",
+            )
+            return
+
+        try:
+            result = await client.request(
+                "skills/list",
+                {"cwds": [str(workspace_root)], "forceReload": False},
+            )
+        except Exception as exc:
+            log_event(
+                self._logger,
+                logging.WARNING,
+                "discord.skills.failed",
+                workspace_path=str(workspace_root),
+                exc=exc,
+            )
+            await self._respond_ephemeral(
+                interaction_id,
+                interaction_token,
+                "Failed to list skills; check logs for details.",
+            )
+            return
+
+        skills_text = _format_skills_list(result, str(workspace_root))
+        styled_lines: list[str] = []
+        for line in skills_text.splitlines():
+            if (
+                not line
+                or line == "Skills:"
+                or line.startswith("...and ")
+                or line.startswith("Use $")
+            ):
+                styled_lines.append(line)
+                continue
+            if " - " in line:
+                name, description = line.split(" - ", 1)
+                styled_lines.append(f"**{name}** - {description}")
+            else:
+                styled_lines.append(f"**{line}**")
+        rendered = format_discord_message("\n".join(styled_lines))
+        chunks = chunk_discord_message(
+            rendered,
+            max_len=self._config.max_message_length,
+            with_numbering=False,
+        )
+        if not chunks:
+            chunks = ["No skills found."]
+
         await self._respond_ephemeral(
             interaction_id,
             interaction_token,
-            "Skills listing requires the app server client. "
-            "This command is not yet available in Discord.",
+            chunks[0],
         )
+        for chunk in chunks[1:]:
+            sent = await self._send_followup_ephemeral(
+                interaction_token=interaction_token,
+                content=chunk,
+            )
+            if not sent:
+                log_event(
+                    self._logger,
+                    logging.WARNING,
+                    "discord.skills.followup_failed",
+                    workspace_path=str(workspace_root),
+                )
+                break
 
     async def _handle_mcp(
         self,
