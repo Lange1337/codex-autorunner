@@ -1085,6 +1085,10 @@ class DiscordBotService:
                 preview_message_id,
                 record_id=f"turn-preview-delete:{session_key}:{uuid.uuid4().hex[:8]}",
             )
+        await self._flush_outbox_files(
+            workspace_root=workspace_root,
+            channel_id=channel_id,
+        )
 
     def _voice_service_for_workspace(
         self, workspace_root: Path
@@ -6202,23 +6206,121 @@ class DiscordBotService:
             value /= 1024
         return f"{value:.1f} TB"
 
-    def _list_files_in_dir(self, folder: Path) -> list[tuple[str, int, str]]:
+    def _list_paths_in_dir(self, folder: Path) -> list[Path]:
         if not folder.exists():
             return []
-        files: list[tuple[str, int, str]] = []
+        files: list[Path] = []
         for path in folder.iterdir():
             try:
                 if path.is_file():
-                    stat = path.stat()
-                    from datetime import datetime, timezone
-
-                    mtime = datetime.fromtimestamp(
-                        stat.st_mtime, tz=timezone.utc
-                    ).strftime("%Y-%m-%d %H:%M")
-                    files.append((path.name, stat.st_size, mtime))
+                    files.append(path)
             except OSError:
                 continue
-        return sorted(files, key=lambda x: x[2], reverse=True)
+
+        def _mtime(entry: Path) -> float:
+            try:
+                return entry.stat().st_mtime
+            except OSError:
+                return 0.0
+
+        return sorted(files, key=_mtime, reverse=True)
+
+    def _list_files_in_dir(self, folder: Path) -> list[tuple[str, int, str]]:
+        files: list[tuple[str, int, str]] = []
+        for path in self._list_paths_in_dir(folder):
+            try:
+                stat = path.stat()
+                from datetime import datetime, timezone
+
+                mtime = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).strftime(
+                    "%Y-%m-%d %H:%M"
+                )
+                files.append((path.name, stat.st_size, mtime))
+            except OSError:
+                continue
+        return files
+
+    async def _send_outbox_file(
+        self,
+        path: Path,
+        *,
+        sent_dir: Path,
+        channel_id: str,
+    ) -> bool:
+        try:
+            data = path.read_bytes()
+        except Exception as exc:
+            log_event(
+                self._logger,
+                logging.WARNING,
+                "discord.files.outbox.read_failed",
+                channel_id=channel_id,
+                path=str(path),
+                exc=exc,
+            )
+            return False
+        try:
+            await self._rest.create_channel_message_with_attachment(
+                channel_id=channel_id,
+                data=data,
+                filename=path.name,
+            )
+        except Exception as exc:
+            log_event(
+                self._logger,
+                logging.WARNING,
+                "discord.files.outbox.send_failed",
+                channel_id=channel_id,
+                path=str(path),
+                exc=exc,
+            )
+            return False
+        try:
+            sent_dir.mkdir(parents=True, exist_ok=True)
+            destination = sent_dir / path.name
+            if destination.exists():
+                destination = (
+                    sent_dir / f"{path.stem}-{uuid.uuid4().hex[:6]}{path.suffix}"
+                )
+            path.replace(destination)
+        except Exception as exc:
+            log_event(
+                self._logger,
+                logging.WARNING,
+                "discord.files.outbox.move_failed",
+                channel_id=channel_id,
+                path=str(path),
+                exc=exc,
+            )
+            return False
+        log_event(
+            self._logger,
+            logging.INFO,
+            "discord.files.outbox.sent",
+            channel_id=channel_id,
+            path=str(path),
+        )
+        return True
+
+    async def _flush_outbox_files(
+        self,
+        *,
+        workspace_root: Path,
+        channel_id: str,
+    ) -> None:
+        pending_dir = outbox_pending_dir(workspace_root)
+        if not pending_dir.exists():
+            return
+        files = self._list_paths_in_dir(pending_dir)
+        if not files:
+            return
+        sent_dir = outbox_sent_dir(workspace_root)
+        for path in files:
+            await self._send_outbox_file(
+                path,
+                sent_dir=sent_dir,
+                channel_id=channel_id,
+            )
 
     def _delete_files_in_dir(self, folder: Path) -> int:
         if not folder.exists():
@@ -7836,6 +7938,10 @@ class DiscordBotService:
                         message_id=preview_message_id,
                         payload={"content": chunks[0]},
                     )
+                    await self._flush_outbox_files(
+                        workspace_root=workspace_root,
+                        channel_id=channel_id,
+                    )
                     log_event(
                         self._logger,
                         logging.INFO,
@@ -7875,6 +7981,10 @@ class DiscordBotService:
                 record_id=f"review:{session_key}:{idx}:{uuid.uuid4().hex[:8]}",
             )
 
+        await self._flush_outbox_files(
+            workspace_root=workspace_root,
+            channel_id=channel_id,
+        )
         log_event(
             self._logger,
             logging.INFO,
@@ -8290,6 +8400,10 @@ class DiscordBotService:
             if chunk_index == last_chunk_index:
                 payload["components"] = [build_continue_turn_button()]
             await self._send_channel_message_safe(channel_id, payload)
+        await self._flush_outbox_files(
+            workspace_root=workspace_root,
+            channel_id=channel_id,
+        )
 
     async def _handle_car_rollout(
         self,
