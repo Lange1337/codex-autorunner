@@ -3296,15 +3296,14 @@ class DiscordBotService:
 
     def _list_bind_workspace_candidates(self) -> list[tuple[Optional[str], str]]:
         candidates: list[tuple[Optional[str], str]] = []
-        seen_paths: set[str] = set()
+        manifest_paths: set[str] = set()
 
         for repo_id, path in self._list_manifest_repos():
             normalized_path = str(canonicalize_path(Path(path)))
-            if normalized_path in seen_paths:
-                continue
-            seen_paths.add(normalized_path)
             candidates.append((repo_id, normalized_path))
+            manifest_paths.add(normalized_path)
 
+        seen_paths: set[str] = set(manifest_paths)
         try:
             for child in sorted(
                 self._config.root.iterdir(),
@@ -3475,7 +3474,9 @@ class DiscordBotService:
             if not value or value in seen:
                 continue
             seen.add(value)
-            option_name = f"{repo_id} - {path}" if repo_id else f"{Path(path).name} - {path}"
+            option_name = (
+                f"{repo_id} - {path}" if repo_id else f"{Path(path).name} - {path}"
+            )
             choices.append(
                 {
                     "name": option_name[:100],
