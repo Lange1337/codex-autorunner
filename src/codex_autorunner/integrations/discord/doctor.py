@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from ...core.config import HubConfig
 from ...core.optional_dependencies import missing_optional_dependencies
 from ...core.runtime import DoctorCheck
+from ...voice.config import VoiceConfig
 from .config import (
     DEFAULT_APP_ID_ENV,
     DEFAULT_BOT_TOKEN_ENV,
@@ -71,6 +72,45 @@ def discord_doctor_checks(config: HubConfig) -> list[DoctorCheck]:
             )
         )
         return checks
+
+    voice_raw = _resolve_voice_raw(raw)
+    voice_config = VoiceConfig.from_raw(voice_raw, env=os.environ)
+    voice_ingestion_enabled = _discord_voice_ingestion_enabled(discord_cfg)
+    if (
+        voice_ingestion_enabled
+        and voice_config.enabled
+        and _normalize_voice_provider(voice_config.provider) == "local_whisper"
+    ):
+        missing_local_voice = missing_optional_dependencies(
+            (("faster_whisper", "faster-whisper"),)
+        )
+        if missing_local_voice:
+            checks.append(
+                DoctorCheck(
+                    name="Discord voice dependencies",
+                    passed=False,
+                    message=(
+                        "Discord voice transcription is configured with "
+                        "local_whisper but faster-whisper is not installed."
+                    ),
+                    check_id="discord.voice.dependencies",
+                    severity="error",
+                    fix="Install with `pip install codex-autorunner[voice-local]`.",
+                )
+            )
+        else:
+            checks.append(
+                DoctorCheck(
+                    name="Discord voice dependencies",
+                    passed=True,
+                    message=(
+                        "Discord voice transcription is using local_whisper and "
+                        "local dependencies are installed."
+                    ),
+                    check_id="discord.voice.dependencies",
+                    severity="info",
+                )
+            )
 
     bot_token_env = str(discord_cfg.get("bot_token_env", DEFAULT_BOT_TOKEN_ENV)).strip()
     app_id_env = str(discord_cfg.get("app_id_env", DEFAULT_APP_ID_ENV)).strip()
@@ -258,6 +298,36 @@ def _resolve_state_file(root: Path, raw_state_file: object) -> Path:
     if isinstance(raw_state_file, str) and raw_state_file.strip():
         return (root / raw_state_file).resolve()
     return (root / DEFAULT_STATE_FILE).resolve()
+
+
+def _resolve_voice_raw(raw: dict[str, Any]) -> Optional[dict[str, Any]]:
+    repo_defaults = raw.get("repo_defaults")
+    if isinstance(repo_defaults, dict):
+        voice = repo_defaults.get("voice")
+        if isinstance(voice, dict):
+            return voice
+
+    voice_raw = raw.get("voice")
+    if isinstance(voice_raw, dict):
+        return voice_raw
+    return None
+
+
+def _normalize_voice_provider(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    normalized = value.strip().lower()
+    if normalized == "local":
+        return "local_whisper"
+    return normalized
+
+
+def _discord_voice_ingestion_enabled(discord_cfg: dict[str, Any]) -> bool:
+    media_raw = discord_cfg.get("media")
+    media_cfg = media_raw if isinstance(media_raw, dict) else {}
+    media_enabled = bool(media_cfg.get("enabled", True))
+    media_voice = bool(media_cfg.get("voice", True))
+    return media_enabled and media_voice
 
 
 def _state_file_writable_check(state_file: Path) -> tuple[bool, str, str | None]:
