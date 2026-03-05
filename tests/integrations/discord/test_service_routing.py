@@ -632,6 +632,92 @@ async def test_service_bind_workspace_autocomplete_returns_matching_repo_ids(
 
 
 @pytest.mark.anyio
+async def test_service_bind_workspace_autocomplete_keeps_repo_id_aliases_for_shared_path(
+    tmp_path: Path,
+) -> None:
+    shared_workspace = tmp_path / "worktrees" / "shared"
+    shared_workspace.mkdir(parents=True)
+    repos = [
+        ("repo-primary", str(shared_workspace)),
+        ("repo-alias", str(shared_workspace)),
+    ]
+    store = DiscordStateStore(tmp_path / "discord_state.sqlite3")
+    await store.initialize()
+    rest = _FakeRest()
+    gateway = _FakeGateway(
+        [
+            _autocomplete_interaction(
+                name="bind",
+                focused_name="workspace",
+                focused_value="repo-",
+            )
+        ]
+    )
+    service = DiscordBotService(
+        _config(tmp_path, allow_user_ids=frozenset({"user-1"})),
+        logger=logging.getLogger("test"),
+        rest_client=rest,
+        gateway_client=gateway,
+        state_store=store,
+        outbox_manager=_FakeOutboxManager(),
+    )
+    service._list_manifest_repos = lambda: repos
+
+    try:
+        await service.run_forever()
+        assert len(rest.interaction_responses) == 1
+        payload = rest.interaction_responses[0]["payload"]
+        assert payload["type"] == 8
+        choices = payload["data"]["choices"]
+        values = [choice["value"] for choice in choices]
+        assert "repo-primary" in values
+        assert "repo-alias" in values
+    finally:
+        await store.close()
+
+
+@pytest.mark.anyio
+async def test_service_bind_accepts_repo_alias_when_manifest_repos_share_workspace_path(
+    tmp_path: Path,
+) -> None:
+    shared_workspace = tmp_path / "worktrees" / "shared"
+    shared_workspace.mkdir(parents=True)
+    repos = [
+        ("repo-primary", str(shared_workspace)),
+        ("repo-alias", str(shared_workspace)),
+    ]
+    store = DiscordStateStore(tmp_path / "discord_state.sqlite3")
+    await store.initialize()
+    rest = _FakeRest()
+    gateway = _FakeGateway(
+        [
+            _interaction(
+                name="bind",
+                options=[{"type": 3, "name": "workspace", "value": "repo-alias"}],
+            )
+        ]
+    )
+    service = DiscordBotService(
+        _config(tmp_path, allow_user_ids=frozenset({"user-1"})),
+        logger=logging.getLogger("test"),
+        rest_client=rest,
+        gateway_client=gateway,
+        state_store=store,
+        outbox_manager=_FakeOutboxManager(),
+    )
+    service._list_manifest_repos = lambda: repos
+
+    try:
+        await service.run_forever()
+        binding = await store.get_binding(channel_id="channel-1")
+        assert binding is not None
+        assert binding["repo_id"] == "repo-alias"
+        assert binding["workspace_path"] == str(shared_workspace.resolve())
+    finally:
+        await store.close()
+
+
+@pytest.mark.anyio
 async def test_service_bind_workspace_autocomplete_long_repo_id_uses_token(
     tmp_path: Path,
 ) -> None:

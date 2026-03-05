@@ -209,6 +209,7 @@ REVIEW_COMMIT_SELECT_ID = "review_commit_select"
 MODEL_EFFORT_SELECT_ID = "model_effort_select"
 BIND_PAGE_CUSTOM_ID_PREFIX = "bind_page"
 REPO_AUTOCOMPLETE_TOKEN_PREFIX = "repo@"
+WORKSPACE_AUTOCOMPLETE_TOKEN_PREFIX = "workspace@"
 FLOW_ACTIONS_WITH_RUN_PICKER = {
     "status",
     "restart",
@@ -3307,6 +3308,35 @@ class DiscordBotService:
         except Exception:
             return []
 
+    def _list_bind_workspace_candidates(self) -> list[tuple[Optional[str], str]]:
+        candidates: list[tuple[Optional[str], str]] = []
+        manifest_paths: set[str] = set()
+
+        for repo_id, path in self._list_manifest_repos():
+            normalized_path = str(canonicalize_path(Path(path)))
+            candidates.append((repo_id, normalized_path))
+            manifest_paths.add(normalized_path)
+
+        seen_paths: set[str] = set(manifest_paths)
+        try:
+            for child in sorted(
+                self._config.root.iterdir(),
+                key=lambda entry: entry.name.lower(),
+            ):
+                if not child.is_dir():
+                    continue
+                if child.name.startswith("."):
+                    continue
+                normalized_path = str(canonicalize_path(child))
+                if normalized_path in seen_paths:
+                    continue
+                seen_paths.add(normalized_path)
+                candidates.append((None, normalized_path))
+        except Exception:
+            pass
+
+        return candidates
+
     def _build_bind_page_prompt_and_components(
         self,
         repos: list[tuple[str, str]],
@@ -3363,24 +3393,47 @@ class DiscordBotService:
         digest = hashlib.sha256(normalized_id.encode("utf-8")).hexdigest()[:24]
         return f"{REPO_AUTOCOMPLETE_TOKEN_PREFIX}{digest}"
 
-    def _resolve_repo_from_token(
-        self, token: str, repos: list[tuple[str, str]]
-    ) -> Optional[tuple[str, str]]:
+    def _workspace_autocomplete_value(self, workspace_path: str) -> str:
+        normalized_path = workspace_path.strip()
+        if len(normalized_path) <= 100:
+            return normalized_path
+        digest = hashlib.sha256(normalized_path.encode("utf-8")).hexdigest()[:24]
+        return f"{WORKSPACE_AUTOCOMPLETE_TOKEN_PREFIX}{digest}"
+
+    def _resolve_workspace_from_token(
+        self,
+        token: str,
+        candidates: list[tuple[Optional[str], str]],
+    ) -> Optional[tuple[Optional[str], str]]:
         normalized = token.strip()
         if not normalized:
             return None
 
-        for repo_id, repo_path in repos:
-            if repo_id == normalized:
-                return repo_id, repo_path
+        for repo_id, workspace_path in candidates:
+            if repo_id == normalized or workspace_path == normalized:
+                return repo_id, workspace_path
 
         if normalized.startswith(REPO_AUTOCOMPLETE_TOKEN_PREFIX):
             digest = normalized[len(REPO_AUTOCOMPLETE_TOKEN_PREFIX) :]
             if digest:
                 matches = [
-                    (repo_id, repo_path)
-                    for repo_id, repo_path in repos
-                    if hashlib.sha256(repo_id.encode("utf-8"))
+                    (repo_id, workspace_path)
+                    for repo_id, workspace_path in candidates
+                    if isinstance(repo_id, str)
+                    and hashlib.sha256(repo_id.encode("utf-8"))
+                    .hexdigest()
+                    .startswith(digest)
+                ]
+                if len(matches) == 1:
+                    return matches[0]
+
+        if normalized.startswith(WORKSPACE_AUTOCOMPLETE_TOKEN_PREFIX):
+            digest = normalized[len(WORKSPACE_AUTOCOMPLETE_TOKEN_PREFIX) :]
+            if digest:
+                matches = [
+                    (repo_id, workspace_path)
+                    for repo_id, workspace_path in candidates
+                    if hashlib.sha256(workspace_path.encode("utf-8"))
                     .hexdigest()
                     .startswith(digest)
                 ]
@@ -3390,16 +3443,18 @@ class DiscordBotService:
         return None
 
     def _build_bind_autocomplete_choices(self, query: str) -> list[dict[str, str]]:
-        repos = self._list_manifest_repos()
+        candidates = self._list_bind_workspace_candidates()
         normalized_query = query.strip().lower()
-        scored: list[tuple[int, int, str, str]] = []
+        scored: list[tuple[int, int, Optional[str], str]] = []
 
-        for index, (repo_id, path) in enumerate(repos):
-            rid = repo_id.lower()
+        for index, (repo_id, path) in enumerate(candidates):
+            rid = repo_id.lower() if isinstance(repo_id, str) else ""
+            basename = Path(path).name.lower()
             pth = path.lower()
             if (
                 normalized_query
                 and normalized_query not in rid
+                and normalized_query not in basename
                 and normalized_query not in pth
             ):
                 continue
@@ -3410,6 +3465,10 @@ class DiscordBotService:
                     score += 40
                 elif normalized_query in rid:
                     score += 20
+                if basename.startswith(normalized_query):
+                    score += 25
+                elif normalized_query in basename:
+                    score += 15
                 if pth.startswith(normalized_query):
                     score += 10
                 elif normalized_query in pth:
@@ -3417,19 +3476,25 @@ class DiscordBotService:
 
             scored.append((score, -index, repo_id, path))
 
-        scored.sort(key=lambda item: (-item[0], -item[1], item[2]))
+        scored.sort(key=lambda item: (-item[0], -item[1], item[2] or "", item[3]))
         seen: set[str] = set()
         choices: list[dict[str, str]] = []
         for _score, _neg_index, repo_id, path in scored:
-            value = self._repo_autocomplete_value(repo_id)
+            value = (
+                self._repo_autocomplete_value(repo_id)
+                if isinstance(repo_id, str) and repo_id
+                else self._workspace_autocomplete_value(path)
+            )
             if not value or value in seen:
                 continue
             seen.add(value)
-            option_name = f"{repo_id} - {path}"
+            option_name = (
+                f"{repo_id} - {path}" if repo_id else f"{Path(path).name} - {path}"
+            )
             choices.append(
                 {
                     "name": option_name[:100],
-                    "value": self._repo_autocomplete_value(value),
+                    "value": value,
                 }
             )
             if len(choices) >= DISCORD_SELECT_OPTION_MAX_OPTIONS:
@@ -3466,14 +3531,11 @@ class DiscordBotService:
         raw_path: str,
     ) -> None:
         token = raw_path.strip()
-        repos = self._list_manifest_repos()
-        resolved_repo = self._resolve_repo_from_token(token, repos)
-        repo_match = resolved_repo[1] if resolved_repo else None
-        if repo_match:
-            workspace = canonicalize_path(Path(repo_match))
-            selected_repo_id: Optional[str] = (
-                resolved_repo[0] if resolved_repo else None
-            )
+        candidates = self._list_bind_workspace_candidates()
+        resolved_workspace = self._resolve_workspace_from_token(token, candidates)
+        if resolved_workspace:
+            selected_repo_id, workspace_path = resolved_workspace
+            workspace = canonicalize_path(Path(workspace_path))
         else:
             candidate = Path(token)
             if not candidate.is_absolute():
