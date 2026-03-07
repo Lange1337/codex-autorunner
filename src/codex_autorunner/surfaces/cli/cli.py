@@ -115,8 +115,7 @@ repos_app = typer.Typer(
     add_completion=False, help="Manage trusted/untrusted template repositories."
 )
 render_app = typer.Typer(
-    add_completion=False,
-    help="Render markdown and diagrams into static export artifacts.",
+    add_completion=False, help="Rendering, export, and browser capture commands."
 )
 cleanup_app = typer.Typer(
     add_completion=False, help="Cleanup managed processes and report artifacts."
@@ -219,6 +218,13 @@ register_discord_commands(
     raise_exit=_raise_exit,
     require_optional_feature=_require_optional_feature,
 )
+app.add_typer(render_app, name="render")
+register_render_commands(
+    render_app,
+    require_optional_feature=_require_optional_feature,
+    require_repo_config=_require_repo_config,
+    raise_exit=_raise_exit,
+)
 app.add_typer(templates_app, name="templates")
 # UX alias: allow singular form (`car template ...`) in addition to `car templates ...`.
 app.add_typer(
@@ -227,7 +233,6 @@ app.add_typer(
     help="Alias of `templates` (canonical form: `car templates ...`).",
 )
 app.add_typer(cleanup_app, name="cleanup")
-app.add_typer(render_app, name="render")
 app.add_typer(chat_app, name="chat")
 register_templates_commands(
     templates_app,
@@ -259,10 +264,6 @@ register_inbox_commands(
 register_cleanup_commands(
     cleanup_app,
     require_repo_config=_require_repo_config,
-)
-register_render_commands(
-    render_app,
-    raise_exit=_raise_exit,
 )
 register_chat_commands(
     chat_app,
