@@ -1,6 +1,6 @@
 [project]
 name = "codex-autorunner"
-version = "1.5.2"
+version = "1.5.3"
 description = "Codex autorunner CLI per DESIGN-V1"
 readme = "README.md"
 license = {file = "LICENSE"}
@@ -52,9 +52,15 @@ voice = [
 voice-local = [
   "faster-whisper>=1.1.0",
 ]
+voice-mlx = [
+  "mlx-whisper>=0.4.2; platform_system == 'Darwin' and platform_machine == 'arm64'",
+]
 github = []
 discord = [
   "websockets>=12",
+]
+browser = [
+  "playwright>=1.40",
 ]
 
 [project.scripts]

@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
+from ...agents.opencode.harness import OpenCodeHarness
 from ...core.config import load_repo_config, resolve_env_for_root
 from ...core.context_awareness import (
     maybe_inject_car_awareness,
@@ -21,6 +22,7 @@ from ...core.context_awareness import (
 )
 from ...core.filebox import (
     inbox_dir,
+    outbox_dir,
     outbox_pending_dir,
     outbox_sent_dir,
 )
@@ -76,6 +78,9 @@ from ...core.utils import (
 )
 from ...flows.ticket_flow.runtime_helpers import build_ticket_flow_controller
 from ...integrations.agents.backend_orchestrator import BackendOrchestrator
+from ...integrations.agents.opencode_supervisor_factory import (
+    build_opencode_supervisor_from_repo_config,
+)
 from ...integrations.app_server.client import (
     CodexAppServerClient,
     CodexAppServerResponseError,
@@ -100,6 +105,7 @@ from ...integrations.chat.media import (
     audio_content_type_for_input,
     audio_extension_for_input,
     is_audio_mime_or_path,
+    is_image_mime_or_path,
     normalize_mime_type,
 )
 from ...integrations.chat.models import (
@@ -123,6 +129,7 @@ from ...integrations.github.service import (
     GitHubService,
 )
 from ...manifest import load_manifest
+from ...tickets.files import read_ticket
 from ...tickets.outbox import resolve_outbox_paths
 from ...voice import VoiceConfig, VoiceService, VoiceServiceError
 from ..telegram.helpers import (
@@ -130,6 +137,7 @@ from ..telegram.helpers import (
     _extract_context_usage_percent,
     _extract_thread_list_cursor,
     _format_skills_list,
+    _extract_thread_preview_parts,
     _format_turn_metrics,
     _parse_review_commit_log,
 )
@@ -189,8 +197,7 @@ DEFAULT_UPDATE_REPO_URL = "https://github.com/Git-on-my-level/codex-autorunner.g
 DEFAULT_UPDATE_REPO_REF = "main"
 DISCORD_TURN_PROGRESS_MIN_EDIT_INTERVAL_SECONDS = 1.0
 DISCORD_TURN_PROGRESS_HEARTBEAT_INTERVAL_SECONDS = 2.0
-DISCORD_TURN_PROGRESS_MAX_ACTIONS = 8
-DISCORD_TURN_PROGRESS_MAX_OUTPUT_CHARS = 120
+DISCORD_TURN_PROGRESS_MAX_ACTIONS = 12
 SHELL_OUTPUT_TRUNCATION_SUFFIX = "\n...[truncated]..."
 DISCORD_ATTACHMENT_MAX_BYTES = 100_000_000
 THREAD_LIST_MAX_PAGES = 5
@@ -274,6 +281,13 @@ def _coerce_model_picker_items(result: Any) -> list[tuple[str, str]]:
     return options
 
 
+def _is_valid_opencode_model_name(model_name: str) -> bool:
+    if "/" not in model_name:
+        return False
+    provider_id, model_id = model_name.split("/", 1)
+    return bool(provider_id.strip() and model_id.strip())
+
+
 def _path_within(root: Path, target: Path) -> bool:
     try:
         root = canonicalize_path(root)
@@ -331,6 +345,43 @@ def _flow_run_matches_action(record: FlowRunRecord, action: str) -> bool:
     return True
 
 
+def _truncate_picker_text(text: str, *, limit: int) -> str:
+    value = " ".join(text.split()).strip()
+    if len(value) <= limit:
+        return value
+    if limit <= 3:
+        return value[:limit]
+    return f"{value[: limit - 3]}..."
+
+
+def _format_session_thread_picker_label(
+    thread_id: str, entry: dict[str, Any], *, is_current: bool
+) -> str:
+    max_label_len = 100
+    current_suffix = " (current)" if is_current else ""
+    max_base_len = max_label_len - len(current_suffix)
+    user_preview, assistant_preview = _extract_thread_preview_parts(entry)
+    user_preview = _truncate_picker_text(user_preview or "", limit=72) or None
+    assistant_preview = _truncate_picker_text(assistant_preview or "", limit=72) or None
+    preview_label: Optional[str] = None
+    if user_preview and assistant_preview:
+        preview_label = f"U: {user_preview} | A: {assistant_preview}"
+    elif user_preview:
+        preview_label = f"U: {user_preview}"
+    elif assistant_preview:
+        preview_label = f"A: {assistant_preview}"
+    if preview_label:
+        short_id = thread_id[:8]
+        id_prefix = f"[{short_id}] "
+        preview_budget = max(1, max_base_len - len(id_prefix))
+        base = (
+            f"{id_prefix}{_truncate_picker_text(preview_label, limit=preview_budget)}"
+        )
+    else:
+        base = _truncate_picker_text(thread_id, limit=max_base_len)
+    return f"{base}{current_suffix}"
+
+
 @dataclass(frozen=True)
 class DiscordMessageTurnResult:
     final_message: str
@@ -346,6 +397,7 @@ class _SavedDiscordAttachment:
     mime_type: Optional[str]
     size_bytes: int
     is_audio: bool
+    is_image: bool
     transcript_text: Optional[str] = None
     transcript_warning: Optional[str] = None
 
@@ -453,6 +505,8 @@ class DiscordBotService:
         self._backend_lock = asyncio.Lock()
         self._app_server_supervisors: dict[str, WorkspaceAppServerSupervisor] = {}
         self._app_server_lock = asyncio.Lock()
+        self._opencode_supervisors: dict[str, Any] = {}
+        self._opencode_lock = asyncio.Lock()
         self._app_server_state_root = resolve_global_state_root() / "workspaces"
         self._channel_directory_store = ChannelDirectoryStore(self._config.root)
         self._guild_name_cache: dict[str, str] = {}
@@ -841,94 +895,106 @@ class DiscordBotService:
         if not pma_enabled:
             paused = await self._find_paused_flow_run(workspace_root)
             if paused is not None:
-                reply_text = text
-                if has_attachments:
-                    (
-                        reply_text,
-                        saved_attachments,
-                        failed_attachments,
-                        transcript_message,
-                    ) = await self._with_attachment_context(
-                        prompt_text=text,
-                        workspace_root=workspace_root,
-                        attachments=event.attachments,
+                if self._is_user_ticket_pause(workspace_root, paused):
+                    log_event(
+                        self._logger,
+                        logging.INFO,
+                        "discord.flow.reply.skipped_for_user_ticket_pause",
                         channel_id=channel_id,
+                        run_id=paused.id,
                     )
-                    if transcript_message:
+                else:
+                    reply_text = text
+                    if has_attachments:
+                        (
+                            reply_text,
+                            saved_attachments,
+                            failed_attachments,
+                            transcript_message,
+                            _native_input_items,
+                        ) = await self._with_attachment_context(
+                            prompt_text=text,
+                            workspace_root=workspace_root,
+                            attachments=event.attachments,
+                            channel_id=channel_id,
+                        )
+                        if transcript_message:
+                            await self._send_channel_message_safe(
+                                channel_id,
+                                {
+                                    "content": transcript_message,
+                                    "allowed_mentions": {"parse": []},
+                                },
+                            )
+                        if failed_attachments > 0:
+                            warning = (
+                                "Some Discord attachments could not be downloaded. "
+                                "Continuing with available inputs."
+                            )
+                            await self._send_channel_message_safe(
+                                channel_id,
+                                {"content": warning},
+                            )
+                        if not reply_text.strip() and saved_attachments == 0:
+                            await self._send_channel_message_safe(
+                                channel_id,
+                                {
+                                    "content": (
+                                        "Failed to download attachments from Discord. "
+                                        "Please retry."
+                                    ),
+                                },
+                            )
+                            return
+
+                    reply_path = self._write_user_reply(
+                        workspace_root, paused, reply_text
+                    )
+                    run_mirror = self._flow_run_mirror(workspace_root)
+                    run_mirror.mirror_inbound(
+                        run_id=paused.id,
+                        platform="discord",
+                        event_type="flow_reply_message",
+                        kind="command",
+                        actor="user",
+                        text=reply_text,
+                        chat_id=channel_id,
+                        thread_id=event.thread.thread_id,
+                        message_id=event.message.message_id,
+                    )
+                    controller = build_ticket_flow_controller(workspace_root)
+                    try:
+                        updated = await controller.resume_flow(paused.id)
+                    except ValueError as exc:
                         await self._send_channel_message_safe(
                             channel_id,
-                            {
-                                "content": transcript_message,
-                                "allowed_mentions": {"parse": []},
-                            },
-                        )
-                    if failed_attachments > 0:
-                        warning = (
-                            "Some Discord attachments could not be downloaded. "
-                            "Continuing with available inputs."
-                        )
-                        await self._send_channel_message_safe(
-                            channel_id,
-                            {"content": warning},
-                        )
-                    if not reply_text.strip() and saved_attachments == 0:
-                        await self._send_channel_message_safe(
-                            channel_id,
-                            {
-                                "content": (
-                                    "Failed to download attachments from Discord. "
-                                    "Please retry."
-                                ),
-                            },
+                            {"content": f"Failed to resume paused run: {exc}"},
                         )
                         return
-
-                reply_path = self._write_user_reply(workspace_root, paused, reply_text)
-                run_mirror = self._flow_run_mirror(workspace_root)
-                run_mirror.mirror_inbound(
-                    run_id=paused.id,
-                    platform="discord",
-                    event_type="flow_reply_message",
-                    kind="command",
-                    actor="user",
-                    text=reply_text,
-                    chat_id=channel_id,
-                    thread_id=event.thread.thread_id,
-                    message_id=event.message.message_id,
-                )
-                controller = build_ticket_flow_controller(workspace_root)
-                try:
-                    updated = await controller.resume_flow(paused.id)
-                except ValueError as exc:
+                    ensure_result = ensure_worker(
+                        workspace_root,
+                        updated.id,
+                        is_terminal=updated.status.is_terminal(),
+                    )
+                    self._close_worker_handles(ensure_result)
+                    content = format_discord_message(
+                        f"Reply saved to `{reply_path.name}` and resumed paused run `{updated.id}`."
+                    )
                     await self._send_channel_message_safe(
                         channel_id,
-                        {"content": f"Failed to resume paused run: {exc}"},
+                        {"content": content},
+                    )
+                    run_mirror.mirror_outbound(
+                        run_id=updated.id,
+                        platform="discord",
+                        event_type="flow_reply_notice",
+                        kind="notice",
+                        actor="car",
+                        text=content,
+                        chat_id=channel_id,
+                        thread_id=event.thread.thread_id,
                     )
                     return
-                ensure_result = ensure_worker(
-                    workspace_root,
-                    updated.id,
-                    is_terminal=updated.status.is_terminal(),
-                )
-                self._close_worker_handles(ensure_result)
-                content = format_discord_message(
-                    f"Reply saved to `{reply_path.name}` and resumed paused run `{updated.id}`."
-                )
-                await self._send_channel_message_safe(
-                    channel_id,
-                    {"content": content},
-                )
-                run_mirror.mirror_outbound(
-                    run_id=updated.id,
-                    platform="discord",
-                    event_type="flow_reply_notice",
-                    kind="notice",
-                    actor="car",
-                    text=content,
-                    chat_id=channel_id,
-                    thread_id=event.thread.thread_id,
-                )
-                return
 
         if text.startswith("!") and not event.attachments:
             await self._handle_bang_shell(
@@ -945,6 +1011,7 @@ class DiscordBotService:
             saved_attachments,
             failed_attachments,
             transcript_message,
+            attachment_input_items,
         ) = await self._with_attachment_context(
             prompt_text=prompt_text,
             workspace_root=workspace_root,
@@ -1047,18 +1114,27 @@ class DiscordBotService:
             pma_enabled=pma_enabled,
             agent=agent,
         )
+        turn_input_items: Optional[list[dict[str, Any]]] = None
+        if attachment_input_items:
+            turn_input_items = [
+                {"type": "text", "text": prompt_text},
+                *attachment_input_items,
+            ]
+        run_turn_kwargs: dict[str, Any] = {
+            "workspace_root": workspace_root,
+            "prompt_text": prompt_text,
+            "agent": agent,
+            "model_override": model_override,
+            "reasoning_effort": reasoning_effort,
+            "session_key": session_key,
+            "orchestrator_channel_key": (
+                channel_id if not pma_enabled else f"pma:{channel_id}"
+            ),
+        }
+        if turn_input_items:
+            run_turn_kwargs["input_items"] = turn_input_items
         try:
-            turn_result = await self._run_agent_turn_for_message(
-                workspace_root=workspace_root,
-                prompt_text=prompt_text,
-                agent=agent,
-                model_override=model_override,
-                reasoning_effort=reasoning_effort,
-                session_key=session_key,
-                orchestrator_channel_key=(
-                    channel_id if not pma_enabled else f"pma:{channel_id}"
-                ),
-            )
+            turn_result = await self._run_agent_turn_for_message(**run_turn_kwargs)
         except Exception as exc:
             log_event(
                 self._logger,
@@ -1081,10 +1157,8 @@ class DiscordBotService:
             )
             return
 
-        preview_message_id: Optional[str] = None
         if isinstance(turn_result, DiscordMessageTurnResult):
             response_text = turn_result.final_message
-            preview_message_id = turn_result.preview_message_id
             metrics_text = _format_turn_metrics(
                 turn_result.token_usage,
                 turn_result.elapsed_seconds,
@@ -1093,7 +1167,7 @@ class DiscordBotService:
                 if response_text.strip():
                     response_text = f"{response_text}\n\n{metrics_text}"
                 else:
-                    response_text = metrics_text
+                    response_text = f"(No response text returned.)\n\n{metrics_text}"
         else:
             response_text = str(turn_result or "")
 
@@ -1109,12 +1183,6 @@ class DiscordBotService:
                 channel_id,
                 {"content": chunk},
                 record_id=f"turn:{session_key}:{idx}:{uuid.uuid4().hex[:8]}",
-            )
-        if preview_message_id:
-            await self._delete_channel_message_safe(
-                channel_id,
-                preview_message_id,
-                record_id=f"turn-preview-delete:{session_key}:{uuid.uuid4().hex[:8]}",
             )
         await self._flush_outbox_files(
             workspace_root=workspace_root,
@@ -1278,9 +1346,9 @@ class DiscordBotService:
         workspace_root: Path,
         attachments: tuple[Any, ...],
         channel_id: str,
-    ) -> tuple[str, int, int, Optional[str]]:
+    ) -> tuple[str, int, int, Optional[str], Optional[list[dict[str, Any]]]]:
         if not attachments:
-            return prompt_text, 0, 0, None
+            return prompt_text, 0, 0, None, None
 
         inbox = inbox_dir(workspace_root)
         inbox.mkdir(parents=True, exist_ok=True)
@@ -1315,6 +1383,10 @@ class DiscordBotService:
                 is_audio = self._is_audio_attachment(
                     attachment, mime_type if isinstance(mime_type, str) else None
                 )
+                is_image = is_image_mime_or_path(
+                    mime_type if isinstance(mime_type, str) else None,
+                    str(original_name),
+                )
                 transcript_text, transcript_warning = (
                     await self._transcribe_voice_attachment(
                         workspace_root=workspace_root,
@@ -1332,6 +1404,7 @@ class DiscordBotService:
                         mime_type=mime_type if isinstance(mime_type, str) else None,
                         size_bytes=len(data),
                         is_audio=is_audio,
+                        is_image=is_image,
                         transcript_text=transcript_text,
                         transcript_warning=transcript_warning,
                     )
@@ -1348,7 +1421,7 @@ class DiscordBotService:
                 )
 
         if not saved:
-            return prompt_text, 0, failed, None
+            return prompt_text, 0, failed, None, None
 
         transcript_lines: list[str] = []
         transcript_items = [item for item in saved if item.transcript_text]
@@ -1401,13 +1474,22 @@ class DiscordBotService:
                     "\n".join(
                         [
                             f"Inbox: {inbox}",
+                            f"Outbox: {outbox_dir(workspace_root)}",
                             f"Outbox (pending): {outbox_pending_dir(workspace_root)}",
-                            "Use inbox files as local inputs and place reply files in outbox (pending).",
+                            "Use inbox files as local inputs and place reply files in outbox.",
                         ]
                     )
                 )
             )
         attachment_context = "\n".join(details)
+        native_input_items = [
+            {"type": "localImage", "path": str(item.path)}
+            for item in saved
+            if item.is_image
+        ]
+        native_input_items_payload: Optional[list[dict[str, Any]]] = (
+            native_input_items if native_input_items else None
+        )
 
         if prompt_text.strip():
             separator = "\n" if prompt_text.endswith("\n") else "\n\n"
@@ -1416,8 +1498,15 @@ class DiscordBotService:
                 len(saved),
                 failed,
                 user_visible_transcript,
+                native_input_items_payload,
             )
-        return attachment_context, len(saved), failed, user_visible_transcript
+        return (
+            attachment_context,
+            len(saved),
+            failed,
+            user_visible_transcript,
+            native_input_items_payload,
+        )
 
     def _build_attachment_filename(self, attachment: Any, *, index: int) -> str:
         raw_name = getattr(attachment, "file_name", None) or f"attachment-{index}"
@@ -1480,6 +1569,30 @@ class DiscordBotService:
             return None
         finally:
             store.close()
+
+    def _is_user_ticket_pause(
+        self, workspace_root: Path, record: FlowRunRecord
+    ) -> bool:
+        state = getattr(record, "state", None)
+        if not isinstance(state, dict):
+            return False
+        engine = state.get("ticket_engine")
+        if not isinstance(engine, dict):
+            return False
+        if str(engine.get("reason_code") or "").strip().lower() != "user_pause":
+            return False
+        current_ticket = engine.get("current_ticket")
+        if not isinstance(current_ticket, str) or not current_ticket.strip():
+            return False
+        ticket_path = (workspace_root / current_ticket).resolve()
+        if not ticket_path.is_file() or not is_within(workspace_root, ticket_path):
+            return False
+        ticket_doc, errors = read_ticket(ticket_path)
+        if errors or ticket_doc is None:
+            return False
+        return ticket_doc.frontmatter.agent == "user" and not bool(
+            ticket_doc.frontmatter.done
+        )
 
     async def _maybe_inject_github_context(
         self,
@@ -1637,6 +1750,64 @@ class DiscordBotService:
                 await asyncio.sleep(sleep_time)
                 delay = min(delay * 2, APP_SERVER_START_BACKOFF_MAX_SECONDS)
 
+    async def _opencode_supervisor_for_workspace(
+        self, workspace_root: Path
+    ) -> Optional[Any]:
+        key = str(workspace_root)
+        async with self._opencode_lock:
+            existing = self._opencode_supervisors.get(key)
+            if existing is not None:
+                return existing
+            repo_config = load_repo_config(
+                workspace_root,
+                hub_path=self._hub_config_path,
+            )
+            supervisor = build_opencode_supervisor_from_repo_config(
+                repo_config,
+                workspace_root=workspace_root,
+                logger=self._logger,
+                base_env=None,
+            )
+            if supervisor is None:
+                return None
+            self._opencode_supervisors[key] = supervisor
+            return supervisor
+
+    async def _list_opencode_models_for_picker(
+        self,
+        *,
+        workspace_path: Optional[str],
+    ) -> Optional[list[tuple[str, str]]]:
+        if not isinstance(workspace_path, str) or not workspace_path.strip():
+            return None
+        try:
+            workspace_root = canonicalize_path(Path(workspace_path))
+        except Exception:
+            return None
+        if not workspace_root.exists() or not workspace_root.is_dir():
+            return None
+        supervisor = await self._opencode_supervisor_for_workspace(workspace_root)
+        if supervisor is None:
+            raise RuntimeError("OpenCode backend unavailable for this workspace")
+        harness = OpenCodeHarness(supervisor)
+        catalog = await harness.model_catalog(workspace_root)
+        options: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for model in catalog.models:
+            model_id = model.id.strip() if isinstance(model.id, str) else ""
+            if not model_id or model_id in seen:
+                continue
+            seen.add(model_id)
+            label = model_id
+            if (
+                isinstance(model.display_name, str)
+                and model.display_name
+                and not _display_name_is_model_alias(model_id, model.display_name)
+            ):
+                label = f"{model_id} ({model.display_name})"
+            options.append((model_id, label))
+        return options
+
     async def _list_threads_paginated(
         self,
         client: CodexAppServerClient,
@@ -1707,9 +1878,11 @@ class DiscordBotService:
             if thread_id in seen_ids:
                 continue
             seen_ids.add(thread_id)
-            label = thread_id
-            if thread_id == current_thread_id:
-                label = f"{thread_id} (current)"
+            label = _format_session_thread_picker_label(
+                thread_id,
+                entry,
+                is_current=thread_id == current_thread_id,
+            )
             items.append((thread_id, label))
             if len(items) >= DISCORD_SELECT_OPTION_MAX_OPTIONS:
                 break
@@ -1720,7 +1893,14 @@ class DiscordBotService:
         ):
             if len(items) >= DISCORD_SELECT_OPTION_MAX_OPTIONS:
                 items.pop()
-            items.append((current_thread_id, f"{current_thread_id} (current)"))
+            items.append(
+                (
+                    current_thread_id,
+                    _format_session_thread_picker_label(
+                        current_thread_id, {"id": current_thread_id}, is_current=True
+                    ),
+                )
+            )
         return items
 
     async def _list_recent_commits_for_picker(
@@ -1813,6 +1993,7 @@ class DiscordBotService:
         *,
         workspace_root: Path,
         prompt_text: str,
+        input_items: Optional[list[dict[str, Any]]] = None,
         agent: str,
         model_override: Optional[str],
         reasoning_effort: Optional[str],
@@ -1827,23 +2008,26 @@ class DiscordBotService:
             if orchestrator_channel_key.startswith("pma:")
             else orchestrator_channel_key
         )
+        max_progress_len = max(int(self._config.max_message_length), 32)
         tracker = TurnProgressTracker(
             started_at=time.monotonic(),
             agent=agent,
             model=model_override or "default",
             label="working",
             max_actions=DISCORD_TURN_PROGRESS_MAX_ACTIONS,
-            max_output_chars=DISCORD_TURN_PROGRESS_MAX_OUTPUT_CHARS,
+            max_output_chars=max_progress_len,
         )
         progress_message_id: Optional[str] = None
         progress_rendered: Optional[str] = None
         progress_last_updated = 0.0
         progress_failure_count = 0
         progress_heartbeat_task: Optional[asyncio.Task[None]] = None
-        max_progress_len = max(int(self._config.max_message_length), 32)
 
         async def _edit_progress(
-            *, force: bool = False, remove_components: bool = False
+            *,
+            force: bool = False,
+            remove_components: bool = False,
+            render_mode: str = "live",
         ) -> None:
             nonlocal progress_rendered
             nonlocal progress_last_updated
@@ -1858,7 +2042,10 @@ class DiscordBotService:
             ):
                 return
             rendered = render_progress_text(
-                tracker, max_length=max_progress_len, now=now
+                tracker,
+                max_length=max_progress_len,
+                now=now,
+                render_mode=render_mode,
             )
             content = truncate_for_discord(rendered, max_len=max_progress_len)
             if not force and content == progress_rendered:
@@ -1932,14 +2119,33 @@ class DiscordBotService:
         )
         known_session = orchestrator.get_thread_id(session_key)
         final_message = ""
+        assistant_stream_fallback = ""
+        completed_seen = False
         token_usage: Optional[dict[str, Any]] = None
         error_message = None
         session_from_events = known_session
+
+        def _merge_assistant_stream(current: str, incoming: str) -> str:
+            if not incoming:
+                return current
+            if not current:
+                return incoming
+            if len(incoming) > len(current) and incoming.startswith(current):
+                return incoming
+            # Collapse only partial overlap between current suffix and incoming prefix.
+            # Full-length overlap is left intact to avoid dropping legitimate repeats.
+            max_overlap = min(len(current), max(len(incoming) - 1, 0))
+            for overlap in range(max_overlap, 0, -1):
+                if current[-overlap:] == incoming[:overlap]:
+                    return f"{current}{incoming[overlap:]}"
+            return f"{current}{incoming}"
+
         try:
             async for run_event in orchestrator.run_turn(
                 agent_id=agent,
                 state=state,
                 prompt=prompt_text,
+                input_items=input_items,
                 model=model_override,
                 reasoning=reasoning_effort,
                 session_key=session_key,
@@ -1952,6 +2158,14 @@ class DiscordBotService:
                 elif isinstance(run_event, OutputDelta):
                     if run_event.delta_type == RUN_EVENT_DELTA_TYPE_USER_MESSAGE:
                         continue
+                    if (
+                        run_event.delta_type == "assistant_stream"
+                        and isinstance(run_event.content, str)
+                        and run_event.content
+                    ):
+                        assistant_stream_fallback = _merge_assistant_stream(
+                            assistant_stream_fallback, run_event.content
+                        )
                     if isinstance(run_event.content, str) and run_event.content.strip():
                         tracker.note_output(run_event.content)
                         await _edit_progress()
@@ -1985,16 +2199,44 @@ class DiscordBotService:
                         )
                 elif isinstance(run_event, Completed):
                     final_message = run_event.final_message or final_message
+                    completed_seen = True
+                    tracker.clear_transient_action()
                     tracker.set_label("done")
-                    await _edit_progress(force=True, remove_components=True)
+                    await _edit_progress(
+                        force=True,
+                        remove_components=True,
+                        render_mode="final",
+                    )
                 elif isinstance(run_event, Failed):
-                    error_message = run_event.error_message or "Turn failed"
+                    failed_message = run_event.error_message or "Turn failed"
+                    if completed_seen:
+                        log_event(
+                            self._logger,
+                            logging.WARNING,
+                            "discord.turn.failed_late_ignored",
+                            channel_id=progress_channel_id,
+                            session_key=session_key,
+                            error_message=failed_message,
+                            final_message_length=len(final_message),
+                            fallback_stream_length=len(assistant_stream_fallback),
+                        )
+                        tracker.clear_transient_action()
+                        tracker.set_label("done")
+                        await _edit_progress(
+                            force=True,
+                            remove_components=True,
+                            render_mode="final",
+                        )
+                        continue
+                    error_message = failed_message
                     tracker.note_error(error_message)
+                    tracker.clear_transient_action()
                     tracker.set_label("failed")
                     await _edit_progress(force=True, remove_components=True)
         except Exception as exc:
             error_message = str(exc) or "Turn failed"
             tracker.note_error(error_message)
+            tracker.clear_transient_action()
             tracker.set_label("failed")
             await _edit_progress(force=True, remove_components=True)
             raise
@@ -2007,6 +2249,16 @@ class DiscordBotService:
             orchestrator.set_thread_id(session_key, session_from_events)
         if error_message:
             raise RuntimeError(error_message)
+        if not final_message.strip() and assistant_stream_fallback.strip():
+            final_message = assistant_stream_fallback
+            log_event(
+                self._logger,
+                logging.INFO,
+                "discord.turn.final_message.fallback_stream",
+                channel_id=progress_channel_id,
+                session_key=session_key,
+                fallback_length=len(final_message),
+            )
         elapsed_seconds = max(0.0, time.monotonic() - tracker.started_at)
         return DiscordMessageTurnResult(
             final_message=final_message,
@@ -2728,6 +2980,12 @@ class DiscordBotService:
             supervisors = list(self._app_server_supervisors.values())
             self._app_server_supervisors.clear()
         for supervisor in supervisors:
+            with contextlib.suppress(Exception):
+                await supervisor.close_all()
+        async with self._opencode_lock:
+            opencode_supervisors = list(self._opencode_supervisors.values())
+            self._opencode_supervisors.clear()
+        for supervisor in opencode_supervisors:
             with contextlib.suppress(Exception):
                 await supervisor.close_all()
 
@@ -4154,7 +4412,10 @@ class DiscordBotService:
         safe_channel_id = re.sub(r"[^a-zA-Z0-9]+", "-", channel_id).strip("-")
         if not safe_channel_id:
             safe_channel_id = "channel"
-        branch_name = f"thread-{safe_channel_id}"
+        branch_suffix = hashlib.sha256(str(workspace_root).encode("utf-8")).hexdigest()[
+            :10
+        ]
+        branch_name = f"thread-{safe_channel_id}-{branch_suffix}"
 
         try:
             default_branch = await asyncio.to_thread(
@@ -4710,59 +4971,92 @@ class DiscordBotService:
                     text,
                 )
 
-            try:
-                client = await self._client_for_workspace(binding.get("workspace_path"))
-            except AppServerUnavailableError as exc:
-                log_event(
-                    self._logger,
-                    logging.WARNING,
-                    "discord.model.list.failed",
-                    channel_id=channel_id,
-                    agent=current_agent,
-                    exc=exc,
-                )
-                await _send_model_picker_or_fallback(
-                    _fallback_model_text(
-                        "Model picker unavailable right now (app server unavailable)."
-                    ),
-                )
-                return
-            if client is None:
-                await _send_model_picker_or_fallback(
-                    _fallback_model_text(
-                        "Workspace unavailable for model picker. Re-bind this channel with `/car bind` and try again."
-                    ),
-                )
-                return
-            try:
-                result = await _model_list_with_agent_compat(
-                    client,
-                    params={
-                        "cursor": None,
-                        "limit": DISCORD_SELECT_OPTION_MAX_OPTIONS,
-                        "agent": current_agent,
-                    },
-                )
-                model_items = _coerce_model_picker_items(result)
-            except Exception as exc:
-                log_event(
-                    self._logger,
-                    logging.WARNING,
-                    "discord.model.list.failed",
-                    channel_id=channel_id,
-                    agent=current_agent,
-                    exc=exc,
-                )
-                await _send_model_picker_or_fallback(
-                    _fallback_model_text("Failed to list models for picker."),
-                )
-                return
+            if current_agent == "opencode":
+                try:
+                    model_items = await self._list_opencode_models_for_picker(
+                        workspace_path=binding.get("workspace_path")
+                    )
+                except Exception as exc:
+                    log_event(
+                        self._logger,
+                        logging.WARNING,
+                        "discord.model.list.failed",
+                        channel_id=channel_id,
+                        agent=current_agent,
+                        exc=exc,
+                    )
+                    await _send_model_picker_or_fallback(
+                        _fallback_model_text("Failed to list models for picker."),
+                    )
+                    return
+                if model_items is None:
+                    await _send_model_picker_or_fallback(
+                        _fallback_model_text(
+                            "Workspace unavailable for model picker. Re-bind this channel with `/car bind` and try again."
+                        ),
+                    )
+                    return
+                if not model_items and not current_model:
+                    await _send_model_picker_or_fallback(
+                        _fallback_model_text("No models found from OpenCode."),
+                    )
+                    return
+            else:
+                try:
+                    client = await self._client_for_workspace(
+                        binding.get("workspace_path")
+                    )
+                except AppServerUnavailableError as exc:
+                    log_event(
+                        self._logger,
+                        logging.WARNING,
+                        "discord.model.list.failed",
+                        channel_id=channel_id,
+                        agent=current_agent,
+                        exc=exc,
+                    )
+                    await _send_model_picker_or_fallback(
+                        _fallback_model_text(
+                            "Model picker unavailable right now (app server unavailable)."
+                        ),
+                    )
+                    return
+                if client is None:
+                    await _send_model_picker_or_fallback(
+                        _fallback_model_text(
+                            "Workspace unavailable for model picker. Re-bind this channel with `/car bind` and try again."
+                        ),
+                    )
+                    return
+                try:
+                    result = await _model_list_with_agent_compat(
+                        client,
+                        params={
+                            "cursor": None,
+                            "limit": DISCORD_SELECT_OPTION_MAX_OPTIONS,
+                            "agent": current_agent,
+                        },
+                    )
+                    model_items = _coerce_model_picker_items(result)
+                except Exception as exc:
+                    log_event(
+                        self._logger,
+                        logging.WARNING,
+                        "discord.model.list.failed",
+                        channel_id=channel_id,
+                        agent=current_agent,
+                        exc=exc,
+                    )
+                    await _send_model_picker_or_fallback(
+                        _fallback_model_text("Failed to list models for picker."),
+                    )
+                    return
 
-            if not model_items and not current_model:
-                await _send_model_picker_or_fallback(
-                    _fallback_model_text("No models found from the app server."),
-                )
-                return
+                if not model_items and not current_model:
+                    await _send_model_picker_or_fallback(
+                        _fallback_model_text("No models found from the app server."),
+                    )
+                    return
 
             lines = [
                 f"Current agent: {current_agent}",
@@ -4796,6 +5090,16 @@ class DiscordBotService:
             )
             await self._respond_ephemeral(
                 interaction_id, interaction_token, "Model override cleared."
+            )
+            return
+
+        if current_agent == "opencode" and not _is_valid_opencode_model_name(
+            model_name
+        ):
+            await self._respond_ephemeral(
+                interaction_id,
+                interaction_token,
+                "OpenCode model must be in `provider/model` format.",
             )
             return
 
@@ -6506,22 +6810,55 @@ class DiscordBotService:
         workspace_root: Path,
         channel_id: str,
     ) -> None:
+        outbox_root = outbox_dir(workspace_root)
         pending_dir = outbox_pending_dir(workspace_root)
-        if not pending_dir.exists():
+        candidates: list[tuple[Path, Path]] = []
+        if outbox_root.exists():
+            for path in self._list_paths_in_dir(outbox_root):
+                candidates.append((outbox_root, path))
+        if pending_dir.exists():
+            for path in self._list_paths_in_dir(pending_dir):
+                candidates.append((pending_dir, path))
+        if not candidates:
             return
-        files = self._list_paths_in_dir(pending_dir)
-        if not files:
-            return
+
+        deduped: dict[str, tuple[Path, Path]] = {}
+        for source_dir, path in candidates:
+            key = str(path)
+            with contextlib.suppress(Exception):
+                key = str(canonicalize_path(path))
+            existing = deduped.get(key)
+            if existing is None:
+                deduped[key] = (source_dir, path)
+                continue
+            existing_source, _existing_path = existing
+            existing_is_root = existing_source == outbox_root
+            current_is_root = source_dir == outbox_root
+            # Preserve outbox-root candidates over pending aliases that resolve
+            # to the same canonical target (e.g., pending symlink to root file).
+            if existing_is_root and not current_is_root:
+                continue
+            if current_is_root and not existing_is_root:
+                deduped[key] = (source_dir, path)
+
+        def _mtime(item: tuple[Path, Path]) -> float:
+            _source, path = item
+            with contextlib.suppress(OSError):
+                return path.stat().st_mtime
+            return 0.0
+
+        files = sorted(deduped.values(), key=_mtime, reverse=True)
+
         sent_dir = outbox_sent_dir(workspace_root)
-        for path in files:
-            if not _path_within(pending_dir, path):
+        for source_dir, path in files:
+            if not _path_within(source_dir, path):
                 log_event(
                     self._logger,
                     logging.WARNING,
                     "discord.files.outbox.skipped_outside_pending",
                     channel_id=channel_id,
                     path=str(path),
-                    pending_dir=str(pending_dir),
+                    pending_dir=str(source_dir),
                 )
                 continue
             await self._send_outbox_file(
@@ -6573,11 +6910,23 @@ class DiscordBotService:
         *,
         workspace_root: Path,
     ) -> None:
+        outbox_root = outbox_dir(workspace_root)
         pending = outbox_pending_dir(workspace_root)
         sent = outbox_sent_dir(workspace_root)
+        root_files = self._list_files_in_dir(outbox_root)
+        root_files = [
+            entry for entry in root_files if entry[0] not in {"pending", "sent"}
+        ]
         pending_files = self._list_files_in_dir(pending)
         sent_files = self._list_files_in_dir(sent)
         lines = []
+        if root_files:
+            lines.append(f"Outbox root ({len(root_files)} file(s)):")
+            for name, size, mtime in root_files[:20]:
+                lines.append(f"- {name} ({self._format_file_size(size)}, {mtime})")
+            if len(root_files) > 20:
+                lines.append(f"... and {len(root_files) - 20} more")
+            lines.append("")
         if pending_files:
             lines.append(f"Outbox pending ({len(pending_files)} file(s)):")
             for name, size, mtime in pending_files[:20]:
@@ -6609,16 +6958,19 @@ class DiscordBotService:
     ) -> None:
         target = (options.get("target") or "all").lower().strip()
         inbox = inbox_dir(workspace_root)
+        outbox_root = outbox_dir(workspace_root)
         pending = outbox_pending_dir(workspace_root)
         sent = outbox_sent_dir(workspace_root)
         deleted = 0
         if target == "inbox":
             deleted = self._delete_files_in_dir(inbox)
         elif target == "outbox":
-            deleted = self._delete_files_in_dir(pending)
+            deleted = self._delete_files_in_dir(outbox_root)
+            deleted += self._delete_files_in_dir(pending)
             deleted += self._delete_files_in_dir(sent)
         elif target == "all":
             deleted = self._delete_files_in_dir(inbox)
+            deleted += self._delete_files_in_dir(outbox_root)
             deleted += self._delete_files_in_dir(pending)
             deleted += self._delete_files_in_dir(sent)
         else:
@@ -8138,50 +8490,6 @@ class DiscordBotService:
         if not chunks:
             chunks = ["(Review completed with no output.)"]
 
-        if preview_message_id:
-            if len(chunks) == 1:
-                try:
-                    await self._rest.edit_channel_message(
-                        channel_id=channel_id,
-                        message_id=preview_message_id,
-                        payload={"content": chunks[0]},
-                    )
-                    await self._flush_outbox_files(
-                        workspace_root=workspace_root,
-                        channel_id=channel_id,
-                    )
-                    log_event(
-                        self._logger,
-                        logging.INFO,
-                        "discord.review.completed",
-                        channel_id=channel_id,
-                        target_type=target_type,
-                    )
-                    return
-                except Exception as exc:
-                    log_event(
-                        self._logger,
-                        logging.WARNING,
-                        "discord.review.preview_edit_failed",
-                        channel_id=channel_id,
-                        message_id=preview_message_id,
-                        exc=exc,
-                    )
-            try:
-                await self._rest.delete_channel_message(
-                    channel_id=channel_id,
-                    message_id=preview_message_id,
-                )
-            except Exception as exc:
-                log_event(
-                    self._logger,
-                    logging.WARNING,
-                    "discord.review.preview_delete_failed",
-                    channel_id=channel_id,
-                    message_id=preview_message_id,
-                    exc=exc,
-                )
-
         for idx, chunk in enumerate(chunks, 1):
             await self._send_channel_message_safe(
                 channel_id,
@@ -8189,10 +8497,21 @@ class DiscordBotService:
                 record_id=f"review:{session_key}:{idx}:{uuid.uuid4().hex[:8]}",
             )
 
-        await self._flush_outbox_files(
-            workspace_root=workspace_root,
-            channel_id=channel_id,
-        )
+        try:
+            await self._flush_outbox_files(
+                workspace_root=workspace_root,
+                channel_id=channel_id,
+            )
+        except Exception as exc:
+            log_event(
+                self._logger,
+                logging.WARNING,
+                "discord.review.outbox_flush_failed",
+                channel_id=channel_id,
+                target_type=target_type,
+                message_id=preview_message_id,
+                exc=exc,
+            )
         log_event(
             self._logger,
             logging.INFO,

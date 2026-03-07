@@ -174,6 +174,15 @@ class CodexAppServerBackend(AgentBackend):
         self._event_queue: asyncio.Queue[RunEvent] = asyncio.Queue()
         self._latest_completed_agent_message: str = ""
 
+    def reset_session_state(self) -> None:
+        """Clear cached session/thread ids so the next turn starts fresh."""
+        self._session_id = None
+        self._thread_id = None
+        self._turn_id = None
+        self._thread_info = None
+        self._reasoning_summary_buffers.clear()
+        self._latest_completed_agent_message = ""
+
     async def _ensure_client(self) -> CodexAppServerClient:
         if self._client is None:
             self._client = await self._supervisor.get_client(self._workspace_root)
@@ -265,7 +274,11 @@ class CodexAppServerBackend(AgentBackend):
         return self._session_id
 
     async def run_turn(
-        self, session_id: str, message: str
+        self,
+        session_id: str,
+        message: str,
+        *,
+        input_items: Optional[list[dict[str, Any]]] = None,
     ) -> AsyncGenerator[AgentEvent, None]:
         client = await self._ensure_client()
         self._latest_completed_agent_message = ""
@@ -297,6 +310,7 @@ class CodexAppServerBackend(AgentBackend):
         handle = await client.turn_start(
             self._thread_id if self._thread_id else "default",
             text=message,
+            input_items=input_items,
             approval_policy=self._approval_policy,
             sandbox_policy=self._sandbox_policy,
             **turn_kwargs,
@@ -314,7 +328,11 @@ class CodexAppServerBackend(AgentBackend):
         yield AgentEvent.message_complete(final_message=final_text)
 
     async def run_turn_events(
-        self, session_id: str, message: str
+        self,
+        session_id: str,
+        message: str,
+        *,
+        input_items: Optional[list[dict[str, Any]]] = None,
     ) -> AsyncGenerator[RunEvent, None]:
         client = await self._ensure_client()
         self._latest_completed_agent_message = ""
@@ -361,6 +379,7 @@ class CodexAppServerBackend(AgentBackend):
         handle = await client.turn_start(
             actual_session_id if actual_session_id else "default",
             text=message,
+            input_items=input_items,
             approval_policy=self._approval_policy,
             sandbox_policy=self._sandbox_policy,
             **turn_kwargs,

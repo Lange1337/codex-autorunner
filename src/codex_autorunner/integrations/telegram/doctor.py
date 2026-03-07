@@ -10,6 +10,10 @@ from ...core.config import HubConfig, RepoConfig
 from ...core.optional_dependencies import missing_optional_dependencies
 from ...core.runtime import DoctorCheck
 from ...voice.config import VoiceConfig
+from ...voice.provider_catalog import (
+    local_voice_provider_spec,
+    missing_local_voice_runtime_commands,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -71,26 +75,65 @@ def telegram_doctor_checks(
 
         voice_raw = _resolve_voice_raw(config)
         voice_config = VoiceConfig.from_raw(voice_raw, env=os.environ)
+        local_provider_spec = local_voice_provider_spec(voice_config.provider)
         if (
             _telegram_voice_ingestion_enabled(telegram_cfg)
             and voice_config.enabled
-            and _normalize_voice_provider(voice_config.provider) == "local_whisper"
+            and local_provider_spec is not None
         ):
-            missing_local_voice = missing_optional_dependencies(
-                (("faster_whisper", "faster-whisper"),)
+            provider_name, deps, extra = local_provider_spec
+            missing_local_voice = missing_optional_dependencies(deps)
+            missing_runtime_commands = missing_local_voice_runtime_commands(
+                provider_name
             )
             if missing_local_voice:
+                missing_desc = ", ".join(missing_local_voice)
+                runtime_hint = ""
+                if missing_runtime_commands:
+                    missing_runtime_desc = ", ".join(missing_runtime_commands)
+                    runtime_hint = (
+                        " Required runtime command(s) are also missing from PATH: "
+                        f"{missing_runtime_desc}."
+                    )
                 checks.append(
                     DoctorCheck(
                         name="Telegram voice dependencies",
                         passed=False,
                         message=(
                             "Telegram voice transcription is configured with "
-                            "local_whisper but faster-whisper is not installed."
+                            f"{provider_name} but {missing_desc} is not installed."
+                            f"{runtime_hint}"
                         ),
                         check_id="telegram.voice.dependencies",
                         severity="error",
-                        fix="Install with `pip install codex-autorunner[voice-local]`.",
+                        fix=(
+                            f"Install with `pip install codex-autorunner[{extra}]`."
+                            + (
+                                " Install ffmpeg and ensure it is on PATH (for macOS: "
+                                "`brew install ffmpeg`)."
+                                if "ffmpeg" in missing_runtime_commands
+                                else ""
+                            )
+                        ),
+                    )
+                )
+            elif missing_runtime_commands:
+                missing_runtime_desc = ", ".join(missing_runtime_commands)
+                checks.append(
+                    DoctorCheck(
+                        name="Telegram voice dependencies",
+                        passed=False,
+                        message=(
+                            "Telegram voice transcription is configured with "
+                            f"{provider_name} but required runtime command(s) are "
+                            f"missing from PATH: {missing_runtime_desc}."
+                        ),
+                        check_id="telegram.voice.dependencies",
+                        severity="error",
+                        fix=(
+                            "Install ffmpeg and ensure it is on PATH (for macOS: "
+                            "`brew install ffmpeg`)."
+                        ),
                     )
                 )
             else:
@@ -99,8 +142,8 @@ def telegram_doctor_checks(
                         name="Telegram voice dependencies",
                         passed=True,
                         message=(
-                            "Telegram voice transcription is using local_whisper and "
-                            "local dependencies are installed."
+                            f"Telegram voice transcription is using {provider_name} "
+                            "and local dependencies are installed."
                         ),
                         check_id="telegram.voice.dependencies",
                         severity="info",
@@ -273,15 +316,6 @@ def _resolve_voice_raw(
         if isinstance(voice, dict):
             return voice
     return None
-
-
-def _normalize_voice_provider(provider: Any) -> str:
-    if not isinstance(provider, str):
-        return ""
-    normalized = provider.strip().lower()
-    if normalized == "local":
-        return "local_whisper"
-    return normalized
 
 
 def _telegram_voice_ingestion_enabled(telegram_cfg: dict[str, Any]) -> bool:
