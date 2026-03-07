@@ -86,6 +86,7 @@ Defaults are `--diagram-format png` and `--doc-format html`; add repeated format
 See the scoped design note: [docs/ops/markdown-mermaid-exports.md](docs/ops/markdown-mermaid-exports.md).
 
 ## Architecture docs
+- [Interactively explore the architecture on Principal Forks](https://app.principal-ade.com/Principal-Forks/codex-autorunner)
 - [Codebase constitution](docs/car_constitution/10_CODEBASE_CONSTITUTION.md)
 - [Architecture map](docs/car_constitution/20_ARCHITECTURE_MAP.md)
 - [Engineering standards](docs/car_constitution/30_ENGINEERING_STANDARDS.md)
