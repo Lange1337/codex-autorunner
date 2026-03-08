@@ -2939,6 +2939,94 @@ async def test_car_update_without_target_returns_picker(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
+async def test_car_tickets_returns_ticket_picker_components(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    ticket_dir = workspace / ".codex-autorunner" / "tickets"
+    ticket_dir.mkdir(parents=True)
+    (ticket_dir / "TICKET-001.md").write_text(
+        "---\ntitle: First\ndone: false\n---\n\nBody\n",
+        encoding="utf-8",
+    )
+    store = DiscordStateStore(tmp_path / "discord_state.sqlite3")
+    await store.initialize()
+    await store.upsert_binding(
+        channel_id="channel-1",
+        guild_id="guild-1",
+        workspace_path=str(workspace),
+        repo_id="repo-1",
+    )
+    rest = _FakeRest()
+    gateway = _FakeGateway([_interaction(name="tickets", options=[])])
+    service = DiscordBotService(
+        _config(tmp_path, allow_user_ids=frozenset({"user-1"})),
+        logger=logging.getLogger("test"),
+        rest_client=rest,
+        gateway_client=gateway,
+        state_store=store,
+        outbox_manager=_FakeOutboxManager(),
+    )
+
+    try:
+        await service.run_forever()
+        assert len(rest.interaction_responses) == 1
+        data = rest.interaction_responses[0]["payload"]["data"]
+        assert data["content"] == "Select a ticket to view or edit."
+        components = data.get("components") or []
+        assert [row["components"][0]["custom_id"] for row in components] == [
+            "tickets_filter_select",
+            "tickets_select",
+        ]
+    finally:
+        await store.close()
+
+
+@pytest.mark.anyio
+async def test_ticket_picker_rejects_modal_for_too_large_ticket(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    ticket_dir = workspace / ".codex-autorunner" / "tickets"
+    ticket_dir.mkdir(parents=True)
+    ticket_path = ticket_dir / "TICKET-001.md"
+    oversized_body = "x" * 4001
+    ticket_path.write_text(oversized_body, encoding="utf-8")
+    store = DiscordStateStore(tmp_path / "discord_state.sqlite3")
+    await store.initialize()
+    await store.upsert_binding(
+        channel_id="channel-1",
+        guild_id="guild-1",
+        workspace_path=str(workspace),
+        repo_id="repo-1",
+    )
+    rest = _FakeRest()
+    gateway = _FakeGateway(
+        [
+            _component_interaction(
+                custom_id="tickets_select",
+                values=[".codex-autorunner/tickets/TICKET-001.md"],
+            )
+        ]
+    )
+    service = DiscordBotService(
+        _config(tmp_path, allow_user_ids=frozenset({"user-1"})),
+        logger=logging.getLogger("test"),
+        rest_client=rest,
+        gateway_client=gateway,
+        state_store=store,
+        outbox_manager=_FakeOutboxManager(),
+    )
+
+    try:
+        await service.run_forever()
+        assert len(rest.interaction_responses) == 1
+        payload = rest.interaction_responses[0]["payload"]
+        assert payload["data"]["content"].startswith(
+            "`" + ".codex-autorunner/tickets/TICKET-001.md" + "` is too large to edit"
+        )
+        assert ticket_path.read_text(encoding="utf-8") == oversized_body
+    finally:
+        await store.close()
+
+
+@pytest.mark.anyio
 async def test_component_interaction_update_target_select_routes_update(
     tmp_path: Path,
 ) -> None:

@@ -33,6 +33,7 @@ def test_build_application_commands_structure_is_stable() -> None:
         "ids",
         "diff",
         "skills",
+        "tickets",
         "mcp",
         "init",
         "repos",

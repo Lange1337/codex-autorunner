@@ -150,15 +150,6 @@ def extract_modal_custom_id(interaction_payload: dict[str, Any]) -> Optional[str
     return _as_id(data.get("custom_id"))
 
 
-def extract_modal_text_values(interaction_payload: dict[str, Any]) -> dict[str, str]:
-    all_values = extract_modal_values(interaction_payload)
-    text_values: dict[str, str] = {}
-    for key, value in all_values.items():
-        if isinstance(value, str):
-            text_values[key] = value
-    return text_values
-
-
 def extract_modal_values(interaction_payload: dict[str, Any]) -> dict[str, Any]:
     data = interaction_payload.get("data")
     if not isinstance(data, dict):

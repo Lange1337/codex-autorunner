@@ -3917,11 +3917,14 @@ class DiscordBotService:
         if normalized_filter not in {"all", "open", "done"}:
             normalized_filter = "all"
         self._pending_ticket_filters[channel_id] = normalized_filter
-        await self._open_ticket_modal(
+        await self._respond_with_components(
             interaction_id,
             interaction_token,
-            workspace_root=workspace_root,
-            status_filter=normalized_filter,
+            "Select a ticket to view or edit.",
+            self._build_ticket_components(
+                workspace_root,
+                status_filter=normalized_filter,
+            ),
         )
 
     def _repo_autocomplete_value(self, repo_id: str) -> str:
@@ -4432,6 +4435,7 @@ class DiscordBotService:
             "/car ids - Show channel/user IDs for debugging",
             "/car diff [path] - Show git diff",
             "/car skills - List available skills",
+            "/car tickets - Browse and edit tickets",
             "/car mcp - Show MCP server status",
             "/car init - Generate AGENTS.md",
             "/car repos - List available repos",
@@ -4745,30 +4749,12 @@ class DiscordBotService:
             )
             return
 
-        status_filter_raw = self._extract_modal_single_select(
-            values, TICKETS_FILTER_SELECT_ID
-        )
-        status_filter = (
-            status_filter_raw
-            if isinstance(status_filter_raw, str)
-            else context.get("status_filter", "all")
-        )
-        normalized_filter = status_filter.strip().lower() if status_filter else "all"
-        if normalized_filter not in {"all", "open", "done"}:
-            normalized_filter = "all"
-        self._pending_ticket_filters[channel_id] = normalized_filter
-
-        ticket_rel_raw = self._extract_modal_single_select(values, TICKETS_SELECT_ID)
-        ticket_rel = (
-            ticket_rel_raw
-            if isinstance(ticket_rel_raw, str)
-            else context.get("ticket_rel")
-        )
+        ticket_rel = context.get("ticket_rel")
         if not isinstance(ticket_rel, str) or not ticket_rel or ticket_rel == "none":
             await self._respond_ephemeral(
                 interaction_id,
                 interaction_token,
-                "No ticket selected. Re-run `/car tickets` and choose one.",
+                "This ticket selection expired. Re-run `/car tickets` and choose one.",
             )
             return
 
@@ -4888,13 +4874,11 @@ class DiscordBotService:
         )
         if not workspace_root:
             return
-        status_filter = self._pending_ticket_filters.get(channel_id, "all")
         await self._open_ticket_modal(
             interaction_id,
             interaction_token,
             workspace_root=workspace_root,
             ticket_rel=values[0],
-            status_filter=status_filter,
         )
 
     async def _open_ticket_modal(
@@ -4903,59 +4887,52 @@ class DiscordBotService:
         interaction_token: str,
         *,
         workspace_root: Path,
-        ticket_rel: Optional[str] = None,
-        status_filter: str = "all",
+        ticket_rel: str,
     ) -> None:
-        normalized_filter = status_filter.strip().lower() if status_filter else "all"
-        if normalized_filter not in {"all", "open", "done"}:
-            normalized_filter = "all"
-        choices = self._list_ticket_choices(
-            workspace_root,
-            status_filter=normalized_filter,
-        )
-        selected_ticket = ticket_rel or (choices[0][0] if choices else "none")
-        selected_paths = {path for path, _label, _description in choices}
-        if selected_ticket not in selected_paths:
-            selected_ticket = choices[0][0] if choices else "none"
-
-        ticket_text = ""
-        if selected_ticket != "none":
-            ticket_dir = self._ticket_dir(workspace_root).resolve()
-            candidate = (workspace_root / selected_ticket).resolve()
-            try:
-                candidate.relative_to(ticket_dir)
-            except ValueError:
-                await self._respond_ephemeral(
-                    interaction_id,
-                    interaction_token,
-                    "Ticket path is invalid. Re-open the ticket list and try again.",
-                )
-                return
-            if not candidate.exists() or not candidate.is_file():
-                await self._respond_ephemeral(
-                    interaction_id,
-                    interaction_token,
-                    "Ticket file not found. Re-open the ticket list and try again.",
-                )
-                return
-            try:
-                ticket_text = candidate.read_text(encoding="utf-8")
-            except Exception as exc:
-                await self._respond_ephemeral(
-                    interaction_id,
-                    interaction_token,
-                    f"Failed to read ticket: {exc}",
-                )
-                return
+        ticket_dir = self._ticket_dir(workspace_root).resolve()
+        candidate = (workspace_root / ticket_rel).resolve()
+        try:
+            candidate.relative_to(ticket_dir)
+        except ValueError:
+            await self._respond_ephemeral(
+                interaction_id,
+                interaction_token,
+                "Ticket path is invalid. Re-open the ticket list and try again.",
+            )
+            return
+        if not candidate.exists() or not candidate.is_file():
+            await self._respond_ephemeral(
+                interaction_id,
+                interaction_token,
+                "Ticket file not found. Re-open the ticket list and try again.",
+            )
+            return
+        try:
+            ticket_text = candidate.read_text(encoding="utf-8")
+        except Exception as exc:
+            await self._respond_ephemeral(
+                interaction_id,
+                interaction_token,
+                f"Failed to read ticket: {exc}",
+            )
+            return
         max_len = 4000
         if len(ticket_text) > max_len:
-            ticket_text = ticket_text[: max_len - 20] + "\n\n...TRUNCATED..."
+            await self._respond_ephemeral(
+                interaction_id,
+                interaction_token,
+                (
+                    f"`{ticket_rel}` is too large to edit in a Discord modal "
+                    f"({len(ticket_text)} characters; limit {max_len}). "
+                    "Use the web UI or edit the file directly."
+                ),
+            )
+            return
 
         token = uuid.uuid4().hex[:12]
         self._pending_ticket_context[token] = {
             "workspace_root": str(workspace_root),
-            "ticket_rel": selected_ticket,
-            "status_filter": normalized_filter,
+            "ticket_rel": ticket_rel,
         }
 
         title = "Edit ticket"
@@ -4966,9 +4943,6 @@ class DiscordBotService:
             title=title,
             field_label="Ticket",
             field_value=ticket_text,
-            status_filter=normalized_filter,
-            ticket_choices=choices,
-            selected_ticket=selected_ticket,
         )
 
     async def _respond_modal(
@@ -4980,68 +4954,13 @@ class DiscordBotService:
         title: str,
         field_label: str,
         field_value: str,
-        status_filter: str,
-        ticket_choices: list[tuple[str, str, str]],
-        selected_ticket: str,
     ) -> None:
-        filter_options = [
-            {"label": "all", "value": "all", "default": status_filter == "all"},
-            {"label": "open", "value": "open", "default": status_filter == "open"},
-            {"label": "done", "value": "done", "default": status_filter == "done"},
-        ]
-        ticket_options = [
-            {
-                "label": label[:100],
-                "value": ticket_id[:100],
-                "description": description[:100] if description else None,
-                "default": ticket_id == selected_ticket,
-            }
-            for ticket_id, label, description in ticket_choices[
-                :DISCORD_SELECT_OPTION_MAX_OPTIONS
-            ]
-        ]
-        if not ticket_options:
-            ticket_options = [
-                {
-                    "label": "No tickets found",
-                    "value": "none",
-                    "description": "Create tickets first",
-                    "default": True,
-                }
-            ]
-        for option in ticket_options:
-            if option.get("description") is None:
-                option.pop("description", None)
         payload = {
             "type": 9,
             "data": {
                 "custom_id": custom_id[:100],
                 "title": title[:45],
                 "components": [
-                    {
-                        "type": 18,
-                        "label": "Filter",
-                        "component": {
-                            "type": 3,
-                            "custom_id": TICKETS_FILTER_SELECT_ID,
-                            "options": filter_options,
-                            "min_values": 1,
-                            "max_values": 1,
-                            "placeholder": "Filter tickets...",
-                        },
-                    },
-                    {
-                        "type": 18,
-                        "label": "Ticket",
-                        "component": {
-                            "type": 3,
-                            "custom_id": TICKETS_SELECT_ID,
-                            "options": ticket_options,
-                            "min_values": 1,
-                            "max_values": 1,
-                            "placeholder": "Select a ticket...",
-                        },
-                    },
                     {
                         "type": 18,
                         "label": field_label[:45],
