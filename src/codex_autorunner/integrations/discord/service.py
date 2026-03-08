@@ -52,6 +52,8 @@ from ...core.injected_context import wrap_injected_context
 from ...core.logging_utils import log_event
 from ...core.pma_context import build_hub_snapshot, format_pma_prompt, load_pma_prompt
 from ...core.ports.run_event import (
+    RUN_EVENT_DELTA_TYPE_ASSISTANT_MESSAGE,
+    RUN_EVENT_DELTA_TYPE_ASSISTANT_STREAM,
     RUN_EVENT_DELTA_TYPE_USER_MESSAGE,
     ApprovalRequested,
     Completed,
@@ -1194,6 +1196,7 @@ class DiscordBotService:
 
         if isinstance(turn_result, DiscordMessageTurnResult):
             response_text = turn_result.final_message
+            preview_message_id = turn_result.preview_message_id
             metrics_text = _format_turn_metrics(
                 turn_result.token_usage,
                 turn_result.elapsed_seconds,
@@ -1205,6 +1208,7 @@ class DiscordBotService:
                     response_text = f"(No response text returned.)\n\n{metrics_text}"
         else:
             response_text = str(turn_result or "")
+            preview_message_id = None
 
         chunks = chunk_discord_message(
             response_text or "(No response text returned.)",
@@ -1218,6 +1222,12 @@ class DiscordBotService:
                 channel_id,
                 {"content": chunk},
                 record_id=f"turn:{session_key}:{idx}:{uuid.uuid4().hex[:8]}",
+            )
+        if isinstance(preview_message_id, str) and preview_message_id:
+            await self._delete_channel_message_safe(
+                channel_id=channel_id,
+                message_id=preview_message_id,
+                record_id=f"turn:delete_progress:{session_key}:{uuid.uuid4().hex[:8]}",
             )
         await self._flush_outbox_files(
             workspace_root=workspace_root,
@@ -2057,6 +2067,7 @@ class DiscordBotService:
         progress_last_updated = 0.0
         progress_failure_count = 0
         progress_heartbeat_task: Optional[asyncio.Task[None]] = None
+        active_progress_labels = {"working", "queued", "running", "review"}
 
         async def _edit_progress(
             *,
@@ -2088,8 +2099,10 @@ class DiscordBotService:
             payload: dict[str, Any] = {"content": content}
             if remove_components:
                 payload["components"] = []
-            else:
+            elif tracker.label in active_progress_labels:
                 payload["components"] = [build_cancel_turn_button()]
+            else:
+                payload["components"] = []
             try:
                 await self._rest.edit_channel_message(
                     channel_id=progress_channel_id,
@@ -2194,7 +2207,11 @@ class DiscordBotService:
                     if run_event.delta_type == RUN_EVENT_DELTA_TYPE_USER_MESSAGE:
                         continue
                     if (
-                        run_event.delta_type == "assistant_stream"
+                        run_event.delta_type
+                        in {
+                            RUN_EVENT_DELTA_TYPE_ASSISTANT_STREAM,
+                            RUN_EVENT_DELTA_TYPE_ASSISTANT_MESSAGE,
+                        }
                         and isinstance(run_event.content, str)
                         and run_event.content
                     ):
@@ -2202,7 +2219,25 @@ class DiscordBotService:
                             assistant_stream_fallback, run_event.content
                         )
                     if isinstance(run_event.content, str) and run_event.content.strip():
-                        tracker.note_output(run_event.content)
+                        if (
+                            run_event.delta_type
+                            == RUN_EVENT_DELTA_TYPE_ASSISTANT_MESSAGE
+                        ):
+                            latest_output = tracker.latest_output_text().strip()
+                            incoming_output = run_event.content.strip()
+                            if latest_output and (
+                                incoming_output == latest_output
+                                or incoming_output.startswith(latest_output)
+                            ):
+                                tracker.note_output(run_event.content)
+                            else:
+                                tracker.note_output(
+                                    run_event.content,
+                                    new_segment=True,
+                                )
+                            tracker.end_output_segment()
+                        else:
+                            tracker.note_output(run_event.content)
                         await _edit_progress()
                 elif isinstance(run_event, ToolCall):
                     tool_name = (
@@ -2234,6 +2269,8 @@ class DiscordBotService:
                         )
                 elif isinstance(run_event, Completed):
                     final_message = run_event.final_message or final_message
+                    if final_message.strip():
+                        tracker.drop_terminal_output_if_duplicate(final_message)
                     completed_seen = True
                     tracker.clear_transient_action()
                     tracker.set_label("done")
@@ -2280,6 +2317,14 @@ class DiscordBotService:
                 progress_heartbeat_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await progress_heartbeat_task
+        if not error_message and not completed_seen:
+            tracker.clear_transient_action()
+            tracker.set_label("done")
+            await _edit_progress(
+                force=True,
+                remove_components=True,
+                render_mode="final",
+            )
         if session_from_events:
             orchestrator.set_thread_id(session_key, session_from_events)
         if error_message:
@@ -9100,6 +9145,14 @@ class DiscordBotService:
                 channel_id,
                 {"content": chunk},
                 record_id=f"review:{session_key}:{idx}:{uuid.uuid4().hex[:8]}",
+            )
+        if isinstance(preview_message_id, str) and preview_message_id:
+            await self._delete_channel_message_safe(
+                channel_id=channel_id,
+                message_id=preview_message_id,
+                record_id=(
+                    f"review:delete_progress:{session_key}:{uuid.uuid4().hex[:8]}"
+                ),
             )
 
         try:
