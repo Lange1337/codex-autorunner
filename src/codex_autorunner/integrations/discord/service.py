@@ -3709,7 +3709,7 @@ class DiscordBotService:
         choices: list[tuple[str, str, str]] = []
         normalized_filter = status_filter.strip().lower()
         if normalized_filter not in {"all", "open", "done"}:
-            normalized_filter = "open"
+            normalized_filter = "all"
         for path in list_ticket_paths(ticket_dir):
             frontmatter, errors = read_ticket_frontmatter(path)
             is_done = bool(frontmatter and frontmatter.done and not errors)
@@ -4735,20 +4735,35 @@ class DiscordBotService:
         ca_dir = target_root / ".codex-autorunner"
 
         try:
-            await asyncio.to_thread(
-                seed_repo_files,
-                target_root,
-                False,
-                False,
-            )
             hub_initialized = False
-            if find_nearest_hub_config_path(target_root) is None:
+            if (target_root / ".git").exists():
+                await asyncio.to_thread(
+                    seed_repo_files,
+                    target_root,
+                    False,
+                    True,
+                )
+                if find_nearest_hub_config_path(target_root) is None:
+                    await asyncio.to_thread(
+                        seed_hub_files,
+                        target_root,
+                        False,
+                    )
+                    hub_initialized = True
+            elif self._has_nested_git(target_root):
                 await asyncio.to_thread(
                     seed_hub_files,
                     target_root,
                     False,
                 )
                 hub_initialized = True
+            else:
+                await self._respond_ephemeral(
+                    interaction_id,
+                    interaction_token,
+                    "No .git directory found. Run git init or use the CLI `car init --git-init`.",
+                )
+                return
         except ConfigError as exc:
             await self._respond_ephemeral(
                 interaction_id,
@@ -4773,6 +4788,20 @@ class DiscordBotService:
             interaction_token,
             "\n".join(lines),
         )
+
+    @staticmethod
+    def _has_nested_git(path: Path) -> bool:
+        try:
+            for child in path.iterdir():
+                if not child.is_dir() or child.is_symlink():
+                    continue
+                if (child / ".git").exists():
+                    return True
+                if DiscordBotService._has_nested_git(child):
+                    return True
+        except OSError:
+            return False
+        return False
 
     async def _handle_repos(
         self,
