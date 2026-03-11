@@ -19,6 +19,8 @@ Config lives under `telegram_bot` in `codex-autorunner.yml` and the generated
 - `telegram_bot.allowed_user_ids`: allowlist of Telegram user ids.
 - `telegram_bot.require_topics`: if true, only accept messages in forum topics.
 - `telegram_bot.trigger_mode`: `all` (default) or `mentions` (only start runs when explicitly invoked).
+- `collaboration_policy.telegram`: optional shared-chat policy overlay for
+  topic/root destinations, modes, and per-destination plain-text triggers.
 - `telegram_bot.parse_mode`: `HTML`, `Markdown`, `MarkdownV2`, or null.
 - `telegram_bot.debug.prefix_context`: when true, prefix outgoing messages with routing metadata.
 - `telegram_bot.app_server_command(_env)`: how to launch `codex app-server`.
@@ -35,13 +37,15 @@ Required env vars are typically:
 - `CAR_TELEGRAM_APP_SERVER_COMMAND` (optional override)
 
 The allowlist must include both chat ids and user ids or the bot will ignore
-messages.
+messages. Those filters intersect, and `collaboration_policy.telegram.destinations`
+can further narrow root-chat vs topic behavior.
 
 ## Runtime flow
 
 1) `car telegram start --path <repo_or_hub>` starts the polling loop.
 2) `TelegramUpdatePoller` fetches updates from the Bot API.
-3) Updates are allowlisted, then routed by chat/topic to a workspace/thread.
+3) Updates are admitted through the shared collaboration policy, then routed by
+   chat/topic to a workspace/thread.
 4) Commands (`/bind`, `/new`, `/resume`, `/approvals`, `/interrupt`) run locally;
    normal messages are forwarded to the Codex app-server. `!<cmd>` runs a shell
    command in the bound workspace (if enabled).
@@ -55,9 +59,11 @@ topic (or chat root when topics are disabled) has its own routing key.
 
 ## Security and multi-user expectations
 
-There is no auth beyond the allowlist. For multi-user use, explicitly add each
-user id and chat id to the allowlist. The simplest setup is for each operator to
-create their own Telegram bot token and run their own instance.
+There is no auth beyond Telegram ids plus the configured collaboration policy.
+For multi-user use, explicitly add each user id and chat id to the allowlist and
+use topic-level destinations to decide which topics are active, command-only, or
+silent. The simplest setup is for each operator to create their own Telegram bot
+token and run their own instance.
 
 ## Observability
 
@@ -73,3 +79,14 @@ The bot logs structured events (e.g. `telegram.update.received`,
 3) Set env vars (`CAR_TELEGRAM_BOT_TOKEN`, optional `CAR_TELEGRAM_CHAT_ID`).
 4) Enable `telegram_bot.enabled` and set `allowed_user_ids`/`allowed_chat_ids`.
 5) Run `car telegram start --path <repo_or_hub>` and send `/status` or `/help`.
+
+## Migration guidance
+
+- Existing DM or single-topic installs can keep the legacy `telegram_bot`
+  allowlists and trigger settings unchanged.
+- Shared supergroups should migrate to explicit
+  `collaboration_policy.telegram.destinations` so root-chat vs topic behavior is
+  no longer implicit.
+- For shared groups, use `/ids` in the root chat and each topic, then gate the
+  root with either `require_topics=true` or an explicit root destination such as
+  `mode: silent`.

@@ -14,6 +14,10 @@ from ...voice.provider_catalog import (
     local_voice_provider_spec,
     missing_local_voice_runtime_commands,
 )
+from ..chat.collaboration_policy import (
+    CollaborationPolicyError,
+    build_discord_collaboration_policy,
+)
 from .config import (
     DEFAULT_APP_ID_ENV,
     DEFAULT_BOT_TOKEN_ENV,
@@ -31,6 +35,7 @@ def discord_doctor_checks(config: HubConfig) -> list[DoctorCheck]:
     checks: list[DoctorCheck] = []
     raw = config.raw if isinstance(config.raw, dict) else {}
     discord_bot_raw = raw.get("discord_bot")
+    collaboration_cfg = raw.get("collaboration_policy", {})
     discord_cfg: dict[str, Any] = (
         discord_bot_raw if isinstance(discord_bot_raw, dict) else {}
     )
@@ -316,6 +321,106 @@ def discord_doctor_checks(config: HubConfig) -> list[DoctorCheck]:
                 ),
                 check_id="discord.allowlists",
                 severity="info",
+            )
+        )
+    try:
+        policy = build_discord_collaboration_policy(
+            allowed_guild_ids=allowed_guild_ids,
+            allowed_channel_ids=allowed_channel_ids,
+            allowed_user_ids=allowed_user_ids,
+            collaboration_raw=(
+                collaboration_cfg.get("discord")
+                if isinstance(collaboration_cfg, dict)
+                else None
+            ),
+            shared_raw=(
+                collaboration_cfg if isinstance(collaboration_cfg, dict) else None
+            ),
+        )
+        checks.append(
+            DoctorCheck(
+                name="Discord collaboration policy",
+                passed=True,
+                message=(
+                    "Shared policy compiled: "
+                    f"{len(policy.allowed_actor_ids)} users, "
+                    f"{len(policy.allowed_container_ids)} guilds, "
+                    f"{len(policy.allowed_destination_ids)} channels, "
+                    f"{len(policy.destinations)} destinations, "
+                    f"default_mode={policy.default_mode}, "
+                    f"default_plain_text_trigger={policy.default_plain_text_trigger}"
+                ),
+                check_id="discord.collaboration_policy",
+                severity="info",
+            )
+        )
+        if policy.destinations:
+            checks.append(
+                DoctorCheck(
+                    name="Discord collaboration migration",
+                    passed=True,
+                    message=(
+                        "Explicit Discord collaboration destinations are configured. "
+                        "Use /car ids to copy exact guild/channel IDs and /car status "
+                        "to verify the effective mode and plain-text trigger in each "
+                        "channel."
+                    ),
+                    check_id="discord.collaboration_migration",
+                    severity="info",
+                )
+            )
+        else:
+            checks.append(
+                DoctorCheck(
+                    name="Discord collaboration migration",
+                    passed=True,
+                    message=(
+                        "Legacy dedicated-channel Discord setups still work with the "
+                        "current allowlists and binding flow. For shared guilds, "
+                        "migrate to collaboration_policy.discord with "
+                        "default_mode=command_only and explicit destinations."
+                    ),
+                    check_id="discord.collaboration_migration",
+                    severity="info",
+                )
+            )
+        if (
+            policy.destinations
+            and policy.default_mode == "active"
+            and policy.allowed_container_ids
+            and not policy.allowed_destination_ids
+        ):
+            checks.append(
+                DoctorCheck(
+                    name="Discord collaboration default mode",
+                    passed=True,
+                    message=(
+                        "Discord collaboration destinations are configured, but "
+                        "default_mode=active still leaves other allowlisted guild "
+                        "channels eligible for plain-text turns after they are bound "
+                        "or switched into PMA."
+                    ),
+                    check_id="discord.collaboration_policy.default_mode",
+                    severity="warning",
+                    fix=(
+                        "Set collaboration_policy.discord.default_mode to "
+                        "`command_only` when you want explicit active channels plus "
+                        "low-noise slash-command access elsewhere."
+                    ),
+                )
+            )
+    except CollaborationPolicyError as exc:
+        checks.append(
+            DoctorCheck(
+                name="Discord collaboration policy",
+                passed=False,
+                message=f"Discord collaboration policy is invalid: {exc}",
+                check_id="discord.collaboration_policy",
+                severity="error",
+                fix=(
+                    "Fix collaboration_policy.discord values so IDs, destination modes, "
+                    "and plain-text triggers are valid."
+                ),
             )
         )
 

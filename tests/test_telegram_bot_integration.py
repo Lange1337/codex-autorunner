@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import sys
 from pathlib import Path
 from typing import Optional
@@ -8,10 +9,12 @@ import pytest
 from codex_autorunner.integrations.telegram.adapter import (
     TelegramDocument,
     TelegramMessage,
+    TelegramMessageEntity,
     TelegramPhotoSize,
 )
 from codex_autorunner.integrations.telegram.config import TelegramBotConfig
 from codex_autorunner.integrations.telegram.service import TelegramBotService
+from codex_autorunner.integrations.telegram.types import PendingQuestion, SelectionState
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "app_server_fixture.py"
 
@@ -23,7 +26,11 @@ def fixture_command(scenario: str) -> list[str]:
 
 
 def make_config(
-    root: Path, command: list[str], overrides: Optional[dict[str, object]] = None
+    root: Path,
+    command: list[str],
+    overrides: Optional[dict[str, object]] = None,
+    *,
+    collaboration_raw: Optional[dict[str, object]] = None,
 ) -> TelegramBotConfig:
     raw = {
         "enabled": True,
@@ -39,7 +46,12 @@ def make_config(
         "CAR_TELEGRAM_BOT_TOKEN": "test-token",
         "CAR_TELEGRAM_CHAT_ID": "123",
     }
-    return TelegramBotConfig.from_raw(raw, root=root, env=env)
+    return TelegramBotConfig.from_raw(
+        raw,
+        root=root,
+        env=env,
+        collaboration_raw=collaboration_raw,
+    )
 
 
 def build_message(
@@ -50,6 +62,7 @@ def build_message(
     user_id: int = 456,
     message_id: int = 1,
     update_id: int = 1,
+    **kwargs: object,
 ) -> TelegramMessage:
     return TelegramMessage(
         update_id=update_id,
@@ -60,6 +73,7 @@ def build_message(
         text=text,
         date=0,
         is_topic_message=thread_id is not None,
+        **kwargs,
     )
 
 
@@ -72,6 +86,7 @@ def build_document_message(
     message_id: int = 1,
     update_id: int = 1,
     caption: Optional[str] = None,
+    **kwargs: object,
 ) -> TelegramMessage:
     return TelegramMessage(
         update_id=update_id,
@@ -84,6 +99,7 @@ def build_document_message(
         date=0,
         is_topic_message=thread_id is not None,
         document=document,
+        **kwargs,
     )
 
 
@@ -96,6 +112,7 @@ def build_photo_message(
     message_id: int = 1,
     update_id: int = 1,
     caption: Optional[str] = None,
+    **kwargs: object,
 ) -> TelegramMessage:
     return TelegramMessage(
         update_id=update_id,
@@ -108,6 +125,7 @@ def build_photo_message(
         date=0,
         is_topic_message=thread_id is not None,
         photos=photos,
+        **kwargs,
     )
 
 
@@ -121,6 +139,11 @@ def build_service_in_closed_loop(
     finally:
         asyncio.set_event_loop(None)
         loop.close()
+
+
+async def _drain_spawned_tasks(service: TelegramBotService) -> None:
+    while service._spawned_tasks:
+        await asyncio.gather(*tuple(service._spawned_tasks))
 
 
 class FakeBot:
@@ -239,6 +262,70 @@ async def test_status_creates_record(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
+async def test_status_reports_collaboration_policy_for_topic(tmp_path: Path) -> None:
+    config = make_config(
+        tmp_path,
+        fixture_command("basic"),
+        collaboration_raw={
+            "telegram": {
+                "destinations": [
+                    {
+                        "chat_id": 123,
+                        "thread_id": 55,
+                        "name": "ops",
+                        "mode": "command_only",
+                        "plain_text_trigger": "disabled",
+                    }
+                ]
+            }
+        },
+    )
+    service = TelegramBotService(config, hub_root=tmp_path)
+    fake_bot = FakeBot()
+    service._bot = fake_bot
+    message = build_message(
+        "/status",
+        thread_id=55,
+        chat_type="supergroup",
+        thread_title="Ops",
+    )
+    try:
+        await service._handle_status(message)
+    finally:
+        await service._app_server_supervisor.close_all()
+    text = fake_bot.messages[-1]["text"]
+    assert "Policy destination: ops" in text
+    assert "Policy mode: command_only" in text
+    assert "Policy plain-text: disabled" in text
+
+
+@pytest.mark.anyio
+async def test_ids_reports_collaboration_snippet_for_topic(tmp_path: Path) -> None:
+    config = make_config(tmp_path, fixture_command("basic"))
+    service = TelegramBotService(config, hub_root=tmp_path)
+    fake_bot = FakeBot()
+    service._bot = fake_bot
+    message = build_message(
+        "/ids",
+        thread_id=77,
+        chat_type="supergroup",
+        thread_title="Planning",
+    )
+    try:
+        await service._handle_ids(message)
+    finally:
+        await service._app_server_supervisor.close_all()
+    text = fake_bot.messages[-1]["text"]
+    assert "Topic key: 123:77" in text
+    assert "Suggested collaboration config:" in text
+    assert "collaboration_policy:" in text
+    assert "require_topics: true" in text
+    assert "thread_id: 77" in text
+    assert "mode: active" in text
+    assert "mode: silent" in text
+
+
+@pytest.mark.anyio
 async def test_normal_message_runs_turn(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -259,6 +346,398 @@ async def test_normal_message_runs_turn(tmp_path: Path) -> None:
         await service._app_server_supervisor.close_all()
     assert any("Bound to" in msg["text"] for msg in fake_bot.messages)
     assert any("fixture reply" in msg["text"] for msg in fake_bot.messages)
+
+
+@pytest.mark.anyio
+async def test_require_topics_blocks_root_chat_commands(tmp_path: Path) -> None:
+    config = make_config(
+        tmp_path,
+        fixture_command("basic"),
+        overrides={"require_topics": True},
+    )
+    service = TelegramBotService(config, hub_root=tmp_path)
+    fake_bot = FakeBot()
+    service._bot = fake_bot
+    message = build_message("/status", chat_type="supergroup")
+    try:
+        await service._handle_message(message)
+    finally:
+        await service._app_server_supervisor.close_all()
+    assert fake_bot.messages == []
+
+
+@pytest.mark.anyio
+async def test_command_only_topic_allows_commands_but_ignores_plain_text(
+    tmp_path: Path,
+) -> None:
+    config = make_config(
+        tmp_path,
+        fixture_command("basic"),
+        collaboration_raw={
+            "telegram": {
+                "destinations": [
+                    {
+                        "chat_id": 123,
+                        "thread_id": 77,
+                        "mode": "command_only",
+                    }
+                ]
+            }
+        },
+    )
+    service = TelegramBotService(config, hub_root=tmp_path)
+    fake_bot = FakeBot()
+    service._bot = fake_bot
+    status_message = build_message(
+        "/status",
+        thread_id=77,
+        message_id=10,
+        update_id=10,
+        chat_type="supergroup",
+        entities=(TelegramMessageEntity(type="bot_command", offset=0, length=7),),
+    )
+    plain_message = build_message(
+        "hello team",
+        thread_id=77,
+        message_id=11,
+        update_id=11,
+        chat_type="supergroup",
+    )
+    try:
+        await service._handle_message_inner(status_message)
+        await _drain_spawned_tasks(service)
+        count_after_status = len(fake_bot.messages)
+        await service._handle_message_inner(plain_message)
+        await _drain_spawned_tasks(service)
+    finally:
+        await service._app_server_supervisor.close_all()
+    assert count_after_status > 0
+    assert "Policy mode: command_only" in fake_bot.messages[-1]["text"]
+    assert len(fake_bot.messages) == count_after_status
+    assert not any("fixture reply" in msg["text"] for msg in fake_bot.messages)
+
+
+@pytest.mark.anyio
+async def test_silent_topic_ignores_commands_and_plain_text(tmp_path: Path) -> None:
+    config = make_config(
+        tmp_path,
+        fixture_command("basic"),
+        collaboration_raw={
+            "telegram": {
+                "destinations": [
+                    {
+                        "chat_id": 123,
+                        "thread_id": 77,
+                        "mode": "silent",
+                    }
+                ]
+            }
+        },
+    )
+    service = TelegramBotService(config, hub_root=tmp_path)
+    fake_bot = FakeBot()
+    service._bot = fake_bot
+    try:
+        await service._handle_message(
+            build_message(
+                "/status",
+                thread_id=77,
+                message_id=10,
+                update_id=10,
+                chat_type="supergroup",
+                entities=(
+                    TelegramMessageEntity(type="bot_command", offset=0, length=7),
+                ),
+            )
+        )
+        await _drain_spawned_tasks(service)
+        await service._handle_message(
+            build_message(
+                "hello team",
+                thread_id=77,
+                message_id=11,
+                update_id=11,
+                chat_type="supergroup",
+            )
+        )
+        await _drain_spawned_tasks(service)
+    finally:
+        await service._app_server_supervisor.close_all()
+    assert fake_bot.messages == []
+
+
+@pytest.mark.anyio
+async def test_mentions_only_topic_requires_invocation_before_turn_starts(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config = make_config(
+        tmp_path,
+        fixture_command("basic"),
+        collaboration_raw={
+            "telegram": {
+                "destinations": [
+                    {
+                        "chat_id": 123,
+                        "thread_id": 77,
+                        "mode": "active",
+                        "plain_text_trigger": "mentions",
+                    }
+                ]
+            }
+        },
+    )
+    service = TelegramBotService(config, hub_root=tmp_path)
+    service._bot_username = "TestBot"
+    fake_bot = FakeBot()
+    service._bot = fake_bot
+    bind_message = build_message("/bind", thread_id=77, message_id=10, update_id=10)
+    try:
+        await service._handle_bind(bind_message, str(repo))
+        before = len(fake_bot.messages)
+        await service._handle_message_inner(
+            build_message(
+                "hello team",
+                thread_id=77,
+                message_id=11,
+                update_id=11,
+                chat_type="supergroup",
+            )
+        )
+        await _drain_spawned_tasks(service)
+        after_plain_text = len(fake_bot.messages)
+        await service._handle_message_inner(
+            build_message(
+                "@TestBot hello team",
+                thread_id=77,
+                message_id=12,
+                update_id=12,
+                chat_type="supergroup",
+            )
+        )
+        await _drain_spawned_tasks(service)
+    finally:
+        await service._app_server_supervisor.close_all()
+    assert before == after_plain_text
+    assert any("fixture reply" in msg["text"] for msg in fake_bot.messages)
+
+
+@pytest.mark.anyio
+async def test_private_chat_stays_easy_with_mentions_trigger(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config = make_config(
+        tmp_path,
+        fixture_command("basic"),
+        overrides={"trigger_mode": "mentions"},
+    )
+    service = TelegramBotService(config, hub_root=tmp_path)
+    fake_bot = FakeBot()
+    service._bot = fake_bot
+    bind_message = build_message("/bind", message_id=10)
+    dm_message = build_message("hello from dm", message_id=11, chat_type="private")
+    try:
+        await service._handle_bind(bind_message, str(repo))
+        await service._handle_message_inner(dm_message)
+        await _drain_spawned_tasks(service)
+    finally:
+        await service._app_server_supervisor.close_all()
+    assert any("fixture reply" in msg["text"] for msg in fake_bot.messages)
+
+
+@pytest.mark.anyio
+async def test_private_chat_default_path_runs_without_collaboration_policy(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config = make_config(tmp_path, fixture_command("basic"))
+    service = TelegramBotService(config, hub_root=tmp_path)
+    fake_bot = FakeBot()
+    service._bot = fake_bot
+    bind_message = build_message("/bind", message_id=10, chat_type="private")
+    dm_message = build_message("hello from dm", message_id=11, chat_type="private")
+    try:
+        await service._handle_bind(bind_message, str(repo))
+        await service._handle_message_inner(dm_message)
+        await _drain_spawned_tasks(service)
+    finally:
+        await service._app_server_supervisor.close_all()
+    assert any("fixture reply" in msg["text"] for msg in fake_bot.messages)
+
+
+@pytest.mark.anyio
+async def test_silent_topic_blocks_pending_bind_reply(tmp_path: Path) -> None:
+    config = make_config(
+        tmp_path,
+        fixture_command("basic"),
+        collaboration_raw={
+            "telegram": {
+                "destinations": [
+                    {
+                        "chat_id": 123,
+                        "thread_id": 77,
+                        "mode": "silent",
+                    }
+                ]
+            }
+        },
+    )
+    service = TelegramBotService(config, hub_root=tmp_path)
+    fake_bot = FakeBot()
+    service._bot = fake_bot
+    key = await service._resolve_topic_key(123, 77)
+    service._bind_options[key] = SelectionState(
+        items=[("repo-basic", "repo-basic")],
+        requester_user_id="456",
+    )
+    message = build_message(
+        "1",
+        thread_id=77,
+        message_id=10,
+        update_id=10,
+        chat_type="supergroup",
+    )
+    try:
+        await service._handle_message_inner(message)
+        await _drain_spawned_tasks(service)
+        record = await service._router.get_topic(key)
+    finally:
+        await service._app_server_supervisor.close_all()
+    assert service._bind_options[key].items == [("repo-basic", "repo-basic")]
+    assert record is None or record.workspace_path is None
+    assert fake_bot.messages == []
+
+
+@pytest.mark.anyio
+async def test_pending_bind_reply_requires_original_user(tmp_path: Path) -> None:
+    config = make_config(
+        tmp_path,
+        fixture_command("basic"),
+        overrides={"trigger_mode": "disabled"},
+        collaboration_raw={
+            "telegram": {
+                "destinations": [
+                    {
+                        "chat_id": 123,
+                        "thread_id": 77,
+                        "mode": "command_only",
+                    }
+                ],
+                "allowed_user_ids": [456, 789],
+            }
+        },
+    )
+    service = TelegramBotService(config, hub_root=tmp_path)
+    fake_bot = FakeBot()
+    service._bot = fake_bot
+    key = await service._resolve_topic_key(123, 77)
+    service._bind_options[key] = SelectionState(
+        items=[("repo-basic", "repo-basic")],
+        requester_user_id="456",
+    )
+    message = build_message(
+        "1",
+        thread_id=77,
+        user_id=789,
+        message_id=10,
+        update_id=10,
+        chat_type="supergroup",
+    )
+    try:
+        await service._handle_message_inner(message)
+        await _drain_spawned_tasks(service)
+        record = await service._router.get_topic(key)
+    finally:
+        await service._app_server_supervisor.close_all()
+    assert service._bind_options[key].items == [("repo-basic", "repo-basic")]
+    assert record is None or record.workspace_path is None
+    assert fake_bot.messages == []
+
+
+@pytest.mark.anyio
+async def test_silent_topic_blocks_pending_custom_question_reply(
+    tmp_path: Path,
+) -> None:
+    config = make_config(
+        tmp_path,
+        fixture_command("basic"),
+        collaboration_raw={
+            "telegram": {
+                "destinations": [
+                    {
+                        "chat_id": 123,
+                        "thread_id": 77,
+                        "mode": "silent",
+                    }
+                ]
+            }
+        },
+    )
+    service = TelegramBotService(config, hub_root=tmp_path)
+    fake_bot = FakeBot()
+    service._bot = fake_bot
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[str | None] = loop.create_future()
+    service._pending_questions["req-1"] = PendingQuestion(
+        request_id="req-1",
+        turn_id="turn-1",
+        codex_thread_id=None,
+        chat_id=123,
+        thread_id=77,
+        topic_key="123:77",
+        requester_user_id="456",
+        message_id=99,
+        created_at="now",
+        question_index=0,
+        prompt="Need input",
+        options=[],
+        future=future,
+        awaiting_custom_input=True,
+    )
+    message = build_message(
+        "custom answer",
+        thread_id=77,
+        message_id=10,
+        update_id=10,
+        chat_type="supergroup",
+    )
+    try:
+        await service._handle_message(message)
+        await _drain_spawned_tasks(service)
+    finally:
+        await service._app_server_supervisor.close_all()
+    assert "req-1" in service._pending_questions
+    assert future.done() is False
+    assert fake_bot.messages == []
+
+
+@pytest.mark.anyio
+async def test_denied_user_is_ignored_and_logged(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config = make_config(tmp_path, fixture_command("basic"))
+    service = TelegramBotService(config, hub_root=tmp_path)
+    fake_bot = FakeBot()
+    service._bot = fake_bot
+    denied_message = build_message(
+        "hello",
+        user_id=999,
+        message_id=10,
+        update_id=10,
+        chat_type="supergroup",
+    )
+    caplog.set_level(logging.INFO)
+    try:
+        await service._handle_message_inner(denied_message)
+        await _drain_spawned_tasks(service)
+    finally:
+        await service._app_server_supervisor.close_all()
+    assert fake_bot.messages == []
+    assert "telegram.collaboration_policy.evaluated" in caplog.text
+    assert '"policy_outcome":"denied_actor"' in caplog.text
 
 
 @pytest.mark.anyio

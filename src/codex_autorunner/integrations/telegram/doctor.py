@@ -14,6 +14,10 @@ from ...voice.provider_catalog import (
     local_voice_provider_spec,
     missing_local_voice_runtime_commands,
 )
+from ..chat.collaboration_policy import (
+    CollaborationPolicyError,
+    build_telegram_collaboration_policy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,10 +45,14 @@ def telegram_doctor_checks(
         telegram_cfg = config.get("telegram_bot")
         if not telegram_cfg:
             telegram_cfg = config.get("notifications", {}).get("telegram", {})
+        collaboration_cfg = config.get("collaboration_policy", {})
     elif isinstance(config.raw, dict):
         telegram_cfg = config.raw.get("telegram_bot")
         if not telegram_cfg:
             telegram_cfg = config.raw.get("notifications", {}).get("telegram", {})
+        collaboration_cfg = config.raw.get("collaboration_policy", {})
+    else:
+        collaboration_cfg = {}
 
     enabled = isinstance(telegram_cfg, dict) and telegram_cfg.get("enabled") is True
 
@@ -222,6 +230,119 @@ def telegram_doctor_checks(
                     severity="info",
                 )
             )
+        try:
+            policy = build_telegram_collaboration_policy(
+                allowed_chat_ids=allowed_chats,
+                allowed_user_ids=allowed_users,
+                require_topics=bool(telegram_cfg.get("require_topics", False)),
+                trigger_mode=str(telegram_cfg.get("trigger_mode", "all")),
+                collaboration_raw=(
+                    collaboration_cfg.get("telegram")
+                    if isinstance(collaboration_cfg, dict)
+                    else None
+                ),
+                shared_raw=(
+                    collaboration_cfg if isinstance(collaboration_cfg, dict) else None
+                ),
+            )
+            checks.append(
+                DoctorCheck(
+                    name="Telegram collaboration policy",
+                    passed=True,
+                    message=(
+                        "Shared policy compiled: "
+                        f"{len(policy.allowed_actor_ids)} actors, "
+                        f"{len(policy.allowed_container_ids)} chats, "
+                        f"{len(policy.destinations)} destinations, "
+                        f"default_mode={policy.default_mode}, "
+                        f"default_plain_text_trigger={policy.default_plain_text_trigger}, "
+                        f"require_topics={policy.require_subdestination}"
+                    ),
+                    check_id="telegram.collaboration_policy",
+                    severity="info",
+                )
+            )
+            if policy.destinations:
+                checks.append(
+                    DoctorCheck(
+                        name="Telegram collaboration migration",
+                        passed=True,
+                        message=(
+                            "Explicit Telegram collaboration destinations are configured. "
+                            "Use /ids to capture exact chat/topic IDs and /status to verify "
+                            "the effective mode for each root chat or topic."
+                        ),
+                        check_id="telegram.collaboration_migration",
+                        severity="info",
+                    )
+                )
+            else:
+                checks.append(
+                    DoctorCheck(
+                        name="Telegram collaboration migration",
+                        passed=True,
+                        message=(
+                            "Legacy Telegram personal setups still work with the current "
+                            "allowlists. For shared supergroups, migrate to "
+                            "collaboration_policy.telegram.destinations and gate the "
+                            "root chat with require_topics or mode:silent."
+                        ),
+                        check_id="telegram.collaboration_migration",
+                        severity="info",
+                    )
+                )
+            if _policy_uses_mentions(policy):
+                checks.append(
+                    DoctorCheck(
+                        name="Telegram privacy mode guidance",
+                        passed=True,
+                        message=(
+                            "Mentions-based Telegram collaboration is configured. "
+                            "Disable BotFather privacy mode if you want plain-text "
+                            "group messages and @mentions to reach CAR."
+                        ),
+                        check_id="telegram.privacy_mode_guidance",
+                        severity="info",
+                    )
+                )
+            if (
+                _has_topic_destinations(policy)
+                and not policy.require_subdestination
+                and not _has_root_destinations(policy)
+                and policy.default_mode == "active"
+            ):
+                checks.append(
+                    DoctorCheck(
+                        name="Telegram root chat collaboration gap",
+                        passed=False,
+                        message=(
+                            "Topic destinations are configured, but the root chat "
+                            "still inherits default_mode=active. Root-chat messages "
+                            "can still reach CAR unless you gate or silence the root."
+                        ),
+                        check_id="telegram.collaboration_policy.root_chat",
+                        severity="warning",
+                        fix=(
+                            "Set telegram_bot.require_topics: true or add an explicit "
+                            "root destination such as `{ chat_id: <group>, mode: "
+                            "silent }`. Use /ids in Telegram to copy the exact IDs."
+                        ),
+                    )
+                )
+        except CollaborationPolicyError as exc:
+            checks.append(
+                DoctorCheck(
+                    name="Telegram collaboration policy",
+                    passed=False,
+                    message=f"Telegram collaboration policy is invalid: {exc}",
+                    check_id="telegram.collaboration_policy",
+                    severity="error",
+                    fix=(
+                        "Fix collaboration_policy.telegram values so IDs, destination modes, "
+                        "and plain-text triggers are valid."
+                    ),
+                )
+            )
 
         state_file_path = None
         if repo_root:
@@ -324,6 +445,29 @@ def _telegram_voice_ingestion_enabled(telegram_cfg: dict[str, Any]) -> bool:
     media_enabled = bool(media_cfg.get("enabled", True))
     media_voice = bool(media_cfg.get("voice", True))
     return media_enabled and media_voice
+
+
+def _has_topic_destinations(policy: Any) -> bool:
+    return any(
+        getattr(destination, "subdestination_id", None) is not None
+        for destination in getattr(policy, "destinations", ())
+    )
+
+
+def _has_root_destinations(policy: Any) -> bool:
+    return any(
+        getattr(destination, "subdestination_id", None) is None
+        for destination in getattr(policy, "destinations", ())
+    )
+
+
+def _policy_uses_mentions(policy: Any) -> bool:
+    if getattr(policy, "default_plain_text_trigger", None) == "mentions":
+        return True
+    return any(
+        getattr(destination, "plain_text_trigger", None) == "mentions"
+        for destination in getattr(policy, "destinations", ())
+    )
 
 
 def _check_stuck_turns(checks: list[DoctorCheck], state_file_path: Path) -> None:
