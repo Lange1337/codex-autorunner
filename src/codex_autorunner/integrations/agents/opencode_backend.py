@@ -90,6 +90,47 @@ class OpenCodeBackend(AgentBackend):
         self._session_id = None
         self._last_turn_id = None
 
+    async def aclose(self) -> None:
+        """Async close method that properly handles exceptions."""
+        if self._client is None:
+            return
+        client = self._client
+        self._client = None
+        try:
+            await client.close()
+        except Exception:
+            pass
+
+    def close(self) -> Optional[Any]:
+        """Close the backend client if created directly (base_url mode).
+
+        This method is called by AgentBackendFactory.close_all() to release
+        backend-owned clients. When a supervisor is used, the supervisor's
+        close_all() is called separately by the factory.
+        """
+        if self._client is None:
+            return None
+        client = self._client
+        self._client = None
+
+        async def _do_close() -> None:
+            try:
+                await client.close()
+            except Exception:
+                pass
+
+        return _do_close()
+
+    async def _mark_turn_started(self) -> None:
+        if self._supervisor is None or self._workspace_root is None:
+            return
+        await self._supervisor.mark_turn_started(self._workspace_root)
+
+    async def _mark_turn_finished(self) -> None:
+        if self._supervisor is None or self._workspace_root is None:
+            return
+        await self._supervisor.mark_turn_finished(self._workspace_root)
+
     def configure(self, **options: Any) -> None:
         self._model = options.get("model")
         reasoning = options.get("reasoning")
@@ -160,6 +201,28 @@ class OpenCodeBackend(AgentBackend):
         input_items: Optional[list[dict[str, Any]]] = None,
     ) -> AsyncGenerator[RunEvent, None]:
         _ = input_items
+
+        turn_started = False
+        try:
+            if self._supervisor is not None and self._workspace_root is not None:
+                # Ensure the supervisor has created the workspace handle before the
+                # active-turn counter is incremented, otherwise first-turn pruning
+                # can still reap the process while the turn is in flight.
+                await self._ensure_client()
+                await self._mark_turn_started()
+                turn_started = True
+
+            async for event in self._run_turn_events_impl(session_id, message):
+                yield event
+        finally:
+            if turn_started:
+                await self._mark_turn_finished()
+
+    async def _run_turn_events_impl(
+        self,
+        session_id: str,
+        message: str,
+    ) -> AsyncGenerator[RunEvent, None]:
         client = await self._ensure_client()
         workspace_root = self._workspace_root or Path(".")
         self._last_token_total = None
@@ -609,13 +672,13 @@ class OpenCodeBackend(AgentBackend):
         return session_id == self._session_id
 
     async def _ensure_client(self) -> OpenCodeClient:
+        if self._supervisor is not None and self._workspace_root is not None:
+            return await self._supervisor.get_client(self._workspace_root)
         if self._client is not None:
             return self._client
-        if self._supervisor is None or self._workspace_root is None:
-            raise RuntimeError("OpenCode client unavailable: supervisor not configured")
-        client = await self._supervisor.get_client(self._workspace_root)
-        self._client = client
-        return client
+        raise RuntimeError(
+            "OpenCode client unavailable: no supervisor and no base_url set"
+        )
 
     @property
     def last_turn_id(self) -> Optional[str]:

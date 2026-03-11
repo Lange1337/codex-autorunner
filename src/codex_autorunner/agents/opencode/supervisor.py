@@ -76,6 +76,12 @@ class OpenCodeHandle:
     active_turns: int = 0
 
 
+@dataclass(frozen=True)
+class OpenCodeSupervisorSnapshot:
+    cached_handles: int
+    active_turns: int
+
+
 class OpenCodeSupervisor:
     def __init__(
         self,
@@ -117,8 +123,21 @@ class OpenCodeSupervisor:
         self._lock: Optional[asyncio.Lock] = None
 
     @property
+    def idle_ttl_seconds(self) -> Optional[float]:
+        return self._idle_ttl_seconds
+
+    @property
     def session_stall_timeout_seconds(self) -> Optional[float]:
         return self._session_stall_timeout_seconds
+
+    async def lifecycle_snapshot(self) -> OpenCodeSupervisorSnapshot:
+        async with self._get_lock():
+            return OpenCodeSupervisorSnapshot(
+                cached_handles=len(self._handles),
+                active_turns=sum(
+                    handle.active_turns for handle in self._handles.values()
+                ),
+            )
 
     async def get_client(self, workspace_root: Path) -> OpenCodeClient:
         canonical_root = canonical_workspace_root(workspace_root)
@@ -856,9 +875,11 @@ class OpenCodeSupervisor:
             event_prefix="opencode.supervisor.terminate_record",
         )
 
-    async def _safe_close_client(self, client: OpenCodeClient) -> None:
+    async def _safe_close_client(self, client: Optional[OpenCodeClient]) -> None:
+        if client is None:
+            return
         try:
-            await self._safe_close_client(client)
+            await client.close()
         except Exception:
             pass
 
@@ -1000,4 +1021,9 @@ class OpenCodeSupervisor:
         )
 
 
-__all__ = ["OpenCodeHandle", "OpenCodeSupervisor", "OpenCodeSupervisorError"]
+__all__ = [
+    "OpenCodeHandle",
+    "OpenCodeSupervisor",
+    "OpenCodeSupervisorError",
+    "OpenCodeSupervisorSnapshot",
+]
