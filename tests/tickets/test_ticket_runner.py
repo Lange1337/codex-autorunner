@@ -134,9 +134,7 @@ async def test_ticket_runner_fails_when_required_context_file_missing(
     ticket_path = ticket_dir / "TICKET-001.md"
     _write_ticket(
         ticket_path,
-        frontmatter_extra=(
-            "context:\n" "  - path: docs/missing.md\n" "    required: true\n"
-        ),
+        frontmatter_extra=("context:\n  - path: docs/missing.md\n    required: true\n"),
     )
 
     pool = FakeAgentPool(
@@ -176,7 +174,7 @@ async def test_ticket_runner_marks_non_required_missing_context_in_prompt(
     _write_ticket(
         ticket_path,
         frontmatter_extra=(
-            "context:\n" "  - path: docs/optional-missing.md\n" "    required: false\n"
+            "context:\n  - path: docs/optional-missing.md\n    required: false\n"
         ),
     )
 
@@ -224,7 +222,7 @@ async def test_ticket_runner_includes_read_error_for_binary_context_file(
     _write_ticket(
         ticket_path,
         frontmatter_extra=(
-            "context:\n" "  - path: docs/binary.txt\n" "    required: false\n"
+            "context:\n  - path: docs/binary.txt\n    required: false\n"
         ),
     )
 
@@ -374,12 +372,7 @@ async def test_ticket_runner_delegates_selection_and_validation(
 
     def wrapped_select(**kwargs):
         result = real_select(**kwargs)
-        selected_ticket = result[0]
-        selected_rel_path = (
-            selected_ticket.get("rel_path", "")
-            if isinstance(selected_ticket, dict)
-            else ""
-        )
+        selected_rel_path = result.selected.rel_path if result.selected else ""
         calls.append(("select", selected_rel_path))
         return result
 
@@ -443,7 +436,13 @@ async def test_ticket_runner_respects_validation_pause_from_selection_seam(
 
     def paused_validation(**kwargs):
         _ = kwargs
-        return None, "paused", "user_pause", "Paused from validation seam.", []
+        from codex_autorunner.tickets.runner_types import TicketValidationResult
+
+        return TicketValidationResult(
+            status="paused",
+            pause_reason="Paused from validation seam.",
+            pause_reason_code="user_pause",
+        )
 
     monkeypatch.setattr(
         runner_module.runner_selection,
@@ -1184,3 +1183,127 @@ async def test_ticket_runner_pauses_after_two_no_diff_turns(tmp_path: Path) -> N
     assert second.state.get("reason_code") == "loop_no_diff"
     assert second.dispatch is not None
     assert second.dispatch.dispatch.mode == "pause"
+
+
+@pytest.mark.asyncio
+async def test_ticket_runner_requires_commit_before_advancing_done_ticket(
+    tmp_path: Path,
+) -> None:
+    workspace_root = tmp_path
+    _init_git_repo(workspace_root)
+    ticket_dir = workspace_root / ".codex-autorunner" / "tickets"
+    ticket_dir.mkdir(parents=True, exist_ok=True)
+    ticket_path = ticket_dir / "TICKET-001.md"
+    _write_ticket(ticket_path, done=False)
+
+    call_count = 0
+
+    def handler(req: AgentTurnRequest) -> AgentTurnResult:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            _set_ticket_done(ticket_path, done=True)
+            (workspace_root / "work.txt").write_text("dirty\n", encoding="utf-8")
+            return AgentTurnResult(
+                agent_id=req.agent_id,
+                conversation_id="conv1",
+                turn_id="t1",
+                text="done but dirty",
+            )
+
+        assert "<CAR_COMMIT_REQUIRED>" in req.prompt
+        subprocess.run(
+            ["git", "add", "-A"], cwd=workspace_root, check=True, capture_output=True
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "finish ticket"],
+            cwd=workspace_root,
+            check=True,
+            capture_output=True,
+        )
+        return AgentTurnResult(
+            agent_id=req.agent_id,
+            conversation_id="conv1",
+            turn_id="t2",
+            text="committed",
+        )
+
+    pool = FakeAgentPool(handler)
+    runner = TicketRunner(
+        workspace_root=workspace_root,
+        run_id="run-1",
+        config=TicketRunConfig(
+            ticket_dir=Path(".codex-autorunner/tickets"),
+            runs_dir=Path(".codex-autorunner/runs"),
+            auto_commit=False,
+        ),
+        agent_pool=pool,
+    )
+
+    first = await runner.step({})
+    assert first.status == "continue"
+    assert isinstance(first.state.get("commit"), dict)
+    assert first.state["commit"]["pending"] is True
+    assert (
+        first.state.get("current_ticket") == ".codex-autorunner/tickets/TICKET-001.md"
+    )
+
+    second = await runner.step(first.state)
+    assert second.status == "continue"
+    assert second.state.get("commit") is None
+    assert second.state.get("current_ticket") is None
+    assert len(pool.requests) == 2
+    assert "<CAR_COMMIT_REQUIRED>" in pool.requests[1].prompt
+
+
+@pytest.mark.asyncio
+async def test_ticket_runner_pauses_when_commit_retries_exhausted(
+    tmp_path: Path,
+) -> None:
+    workspace_root = tmp_path
+    _init_git_repo(workspace_root)
+    ticket_dir = workspace_root / ".codex-autorunner" / "tickets"
+    ticket_dir.mkdir(parents=True, exist_ok=True)
+    ticket_path = ticket_dir / "TICKET-001.md"
+    _write_ticket(ticket_path, done=False)
+
+    call_count = 0
+
+    def handler(req: AgentTurnRequest) -> AgentTurnResult:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            _set_ticket_done(ticket_path, done=True)
+            (workspace_root / "work.txt").write_text("dirty\n", encoding="utf-8")
+        else:
+            assert "<CAR_COMMIT_REQUIRED>" in req.prompt
+        return AgentTurnResult(
+            agent_id=req.agent_id,
+            conversation_id="conv1",
+            turn_id=f"t{call_count}",
+            text="still dirty",
+        )
+
+    pool = FakeAgentPool(handler)
+    runner = TicketRunner(
+        workspace_root=workspace_root,
+        run_id="run-1",
+        config=TicketRunConfig(
+            ticket_dir=Path(".codex-autorunner/tickets"),
+            runs_dir=Path(".codex-autorunner/runs"),
+            max_commit_retries=1,
+            auto_commit=False,
+        ),
+        agent_pool=pool,
+    )
+
+    first = await runner.step({})
+    assert first.status == "continue"
+    assert first.state.get("commit", {}).get("pending") is True
+
+    second = await runner.step(first.state)
+    assert second.status == "paused"
+    assert second.reason == "Commit failed after 1 attempts. Manual commit required."
+    assert "Working tree status" in (second.reason_details or "")
+    assert second.state.get("commit", {}).get("retries") == 1
+    assert len(pool.requests) == 2
