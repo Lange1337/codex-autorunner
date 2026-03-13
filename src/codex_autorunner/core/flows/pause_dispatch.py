@@ -24,6 +24,7 @@ class PauseDispatchSnapshot:
     dispatch_seq: str
     dispatch_markdown: str
     dispatch_dir: Optional[Path]
+    allow_resume_hint: bool = True
 
 
 def latest_dispatch_seq(history_dir: Path) -> Optional[str]:
@@ -37,6 +38,17 @@ def latest_dispatch_seq(history_dir: Path) -> Optional[str]:
     if not seqs:
         return None
     return max(seqs)
+
+
+def _iter_dispatch_history_dirs(history_dir: Path) -> list[Path]:
+    if not history_dir.exists() or not history_dir.is_dir():
+        return []
+    seq_dirs = [
+        child
+        for child in history_dir.iterdir()
+        if child.is_dir() and not child.name.startswith(".") and child.name.isdigit()
+    ]
+    return sorted(seq_dirs, key=lambda path: path.name, reverse=True)
 
 
 def _format_public_error(detail: str, *, limit: int = 200) -> str:
@@ -59,6 +71,31 @@ def format_pause_reason(record: FlowRunRecord) -> str:
         else "Paused without details."
     )
     return f"Reason: {reason}"
+
+
+def _render_dispatch_for_chat(*, title: Optional[str], body: str) -> str:
+    parts: list[str] = []
+    title_text = title.strip() if isinstance(title, str) and title.strip() else ""
+    body_text = body.strip()
+    if title_text:
+        parts.append(title_text)
+    if body_text:
+        parts.append(body_text)
+    return "\n\n".join(parts).strip()
+
+
+def _format_dispatch_parse_failure(*, seq: str, errors: list[str]) -> str:
+    lines = [f"Latest paused dispatch #{seq} is unreadable or invalid."]
+    if errors:
+        lines.append("")
+        lines.append("Errors:")
+        for error in errors[:5]:
+            lines.append(f"- {_format_public_error(error, limit=300)}")
+        if len(errors) > 5:
+            lines.append(f"- ...and {len(errors) - 5} more")
+    lines.append("")
+    lines.append("Fix DISPATCH.md for that paused turn before resuming.")
+    return "\n".join(lines)
 
 
 def load_latest_paused_ticket_flow_dispatch(
@@ -89,24 +126,71 @@ def load_latest_paused_ticket_flow_dispatch(
         workspace_root=workspace_root, runs_dir=runs_dir, run_id=latest.id
     )
     history_dir = paths.dispatch_history_dir
-    seq = latest_dispatch_seq(history_dir)
-    if not seq:
+    seq_dirs = _iter_dispatch_history_dirs(history_dir)
+    if not seq_dirs:
         return PauseDispatchSnapshot(
             run_id=latest.id,
             dispatch_seq="paused",
             dispatch_markdown=format_pause_reason(latest),
             dispatch_dir=None,
+            allow_resume_hint=True,
         )
 
-    message_path = history_dir / seq / "DISPATCH.md"
-    try:
-        content = message_path.read_text(encoding="utf-8")
-    except OSError:
-        return None
+    from ...tickets.outbox import parse_dispatch
+
+    handoff_snapshot: Optional[PauseDispatchSnapshot] = None
+    non_summary_snapshot: Optional[PauseDispatchSnapshot] = None
+    turn_summary_snapshot: Optional[PauseDispatchSnapshot] = None
+    error_snapshot: Optional[PauseDispatchSnapshot] = None
+    latest_seq = seq_dirs[0].name
+
+    for dispatch_dir in seq_dirs:
+        dispatch_path = dispatch_dir / "DISPATCH.md"
+        dispatch, errors = parse_dispatch(dispatch_path)
+        if errors or dispatch is None:
+            failure_snapshot = PauseDispatchSnapshot(
+                run_id=latest.id,
+                dispatch_seq=dispatch_dir.name,
+                dispatch_markdown=_format_dispatch_parse_failure(
+                    seq=dispatch_dir.name,
+                    errors=errors,
+                ),
+                dispatch_dir=dispatch_dir,
+                allow_resume_hint=False,
+            )
+            if dispatch_dir.name == latest_seq:
+                return failure_snapshot
+            if error_snapshot is None:
+                error_snapshot = failure_snapshot
+            continue
+        snapshot = PauseDispatchSnapshot(
+            run_id=latest.id,
+            dispatch_seq=dispatch_dir.name,
+            dispatch_markdown=_render_dispatch_for_chat(
+                title=dispatch.title,
+                body=dispatch.body,
+            ),
+            dispatch_dir=dispatch_dir,
+            allow_resume_hint=True,
+        )
+        if dispatch.is_handoff:
+            handoff_snapshot = snapshot
+            break
+        if dispatch.mode != "turn_summary" and non_summary_snapshot is None:
+            non_summary_snapshot = snapshot
+        if dispatch.mode == "turn_summary" and turn_summary_snapshot is None:
+            turn_summary_snapshot = snapshot
+
+    selected = handoff_snapshot or non_summary_snapshot or turn_summary_snapshot
+    if selected is not None:
+        return selected
+    if error_snapshot is not None:
+        return error_snapshot
 
     return PauseDispatchSnapshot(
         run_id=latest.id,
-        dispatch_seq=seq,
-        dispatch_markdown=content,
-        dispatch_dir=history_dir / seq,
+        dispatch_seq=latest_seq,
+        dispatch_markdown=format_pause_reason(latest),
+        dispatch_dir=seq_dirs[0],
+        allow_resume_hint=True,
     )

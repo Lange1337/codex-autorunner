@@ -22,6 +22,10 @@ from ...flows.ticket_flow.runtime_helpers import (
     spawn_ticket_flow_worker,
 )
 from ...manifest import load_manifest
+from ..chat.pause_notifications import (
+    format_pause_notification_source,
+    format_pause_notification_text,
+)
 from ..chat.run_mirror import ChatRunMirror
 from .adapter import chunk_message
 from .constants import TELEGRAM_MAX_MESSAGE_LENGTH
@@ -171,7 +175,8 @@ class TelegramTicketFlowBridge:
             return
         if pause is None:
             return
-        run_id, seq, content, archived_dir = pause
+        run_id, seq, content, archived_dir = pause[:4]
+        allow_resume_hint = pause[4] if len(pause) > 4 else True
         marker = f"{run_id}:{seq}"
         pending = [
             (key, record)
@@ -213,6 +218,7 @@ class TelegramTicketFlowBridge:
                 archived_dir=archived_dir,
                 workspace_root=workspace_root,
                 repo_id=getattr(primary_record, "repo_id", None),
+                allow_resume_hint=allow_resume_hint,
             )
             self._pause_targets[str(workspace_root)] = run_id
         except Exception as exc:
@@ -269,7 +275,7 @@ class TelegramTicketFlowBridge:
 
     def _load_ticket_flow_pause(
         self, workspace_root: Path
-    ) -> Optional[tuple[str, str, str, Optional[Path]]]:
+    ) -> Optional[tuple[str, str, str, Optional[Path], bool]]:
         snapshot = load_latest_paused_ticket_flow_dispatch(workspace_root)
         if snapshot is None:
             return None
@@ -278,6 +284,7 @@ class TelegramTicketFlowBridge:
             snapshot.dispatch_seq,
             snapshot.dispatch_markdown,
             snapshot.dispatch_dir,
+            snapshot.allow_resume_hint,
         )
 
     def get_paused_ticket_flow(
@@ -359,7 +366,8 @@ class TelegramTicketFlowBridge:
             return
         if pause is None:
             return
-        run_id, seq, content, archived_dir = pause
+        run_id, seq, content, archived_dir = pause[:4]
+        allow_resume_hint = pause[4] if len(pause) > 4 else True
         marker = f"{run_id}:{seq}"
         previous = self._last_default_notification.get(workspace_root)
         if previous == marker:
@@ -373,6 +381,7 @@ class TelegramTicketFlowBridge:
                 content=content,
                 archived_dir=archived_dir,
                 workspace_root=workspace_root,
+                allow_resume_hint=allow_resume_hint,
             )
             self._last_default_notification[workspace_root] = marker
             self._pause_targets[str(workspace_root)] = run_id
@@ -448,6 +457,7 @@ class TelegramTicketFlowBridge:
         archived_dir: Optional[Path],
         workspace_root: Optional[Path],
         repo_id: Optional[str] = None,
+        allow_resume_hint: bool = True,
     ) -> None:
         await self._send_dispatch_text(
             chat_id,
@@ -457,6 +467,7 @@ class TelegramTicketFlowBridge:
             content=content,
             workspace_root=workspace_root,
             repo_id=repo_id,
+            allow_resume_hint=allow_resume_hint,
         )
         if self._pause_config.send_attachments and archived_dir:
             await self._send_dispatch_attachments(
@@ -477,20 +488,21 @@ class TelegramTicketFlowBridge:
         content: str,
         workspace_root: Optional[Path],
         repo_id: Optional[str] = None,
+        allow_resume_hint: bool = True,
     ) -> None:
         run_mirror = (
             ChatRunMirror(workspace_root, logger_=self._logger)
             if isinstance(workspace_root, Path)
             else None
         )
-        body = content.strip() or "(no dispatch message)"
         source = self._format_dispatch_source(workspace_root, repo_id)
-        header = (
-            f"Ticket flow paused (run {run_id}). Latest dispatch #{seq}:\n"
-            f"Source: {source}\n\n"
+        full_text = format_pause_notification_text(
+            run_id=run_id,
+            dispatch_seq=seq,
+            content=content,
+            source=source,
+            resume_hint="`/flow resume`" if allow_resume_hint else "",
         )
-        footer = "\n\nUse /flow resume to continue."
-        full_text = f"{header}{body}{footer}"
 
         if self._pause_config.chunk_long_messages:
             chunks = chunk_message(
@@ -526,34 +538,14 @@ class TelegramTicketFlowBridge:
     def _format_dispatch_source(
         self, workspace_root: Optional[Path], repo_id: Optional[str]
     ) -> str:
-        workspace_label = None
-        if isinstance(workspace_root, Path):
-            workspace_label = str(workspace_root)
-        repo_label = repo_id.strip() if isinstance(repo_id, str) else ""
-        if self._hub_root and self._manifest_path and self._manifest_path.exists():
-            try:
-                manifest = load_manifest(self._manifest_path, self._hub_root)
-                if workspace_root:
-                    entry = manifest.get_by_path(self._hub_root, workspace_root)
-                else:
-                    entry = None
-                if entry:
-                    repo_label = entry.id or repo_label
-                    if entry.display_name and entry.display_name != repo_label:
-                        repo_label = f"{repo_label} ({entry.display_name})"
-                    if entry.kind == "worktree" and entry.worktree_of:
-                        repo_label = f"{repo_label} [worktree of {entry.worktree_of}]"
-            except Exception as exc:
-                self._logger.debug(
-                    "telegram.ticket_flow.manifest_label_failed", exc_info=exc
-                )
-        if repo_label and workspace_label:
-            return f"{repo_label} @ {workspace_label}"
-        if repo_label:
-            return repo_label
-        if workspace_label:
-            return workspace_label
-        return "unknown workspace"
+        return format_pause_notification_source(
+            workspace_root=workspace_root,
+            repo_id=repo_id,
+            hub_root=self._hub_root,
+            manifest_path=self._manifest_path,
+            logger=self._logger,
+            debug_label="telegram.ticket_flow.manifest_label_failed",
+        )
 
     async def _send_dispatch_attachments(
         self,
