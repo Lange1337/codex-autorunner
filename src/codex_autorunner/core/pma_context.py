@@ -25,6 +25,7 @@ from .flows.models import (
 )
 from .flows.store import FlowStore
 from .flows.worker_process import check_worker_health, read_worker_crash_info
+from .flows.workspace_root import resolve_ticket_flow_workspace_root
 from .freshness import (
     build_freshness_payload,
     iso_now,
@@ -485,7 +486,7 @@ def _snapshot_pma_files(
     pma_files: dict[str, list[str]] = {"inbox": [], "outbox": []}
     pma_files_detail: dict[str, list[dict[str, Any]]] = {"inbox": [], "outbox": []}
     try:
-        filebox = list_filebox(hub_root, include_legacy=True)
+        filebox = list_filebox(hub_root)
         for box in ("inbox", "outbox"):
             entries = filebox.get(box) or []
             names = sorted([e.name for e in entries])
@@ -1657,8 +1658,7 @@ def format_pma_discoverability_preamble(
         "Automation quickstart: `/hub/pma/subscriptions` (event triggers) and `/hub/pma/timers` (one-shot/watchdog).\n"
         'Automation recipes: `.codex-autorunner/pma/docs/ABOUT_CAR.md` -> "PMA automation wake-ups".\n'
         "To send a file to the user, write it to `.codex-autorunner/filebox/outbox/`.\n"
-        "User uploaded files are in `.codex-autorunner/filebox/inbox/`.\n"
-        "Note: Legacy paths `.codex-autorunner/pma/inbox/` and `.codex-autorunner/pma/outbox/` redirect to filebox.\n\n"
+        "User uploaded files are in `.codex-autorunner/filebox/inbox/`.\n\n"
     )
 
     resolved_docs = pma_docs
@@ -1897,37 +1897,20 @@ def _get_ticket_flow_summary(repo_path: Path) -> Optional[dict[str, Any]]:
     return build_ticket_flow_summary(repo_path, include_failure=False)
 
 
-def _resolve_workspace_and_runs(
-    record_input: dict[str, Any], repo_root: Path
-) -> tuple[Path, Path]:
-    workspace_raw = record_input.get("workspace_root")
-    workspace_root = Path(workspace_raw) if workspace_raw else repo_root
-    if not workspace_root.is_absolute():
-        workspace_root = (repo_root / workspace_root).resolve()
-    else:
-        workspace_root = workspace_root.resolve()
-    resolved_repo = repo_root.resolve()
-    try:
-        workspace_root.relative_to(resolved_repo)
-    except ValueError as exc:
-        raise ValueError(
-            f"workspace_root escapes repo boundary: {workspace_root}"
-        ) from exc
-    runs_raw = record_input.get("runs_dir") or ".codex-autorunner/runs"
-    runs_dir = Path(runs_raw)
-    if not runs_dir.is_absolute():
-        runs_dir = (workspace_root / runs_dir).resolve()
-    return workspace_root, runs_dir
+def _resolve_workspace_root(record_input: dict[str, Any], repo_root: Path) -> Path:
+    return resolve_ticket_flow_workspace_root(
+        record_input,
+        repo_root,
+        enforce_repo_boundary=True,
+    )
 
 
 def _latest_reply_history_seq(
     repo_root: Path, run_id: str, record_input: dict[str, Any]
 ) -> int:
     try:
-        workspace_root, runs_dir = _resolve_workspace_and_runs(record_input, repo_root)
-        reply_paths = resolve_reply_paths(
-            workspace_root=workspace_root, runs_dir=runs_dir, run_id=run_id
-        )
+        workspace_root = _resolve_workspace_root(record_input, repo_root)
+        reply_paths = resolve_reply_paths(workspace_root=workspace_root, run_id=run_id)
         history_dir = reply_paths.reply_history_dir
         if not history_dir.exists() or not history_dir.is_dir():
             return 0
@@ -2018,9 +2001,9 @@ def _latest_dispatch(
     repo_root: Path, run_id: str, input_data: dict, *, max_text_chars: int
 ) -> Optional[dict[str, Any]]:
     try:
-        workspace_root, runs_dir = _resolve_workspace_and_runs(input_data, repo_root)
+        workspace_root = _resolve_workspace_root(input_data, repo_root)
         outbox_paths = resolve_outbox_paths(
-            workspace_root=workspace_root, runs_dir=runs_dir, run_id=run_id
+            workspace_root=workspace_root, run_id=run_id
         )
         history_dir = outbox_paths.dispatch_history_dir
         if not history_dir.exists() or not history_dir.is_dir():

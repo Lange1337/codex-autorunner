@@ -23,7 +23,11 @@ def _disable_pma(hub_root: Path) -> None:
     write_test_config(hub_root / CONFIG_FILENAME, cfg)
 
 
-def test_create_managed_thread_with_repo_id(hub_env) -> None:
+def _repo_owner(hub_env) -> dict[str, str]:
+    return {"resource_kind": "repo", "resource_id": hub_env.repo_id}
+
+
+def test_create_managed_thread_with_repo_owner(hub_env) -> None:
     app = create_hub_app(hub_env.hub_root)
 
     with TestClient(app) as client:
@@ -31,7 +35,7 @@ def test_create_managed_thread_with_repo_id(hub_env) -> None:
             "/hub/pma/threads",
             json={
                 "agent": "codex",
-                "repo_id": hub_env.repo_id,
+                **_repo_owner(hub_env),
                 "name": "Primary thread",
                 "backend_thread_id": "thread-backend-1",
             },
@@ -126,7 +130,7 @@ def test_create_managed_thread_accepts_explicit_context_profile(hub_env) -> None
             "/hub/pma/threads",
             json={
                 "agent": "codex",
-                "repo_id": hub_env.repo_id,
+                **_repo_owner(hub_env),
                 "context_profile": "car_core",
             },
         )
@@ -235,7 +239,7 @@ def test_create_managed_thread_rejects_unknown_agent(hub_env) -> None:
             "/hub/pma/threads",
             json={
                 "agent": "bogus",
-                "repo_id": hub_env.repo_id,
+                **_repo_owner(hub_env),
                 "name": "Invalid thread",
             },
         )
@@ -259,18 +263,31 @@ def test_create_managed_thread_rejects_invalid_notify_on_without_side_effect(
             "/hub/pma/threads",
             json={
                 "agent": "codex",
-                "repo_id": hub_env.repo_id,
+                **_repo_owner(hub_env),
                 "notify_on": "invalid",
             },
         )
-        assert create_resp.status_code == 400
-        assert "notify_on" in (create_resp.json().get("detail") or "")
+        assert create_resp.status_code == 422
+        assert "notify_on" in str(create_resp.json())
 
         after_resp = client.get("/hub/pma/threads")
         assert after_resp.status_code == 200
         after_count = len(after_resp.json().get("threads") or [])
 
     assert after_count == before_count
+
+
+def test_create_managed_thread_rejects_legacy_repo_owner_alias(hub_env) -> None:
+    app = create_hub_app(hub_env.hub_root)
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/hub/pma/threads",
+            json={"agent": "codex", "repo_id": hub_env.repo_id},
+        )
+
+    assert resp.status_code == 422
+    assert "repo_id" in str(resp.json())
 
 
 def test_create_managed_thread_rejects_missing_or_both_inputs(hub_env) -> None:
@@ -282,7 +299,7 @@ def test_create_managed_thread_rejects_missing_or_both_inputs(hub_env) -> None:
             "/hub/pma/threads",
             json={
                 "agent": "codex",
-                "repo_id": hub_env.repo_id,
+                **_repo_owner(hub_env),
                 "workspace_root": str(hub_env.repo_root),
             },
         )
@@ -305,7 +322,7 @@ def test_list_managed_threads_returns_created_thread(hub_env) -> None:
             "/hub/pma/threads",
             json={
                 "agent": "codex",
-                "repo_id": hub_env.repo_id,
+                **_repo_owner(hub_env),
                 "name": "List me",
             },
         )
@@ -314,7 +331,7 @@ def test_list_managed_threads_returns_created_thread(hub_env) -> None:
 
         list_resp = client.get(
             "/hub/pma/threads",
-            params={"agent": "codex", "repo_id": hub_env.repo_id, "limit": 200},
+            params={"agent": "codex", **_repo_owner(hub_env), "limit": 200},
         )
 
     assert list_resp.status_code == 200
@@ -329,7 +346,7 @@ def test_list_managed_threads_supports_normalized_status_filter(hub_env) -> None
     with TestClient(app) as client:
         create_resp = client.post(
             "/hub/pma/threads",
-            json={"agent": "codex", "repo_id": hub_env.repo_id},
+            json={"agent": "codex", **_repo_owner(hub_env)},
         )
         assert create_resp.status_code == 200
 
@@ -363,7 +380,7 @@ def test_list_managed_threads_includes_ticket_flow_threads_for_repo(hub_env) -> 
     with TestClient(app) as client:
         list_resp = client.get(
             "/hub/pma/threads",
-            params={"repo_id": hub_env.repo_id, "limit": 200},
+            params={**_repo_owner(hub_env), "limit": 200},
         )
 
     assert list_resp.status_code == 200
@@ -387,7 +404,7 @@ def test_get_managed_thread_returns_created_thread(hub_env) -> None:
             "/hub/pma/threads",
             json={
                 "agent": "codex",
-                "repo_id": hub_env.repo_id,
+                **_repo_owner(hub_env),
             },
         )
         assert create_resp.status_code == 200
@@ -413,7 +430,7 @@ def test_create_managed_thread_notify_on_terminal_creates_subscription(hub_env) 
             "/hub/pma/threads",
             json={
                 "agent": "codex",
-                "repo_id": hub_env.repo_id,
+                **_repo_owner(hub_env),
                 "notify_on": "terminal",
                 "notify_lane": "pma:lane-next",
                 "notify_once": True,
@@ -442,7 +459,7 @@ def test_managed_thread_routes_respect_pma_enabled_flag(hub_env) -> None:
         list_resp = client.get("/hub/pma/threads")
         create_resp = client.post(
             "/hub/pma/threads",
-            json={"agent": "codex", "repo_id": hub_env.repo_id},
+            json={"agent": "codex", **_repo_owner(hub_env)},
         )
 
     assert list_resp.status_code == 404
@@ -509,7 +526,7 @@ def test_resume_managed_thread_allows_send_without_new_backend_thread(hub_env) -
     with TestClient(app) as client:
         create_resp = client.post(
             "/hub/pma/threads",
-            json={"agent": "codex", "repo_id": hub_env.repo_id},
+            json={"agent": "codex", **_repo_owner(hub_env)},
         )
         assert create_resp.status_code == 200
         managed_thread_id = create_resp.json()["thread"]["managed_thread_id"]
@@ -701,14 +718,14 @@ def test_managed_thread_crud_routes_use_orchestration_service(
             "/hub/pma/threads",
             json={
                 "agent": "codex",
-                "repo_id": hub_env.repo_id,
+                **_repo_owner(hub_env),
                 "name": "Orchestrated thread",
                 "backend_thread_id": "backend-thread-1",
             },
         )
         list_resp = client.get(
             "/hub/pma/threads",
-            params={"agent": "codex", "status": "idle", "repo_id": hub_env.repo_id},
+            params={"agent": "codex", "status": "idle", **_repo_owner(hub_env)},
         )
         get_resp = client.get("/hub/pma/threads/thread-orch-1")
         resume_resp = client.post(
@@ -835,7 +852,7 @@ def test_list_bindings_work_route_returns_busy_work_summaries(
     with TestClient(app) as client:
         resp = client.get(
             "/hub/pma/bindings/work",
-            params={"agent": "codex", "repo_id": hub_env.repo_id, "limit": 25},
+            params={"agent": "codex", **_repo_owner(hub_env), "limit": 25},
         )
 
     assert resp.status_code == 200

@@ -81,7 +81,6 @@ def _init_git_repo(path: Path) -> None:
 def test_ticket_run_config_default_max_turns() -> None:
     cfg = TicketRunConfig(
         ticket_dir=Path(".codex-autorunner/tickets"),
-        runs_dir=Path(".codex-autorunner/runs"),
         auto_commit=False,
     )
     assert cfg.max_total_turns == DEFAULT_MAX_TOTAL_TURNS
@@ -108,7 +107,6 @@ async def test_ticket_runner_pauses_when_no_tickets(tmp_path: Path) -> None:
         run_id="run-1",
         config=TicketRunConfig(
             ticket_dir=Path(".codex-autorunner/tickets"),
-            runs_dir=Path(".codex-autorunner/runs"),
             auto_commit=False,
         ),
         agent_pool=FakeAgentPool(
@@ -152,7 +150,6 @@ async def test_ticket_runner_fails_when_required_context_file_missing(
         run_id="run-1",
         config=TicketRunConfig(
             ticket_dir=Path(".codex-autorunner/tickets"),
-            runs_dir=Path(".codex-autorunner/runs"),
             auto_commit=False,
         ),
         agent_pool=pool,
@@ -193,7 +190,6 @@ async def test_ticket_runner_marks_non_required_missing_context_in_prompt(
         run_id="run-1",
         config=TicketRunConfig(
             ticket_dir=Path(".codex-autorunner/tickets"),
-            runs_dir=Path(".codex-autorunner/runs"),
             auto_commit=False,
         ),
         agent_pool=pool,
@@ -242,7 +238,6 @@ async def test_ticket_runner_includes_read_error_for_binary_context_file(
         run_id="run-1",
         config=TicketRunConfig(
             ticket_dir=Path(".codex-autorunner/tickets"),
-            runs_dir=Path(".codex-autorunner/runs"),
             auto_commit=False,
         ),
         agent_pool=pool,
@@ -289,7 +284,6 @@ async def test_ticket_runner_requested_context_respects_size_caps(
         run_id="run-1",
         config=TicketRunConfig(
             ticket_dir=Path(".codex-autorunner/tickets"),
-            runs_dir=Path(".codex-autorunner/runs"),
             auto_commit=False,
         ),
         agent_pool=pool,
@@ -328,7 +322,6 @@ async def test_ticket_runner_recovers_when_current_ticket_path_is_stale(
         run_id="run-1",
         config=TicketRunConfig(
             ticket_dir=Path(".codex-autorunner/tickets"),
-            runs_dir=Path(".codex-autorunner/runs"),
             auto_commit=False,
         ),
         agent_pool=pool,
@@ -394,7 +387,6 @@ async def test_ticket_runner_delegates_selection_and_validation(
         run_id="run-1",
         config=TicketRunConfig(
             ticket_dir=Path(".codex-autorunner/tickets"),
-            runs_dir=Path(".codex-autorunner/runs"),
             auto_commit=False,
         ),
         agent_pool=FakeAgentPool(
@@ -457,7 +449,6 @@ async def test_ticket_runner_respects_validation_pause_from_selection_seam(
         run_id="run-1",
         config=TicketRunConfig(
             ticket_dir=Path(".codex-autorunner/tickets"),
-            runs_dir=Path(".codex-autorunner/runs"),
             auto_commit=False,
         ),
         agent_pool=pool,
@@ -492,7 +483,6 @@ async def test_ticket_runner_completes_when_all_tickets_done(tmp_path: Path) -> 
         run_id="run-1",
         config=TicketRunConfig(
             ticket_dir=Path(".codex-autorunner/tickets"),
-            runs_dir=Path(".codex-autorunner/runs"),
             auto_commit=False,
         ),
         agent_pool=FakeAgentPool(handler),
@@ -542,7 +532,6 @@ async def test_ticket_runner_dispatch_pause_message(tmp_path: Path) -> None:
         run_id=run_id,
         config=TicketRunConfig(
             ticket_dir=Path(".codex-autorunner/tickets"),
-            runs_dir=runs_dir,
             auto_commit=False,
         ),
         agent_pool=FakeAgentPool(handler),
@@ -596,7 +585,6 @@ async def test_ticket_runner_lint_retry_reuses_conversation_id(tmp_path: Path) -
         run_id="run-1",
         config=TicketRunConfig(
             ticket_dir=Path(".codex-autorunner/tickets"),
-            runs_dir=Path(".codex-autorunner/runs"),
             max_lint_retries=3,
             auto_commit=False,
         ),
@@ -651,7 +639,6 @@ async def test_ticket_runner_switches_agents_between_tickets(tmp_path: Path) -> 
         run_id="run-1",
         config=TicketRunConfig(
             ticket_dir=Path(".codex-autorunner/tickets"),
-            runs_dir=Path(".codex-autorunner/runs"),
             auto_commit=False,
         ),
         agent_pool=pool,
@@ -673,7 +660,6 @@ async def test_ticket_runner_pauses_on_duplicate_ticket_indices(tmp_path: Path) 
     _write_ticket(ticket_dir / "TICKET-001-duplicate.md", done=False)
     _write_ticket(ticket_dir / "TICKET-002.md", done=False)
 
-    runs_dir = workspace_root / ".codex-autorunner" / "runs"
     run_id = "run-1"
 
     pool = FakeAgentPool(
@@ -690,7 +676,6 @@ async def test_ticket_runner_pauses_on_duplicate_ticket_indices(tmp_path: Path) 
         run_id=run_id,
         config=TicketRunConfig(
             ticket_dir=Path(".codex-autorunner/tickets"),
-            runs_dir=runs_dir,
             auto_commit=False,
         ),
         agent_pool=pool,
@@ -731,7 +716,6 @@ async def test_previous_ticket_context_excluded_by_default(tmp_path: Path) -> No
         run_id="run-1",
         config=TicketRunConfig(
             ticket_dir=Path(".codex-autorunner/tickets"),
-            runs_dir=Path(".codex-autorunner/runs"),
             auto_commit=False,
             include_previous_ticket_context=False,
         ),
@@ -773,7 +757,6 @@ async def test_previous_ticket_context_included_when_enabled(tmp_path: Path) -> 
         run_id="run-1",
         config=TicketRunConfig(
             ticket_dir=Path(".codex-autorunner/tickets"),
-            runs_dir=Path(".codex-autorunner/runs"),
             auto_commit=False,
             include_previous_ticket_context=True,
         ),
@@ -854,7 +837,6 @@ async def test_ticket_runner_retries_on_network_error(tmp_path: Path) -> None:
         run_id="run-1",
         config=TicketRunConfig(
             ticket_dir=Path(".codex-autorunner/tickets"),
-            runs_dir=Path(".codex-autorunner/runs"),
             max_network_retries=5,
             auto_commit=False,
         ),
@@ -908,7 +890,6 @@ async def test_ticket_runner_pauses_after_network_retries_exhausted(
         run_id="run-1",
         config=TicketRunConfig(
             ticket_dir=Path(".codex-autorunner/tickets"),
-            runs_dir=Path(".codex-autorunner/runs"),
             max_network_retries=2,
             auto_commit=False,
         ),
@@ -973,7 +954,6 @@ async def test_ticket_runner_clears_network_retry_on_non_network_error(
         run_id="run-1",
         config=TicketRunConfig(
             ticket_dir=Path(".codex-autorunner/tickets"),
-            runs_dir=Path(".codex-autorunner/runs"),
             max_network_retries=5,
             auto_commit=False,
         ),
@@ -1029,7 +1009,6 @@ async def test_ticket_runner_clears_network_retry_on_success(tmp_path: Path) -> 
         run_id="run-1",
         config=TicketRunConfig(
             ticket_dir=Path(".codex-autorunner/tickets"),
-            runs_dir=Path(".codex-autorunner/runs"),
             max_network_retries=5,
             auto_commit=False,
         ),
@@ -1075,7 +1054,6 @@ async def test_ticket_runner_archives_user_reply_before_turn(tmp_path: Path) -> 
         run_id="run-1",
         config=TicketRunConfig(
             ticket_dir=Path(".codex-autorunner/tickets"),
-            runs_dir=Path(".codex-autorunner/runs"),
             auto_commit=False,
         ),
         agent_pool=FakeAgentPool(handler),
@@ -1131,7 +1109,6 @@ async def test_ticket_runner_only_consumes_archived_reply_after_success(
         run_id="run-1",
         config=TicketRunConfig(
             ticket_dir=Path(".codex-autorunner/tickets"),
-            runs_dir=Path(".codex-autorunner/runs"),
             auto_commit=False,
         ),
         agent_pool=FakeAgentPool(handler),
@@ -1173,7 +1150,6 @@ async def test_ticket_runner_pauses_after_two_no_diff_turns(tmp_path: Path) -> N
         run_id="run-1",
         config=TicketRunConfig(
             ticket_dir=Path(".codex-autorunner/tickets"),
-            runs_dir=Path(".codex-autorunner/runs"),
             auto_commit=False,
         ),
         agent_pool=FakeAgentPool(handler),
@@ -1239,7 +1215,6 @@ async def test_ticket_runner_requires_commit_before_advancing_done_ticket(
         run_id="run-1",
         config=TicketRunConfig(
             ticket_dir=Path(".codex-autorunner/tickets"),
-            runs_dir=Path(".codex-autorunner/runs"),
             auto_commit=False,
         ),
         agent_pool=pool,
@@ -1295,7 +1270,6 @@ async def test_ticket_runner_pauses_when_commit_retries_exhausted(
         run_id="run-1",
         config=TicketRunConfig(
             ticket_dir=Path(".codex-autorunner/tickets"),
-            runs_dir=Path(".codex-autorunner/runs"),
             max_commit_retries=1,
             auto_commit=False,
         ),
