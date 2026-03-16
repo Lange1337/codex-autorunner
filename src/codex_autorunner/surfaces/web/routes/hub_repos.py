@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import sqlite3
@@ -28,12 +27,11 @@ from ....core.pma_context import (
 )
 from ....core.pma_thread_store import default_pma_threads_db_path
 from ....integrations.app_server.threads import (
-    FILE_CHAT_OPENCODE_PREFIX,
-    FILE_CHAT_PREFIX,
-    PMA_KEY,
-    PMA_OPENCODE_KEY,
     AppServerThreadRegistry,
     default_app_server_threads_path,
+    file_chat_discord_key,
+    pma_base_key,
+    pma_topic_scoped_key,
 )
 from ....integrations.telegram.state import topic_key
 from ....manifest import Manifest, load_manifest
@@ -926,7 +924,7 @@ def build_hub_repo_routes(
         agent = _normalize_agent(binding.get("agent"))
         pma_enabled = bool(binding.get("pma_enabled"))
         if pma_enabled:
-            base_key = PMA_OPENCODE_KEY if agent == "opencode" else PMA_KEY
+            base_key = pma_base_key(agent)
             if platform != "telegram" or not telegram_require_topics:
                 return base_key
             chat_id_raw = entry.get("chat_id")
@@ -947,7 +945,9 @@ def build_hub_repo_routes(
                     thread_id = int(str(thread_id_raw))
                 except (TypeError, ValueError):
                     thread_id = None
-            return f"{base_key}.{topic_key(chat_id, thread_id)}"
+            return pma_topic_scoped_key(
+                agent, chat_id, thread_id, topic_key_fn=topic_key
+            )
 
         if platform != "discord":
             return None
@@ -957,9 +957,7 @@ def build_hub_repo_routes(
             return None
         if not isinstance(workspace_path, str) or not workspace_path.strip():
             return None
-        digest = hashlib.sha256(workspace_path.encode("utf-8")).hexdigest()[:12]
-        prefix = FILE_CHAT_OPENCODE_PREFIX if agent == "opencode" else FILE_CHAT_PREFIX
-        return f"{prefix}discord.{channel_id.strip()}.{digest}"
+        return file_chat_discord_key(agent, channel_id, workspace_path)
 
     def _registry_thread_id(
         workspace_path: Any,

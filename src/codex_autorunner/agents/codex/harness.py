@@ -4,7 +4,10 @@ import re
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional
 
-from ...integrations.app_server.client import CodexAppServerResponseError
+from ...integrations.app_server.client import (
+    CodexAppServerResponseError,
+    is_missing_thread_error,
+)
 from ...integrations.app_server.event_buffer import AppServerEventBuffer
 from ...integrations.app_server.supervisor import WorkspaceAppServerSupervisor
 from ..base import AgentHarness
@@ -187,7 +190,12 @@ class CodexHarness(AgentHarness):
         resume = getattr(client, "thread_resume", None)
         if not callable(resume):
             return ConversationRef(agent=self.agent_id, id=conversation_id)
-        result = await resume(conversation_id)
+        try:
+            result = await resume(conversation_id)
+        except Exception as exc:
+            if is_missing_thread_error(exc):
+                return ConversationRef(agent=self.agent_id, id=conversation_id)
+            raise
         thread_id = conversation_id
         if isinstance(result, dict):
             candidate = result.get("id")

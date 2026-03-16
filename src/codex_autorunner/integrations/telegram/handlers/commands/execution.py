@@ -43,8 +43,6 @@ from .....core.orchestration.runtime_thread_events import (
     terminal_run_event_from_outcome,
 )
 from .....core.orchestration.runtime_threads import (
-    RUNTIME_THREAD_INTERRUPTED_ERROR,
-    RUNTIME_THREAD_TIMEOUT_ERROR,
     RuntimeThreadExecution,
     RuntimeThreadOutcome,
     await_runtime_thread_outcome,
@@ -62,11 +60,14 @@ from .....core.pma_transcripts import PmaTranscriptStore
 from .....core.state import now_iso
 from .....core.utils import canonicalize_path
 from .....integrations.app_server.threads import (
-    PMA_KEY,
-    PMA_OPENCODE_KEY,
     AppServerThreadRegistry,
+    pma_base_key,
+    pma_topic_scoped_key,
 )
 from .....integrations.chat.compaction import match_pending_compact_seed
+from .....integrations.chat.runtime_thread_errors import (
+    sanitize_runtime_thread_error as _sanitize_runtime_thread_result_error,
+)
 from .....integrations.github.context_injection import maybe_inject_github_context
 from ....app_server.client import (
     CodexAppServerClient,
@@ -210,23 +211,6 @@ def _format_download_failure_response(kind: str, detail: Optional[str]) -> str:
     if detail:
         return f"{base} Reason: {detail}"
     return base
-
-
-def _sanitize_runtime_thread_result_error(
-    detail: Any,
-    *,
-    public_error: str,
-    timeout_error: str,
-    interrupted_error: str,
-) -> str:
-    sanitized = str(detail or "").strip()
-    if sanitized in {RUNTIME_THREAD_TIMEOUT_ERROR, timeout_error}:
-        return timeout_error
-    if sanitized in {RUNTIME_THREAD_INTERRUPTED_ERROR, interrupted_error}:
-        return interrupted_error
-    if sanitized in {timeout_error, interrupted_error}:
-        return sanitized
-    return public_error
 
 
 def _build_managed_thread_input_items(
@@ -599,8 +583,12 @@ async def _finalize_telegram_managed_thread_execution(
             if finalized_status == "interrupted":
                 detail = interrupted_error
             elif finalized_status == "error" and finalized_execution is not None:
+                raw_error = (
+                    getattr(finalized_execution, "error", None)
+                    or event_state.last_error_message
+                )
                 detail = _sanitize_runtime_thread_result_error(
-                    finalized_execution.error,
+                    raw_error,
                     public_error=public_execution_error,
                     timeout_error=timeout_error,
                     interrupted_error=interrupted_error,
@@ -647,8 +635,9 @@ async def _finalize_telegram_managed_thread_execution(
             "token_usage": event_state.token_usage,
         }
 
+    raw_error = outcome.error or event_state.last_error_message
     detail = _sanitize_runtime_thread_result_error(
-        outcome.error,
+        raw_error,
         public_error=public_execution_error,
         timeout_error=timeout_error,
         interrupted_error=interrupted_error,
@@ -756,6 +745,24 @@ def _ensure_telegram_managed_thread_queue_worker(
 
     worker_task = handlers._spawn_task(_queue_worker())
     task_map[managed_thread_id] = worker_task
+
+
+def _sync_pma_registry_thread_id(
+    handlers: Any,
+    record: "TelegramTopicRecord",
+    message: TelegramMessage,
+    backend_thread_id: Optional[str],
+) -> None:
+    if not isinstance(backend_thread_id, str) or not backend_thread_id.strip():
+        return
+    registry = getattr(handlers, "_hub_thread_registry", None)
+    pma_key_builder = getattr(handlers, "_pma_registry_key", None)
+    if registry is None or not callable(pma_key_builder):
+        return
+    pma_key = pma_key_builder(record, message)
+    if not isinstance(pma_key, str) or not pma_key.strip():
+        return
+    registry.set_thread_id(pma_key, backend_thread_id)
 
 
 async def _run_telegram_managed_thread_turn(
@@ -1018,6 +1025,14 @@ async def _run_telegram_managed_thread_turn(
             transcript_message_id,
             transcript_text,
         )
+    if pma_enabled:
+        _sync_pma_registry_thread_id(
+            handlers,
+            record,
+            message,
+            str(getattr(started_execution.thread, "backend_thread_id", "") or "")
+            or None,
+        )
     if pending_seed and not pma_enabled:
         await handlers._router.update_topic(
             message.chat_id,
@@ -1171,6 +1186,13 @@ async def _run_telegram_managed_thread_turn(
             transcript_text,
         )
     resolved_backend_thread_id = str(finalized.get("backend_thread_id") or "") or None
+    if pma_enabled and resolved_backend_thread_id:
+        _sync_pma_registry_thread_id(
+            handlers,
+            record,
+            message,
+            resolved_backend_thread_id,
+        )
     if not pma_enabled and resolved_backend_thread_id and hasattr(handlers, "_router"):
         await _sync_telegram_thread_binding(
             handlers,
@@ -3235,13 +3257,13 @@ class ExecutionCommands(SharedHelpers):
         in the common case (require_topics disabled).
         """
         agent = self._effective_agent(record)
-        base_key = PMA_OPENCODE_KEY if agent == "opencode" else PMA_KEY
+        base_key = pma_base_key(agent)
 
-        # PMA thread scoping: per-topic when require_topics is true
         require_topics = getattr(self._config, "require_topics", False)
         if require_topics and message is not None:
-            topic_key = build_topic_key(message.chat_id, message.thread_id)
-            return f"{base_key}.{topic_key}"
+            return pma_topic_scoped_key(
+                agent, message.chat_id, message.thread_id, topic_key_fn=build_topic_key
+            )
         return base_key
 
     async def _prepare_pma_prompt(self, message_text: str) -> Optional[str]:
@@ -3474,7 +3496,6 @@ class ExecutionCommands(SharedHelpers):
 
         if (
             pma_enabled
-            and allow_new_thread
             and getattr(self._config, "root", None) is not None
             and callable(getattr(self, "_spawn_task", None))
         ):
@@ -3491,6 +3512,8 @@ class ExecutionCommands(SharedHelpers):
                 transcript_message_id=transcript_message_id,
                 transcript_text=transcript_text,
                 placeholder_id=placeholder_id,
+                allow_new_thread=allow_new_thread,
+                missing_thread_message=missing_thread_message,
             )
 
         if getattr(self._config, "root", None) is not None and callable(

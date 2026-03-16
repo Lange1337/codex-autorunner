@@ -16,6 +16,10 @@ from codex_autorunner.core.app_server_threads import (
     PMA_OPENCODE_KEY,
     AppServerThreadRegistry,
 )
+from codex_autorunner.core.orchestration.runtime_threads import (
+    RUNTIME_THREAD_INTERRUPTED_ERROR,
+    RUNTIME_THREAD_TIMEOUT_ERROR,
+)
 from codex_autorunner.core.sse import format_sse
 from codex_autorunner.integrations.app_server.client import (
     CodexAppServerResponseError,
@@ -71,9 +75,7 @@ class _RouterStub:
         return self._record
 
 
-def test_sanitize_runtime_thread_result_error_returns_public_error_for_unknown_failures() -> (
-    None
-):
+def test_sanitize_runtime_thread_result_error_preserves_sanitized_detail() -> None:
     assert (
         execution_commands_module._sanitize_runtime_thread_result_error(
             "backend exploded with private detail",
@@ -81,7 +83,33 @@ def test_sanitize_runtime_thread_result_error_returns_public_error_for_unknown_f
             timeout_error="Telegram PMA turn timed out",
             interrupted_error="Telegram PMA turn interrupted",
         )
-        == "Telegram PMA turn failed"
+        == "backend exploded with private detail"
+    )
+
+
+def test_sanitize_runtime_thread_result_error_maps_timeout_to_surface_timeout() -> None:
+    assert (
+        execution_commands_module._sanitize_runtime_thread_result_error(
+            RUNTIME_THREAD_TIMEOUT_ERROR,
+            public_error="Telegram PMA turn failed",
+            timeout_error="Telegram PMA turn timed out",
+            interrupted_error="Telegram PMA turn interrupted",
+        )
+        == "Telegram PMA turn timed out"
+    )
+
+
+def test_sanitize_runtime_thread_result_error_maps_interrupted_to_surface_interrupted() -> (
+    None
+):
+    assert (
+        execution_commands_module._sanitize_runtime_thread_result_error(
+            RUNTIME_THREAD_INTERRUPTED_ERROR,
+            public_error="Telegram PMA turn failed",
+            timeout_error="Telegram PMA turn timed out",
+            interrupted_error="Telegram PMA turn interrupted",
+        )
+        == "Telegram PMA turn interrupted"
     )
 
 
@@ -1740,6 +1768,172 @@ async def test_pma_text_messages_route_repeated_messages_through_managed_thread_
 
 
 @pytest.mark.anyio
+async def test_pma_followup_turn_without_new_thread_reuses_managed_thread_and_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record = TelegramTopicRecord(
+        pma_enabled=True,
+        workspace_path=None,
+        repo_id="repo-1",
+        agent="codex",
+    )
+    handler = _ManagedThreadPMAHandler(record, tmp_path)
+
+    class _FakeHarness:
+        display_name = "Fake"
+        capabilities = frozenset(
+            {
+                "durable_threads",
+                "message_turns",
+                "interrupt",
+                "event_streaming",
+            }
+        )
+
+        def __init__(self) -> None:
+            self.start_calls: list[tuple[str, str]] = []
+
+        async def ensure_ready(self, workspace_root: Path) -> None:
+            _ = workspace_root
+
+        def supports(self, capability: str) -> bool:
+            return capability in self.capabilities
+
+        async def new_conversation(
+            self, workspace_root: Path, title: Optional[str] = None
+        ) -> SimpleNamespace:
+            _ = workspace_root, title
+            return SimpleNamespace(id="telegram-backend-thread-1")
+
+        async def resume_conversation(
+            self, workspace_root: Path, conversation_id: str
+        ) -> SimpleNamespace:
+            _ = workspace_root
+            return SimpleNamespace(id=conversation_id)
+
+        async def start_turn(
+            self,
+            workspace_root: Path,
+            conversation_id: str,
+            prompt: str,
+            model: Optional[str],
+            reasoning: Optional[str],
+            *,
+            approval_mode: Optional[str],
+            sandbox_policy: Optional[Any],
+            input_items: Optional[list[dict[str, Any]]] = None,
+        ) -> SimpleNamespace:
+            _ = (
+                workspace_root,
+                model,
+                reasoning,
+                approval_mode,
+                sandbox_policy,
+                input_items,
+            )
+            self.start_calls.append((conversation_id, prompt))
+            turn_id = f"telegram-backend-turn-{len(self.start_calls)}"
+            return SimpleNamespace(
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+            )
+
+        async def start_review(self, *args: Any, **kwargs: Any) -> SimpleNamespace:
+            raise AssertionError("review mode should not be used in this test")
+
+        async def wait_for_turn(
+            self,
+            workspace_root: Path,
+            conversation_id: str,
+            turn_id: Optional[str],
+            *,
+            timeout: Optional[float] = None,
+        ) -> SimpleNamespace:
+            _ = workspace_root, timeout
+            assert conversation_id == "telegram-backend-thread-1"
+            assert isinstance(turn_id, str)
+            return SimpleNamespace(
+                status="ok",
+                assistant_text=f"reply for {turn_id}",
+                errors=[],
+            )
+
+        async def interrupt(
+            self, workspace_root: Path, conversation_id: str, turn_id: Optional[str]
+        ) -> None:
+            _ = workspace_root, conversation_id, turn_id
+
+        async def stream_events(
+            self, workspace_root: Path, conversation_id: str, turn_id: str
+        ):
+            _ = workspace_root, conversation_id, turn_id
+            if False:
+                yield ""
+
+    harness = _FakeHarness()
+    monkeypatch.setattr(
+        execution_commands_module,
+        "get_registered_agents",
+        lambda: {
+            "codex": AgentDescriptor(
+                id="codex",
+                name="Codex",
+                capabilities=harness.capabilities,
+                make_harness=lambda _ctx: harness,
+            )
+        },
+    )
+
+    first_message = TelegramMessage(
+        update_id=1,
+        message_id=10,
+        chat_id=-1001,
+        thread_id=101,
+        from_user_id=42,
+        text="first pma orchestration prompt",
+        date=None,
+        is_topic_message=True,
+    )
+
+    await handler._handle_normal_message(first_message, runtime=_RuntimeStub())
+
+    assert handler._hub_thread_registry.get_thread_id(PMA_KEY) == (
+        "telegram-backend-thread-1"
+    )
+
+    followup_message = TelegramMessage(
+        update_id=2,
+        message_id=11,
+        chat_id=-1001,
+        thread_id=101,
+        from_user_id=42,
+        text="/compact",
+        date=None,
+        is_topic_message=True,
+    )
+
+    outcome = await handler._run_turn_and_collect_result(
+        followup_message,
+        runtime=_RuntimeStub(),
+        text_override="compact summary prompt",
+        record=record,
+        allow_new_thread=False,
+        missing_thread_message="No active thread to compact. Use /new to start one.",
+        send_placeholder=False,
+    )
+
+    assert isinstance(outcome, _TurnRunResult)
+    assert outcome.thread_id == "telegram-backend-thread-1"
+    assert handler._hub_thread_registry.get_thread_id(PMA_KEY) == (
+        "telegram-backend-thread-1"
+    )
+    assert [call[0] for call in harness.start_calls] == [
+        "telegram-backend-thread-1",
+        "telegram-backend-thread-1",
+    ]
+
+
+@pytest.mark.anyio
 async def test_pma_native_input_items_route_through_managed_thread_execution(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2822,10 +3016,11 @@ class _PMAWorkspaceHandler(WorkspaceCommands):
         self, record: TelegramTopicRecord, registry: AppServerThreadRegistry
     ) -> None:
         self._logger = logging.getLogger("test")
-        self._config = SimpleNamespace()
+        self._config = SimpleNamespace(require_topics=False)
         self._router = _PMAWorkspaceRouter(record)
         self._hub_thread_registry = registry
         self._sent: list[str] = []
+        self._record = record
 
     async def _resolve_topic_key(self, chat_id: int, thread_id: Optional[int]) -> str:
         return f"{chat_id}:{thread_id}"
@@ -2840,6 +3035,25 @@ class _PMAWorkspaceHandler(WorkspaceCommands):
         reply_markup: Optional[object] = None,
     ) -> None:
         self._sent.append(text)
+
+    def _pma_registry_key(
+        self, record: "TelegramTopicRecord", message: Optional[TelegramMessage] = None
+    ) -> str:
+        from codex_autorunner.integrations.app_server.threads import pma_base_key
+
+        agent = self._effective_agent(record)
+        base_key = pma_base_key(agent)
+
+        require_topics = getattr(self._config, "require_topics", False)
+        if require_topics and message is not None:
+            topic_key = f"{message.chat_id}:{message.thread_id or 'root'}"
+            return f"{base_key}.{topic_key}"
+        return base_key
+
+    def _effective_agent(self, record: Optional["TelegramTopicRecord"]) -> str:
+        if record and record.agent:
+            return record.agent
+        return "codex"
 
 
 class _NewtRouterStub:
@@ -2939,6 +3153,131 @@ async def test_pma_new_resets_session(tmp_path: Path) -> None:
 
     assert registry.get_thread_id(PMA_OPENCODE_KEY) is None
     assert handler._sent and "PMA session reset" in handler._sent[-1]
+
+
+@pytest.mark.anyio
+async def test_pma_new_resets_scoped_key_when_require_topics_enabled(
+    tmp_path: Path,
+) -> None:
+    from codex_autorunner.integrations.app_server.threads import pma_topic_scoped_key
+
+    registry = AppServerThreadRegistry(tmp_path / "threads.json")
+    registry.reset_all()
+    scoped_key = pma_topic_scoped_key(
+        agent="opencode",
+        chat_id=-2002,
+        thread_id=333,
+        topic_key_fn=lambda c, t: f"{c}:{t or 'root'}",
+    )
+    registry.set_thread_id(scoped_key, "old-scoped-thread")
+
+    record = TelegramTopicRecord(
+        pma_enabled=True, workspace_path=None, agent="opencode"
+    )
+    handler = _PMAWorkspaceHandlerWithScopedKey(record, registry, require_topics=True)
+    message = TelegramMessage(
+        update_id=1,
+        message_id=2,
+        chat_id=-2002,
+        thread_id=333,
+        from_user_id=99,
+        text="/new",
+        date=None,
+        is_topic_message=True,
+    )
+
+    await handler._handle_new(message)
+
+    assert registry.get_thread_id(scoped_key) is None
+    assert handler._sent and "PMA session reset" in handler._sent[-1]
+
+
+@pytest.mark.anyio
+async def test_pma_reset_resets_scoped_key_when_require_topics_enabled(
+    tmp_path: Path,
+) -> None:
+    from codex_autorunner.integrations.app_server.threads import pma_topic_scoped_key
+
+    registry = AppServerThreadRegistry(tmp_path / "threads.json")
+    registry.reset_all()
+    scoped_key = pma_topic_scoped_key(
+        agent="codex",
+        chat_id=-1001,
+        thread_id=42,
+        topic_key_fn=lambda c, t: f"{c}:{t or 'root'}",
+    )
+    registry.set_thread_id(scoped_key, "old-scoped-thread")
+
+    record = TelegramTopicRecord(pma_enabled=True, workspace_path=None, agent="codex")
+    handler = _PMAWorkspaceHandlerWithScopedKey(record, registry, require_topics=True)
+    message = TelegramMessage(
+        update_id=1,
+        message_id=2,
+        chat_id=-1001,
+        thread_id=42,
+        from_user_id=99,
+        text="/reset",
+        date=None,
+        is_topic_message=True,
+    )
+
+    await handler._handle_reset(message)
+
+    assert registry.get_thread_id(scoped_key) is None
+    assert handler._sent and "PMA thread reset" in handler._sent[-1]
+
+
+class _PMAWorkspaceHandlerWithScopedKey(WorkspaceCommands):
+    def __init__(
+        self,
+        record: TelegramTopicRecord,
+        registry: AppServerThreadRegistry,
+        *,
+        require_topics: bool = False,
+    ) -> None:
+        self._logger = logging.getLogger("test")
+        self._config = SimpleNamespace(require_topics=require_topics)
+        self._router = _PMAWorkspaceRouter(record)
+        self._hub_thread_registry = registry
+        self._sent: list[str] = []
+        self._record = record
+
+    async def _resolve_topic_key(self, chat_id: int, thread_id: Optional[int]) -> str:
+        return f"{chat_id}:{thread_id}"
+
+    async def _send_message(
+        self,
+        _chat_id: int,
+        text: str,
+        *,
+        thread_id: Optional[int],
+        reply_to: Optional[int],
+        reply_markup: Optional[object] = None,
+    ) -> None:
+        self._sent.append(text)
+
+    def _pma_registry_key(
+        self, record: "TelegramTopicRecord", message: Optional[TelegramMessage] = None
+    ) -> str:
+        from codex_autorunner.integrations.app_server.threads import pma_base_key
+
+        agent = (
+            self._effective_agent(record)
+            if hasattr(self, "_effective_agent")
+            else record.agent or "codex"
+        )
+        base_key = pma_base_key(agent)
+
+        require_topics = getattr(self._config, "require_topics", False)
+        if require_topics and message is not None:
+            topic_key = f"{message.chat_id}:{message.thread_id or 'root'}"
+            return f"{base_key}.{topic_key}"
+        return base_key
+
+    def _effective_agent(self, record: Optional["TelegramTopicRecord"]) -> str:
+        if record and record.agent:
+            return record.agent
+        return "codex"
 
 
 @pytest.mark.anyio
@@ -3508,6 +3847,58 @@ async def test_pma_targets_subcommand_uses_usage_text(tmp_path: Path) -> None:
     await handler._handle_pma(message, "targets", _RuntimeStub())
 
     assert handler.sent[-1] == "Usage:\n/pma [on|off|status]"
+
+
+@pytest.mark.anyio
+async def test_require_topics_uses_scoped_pma_registry_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from codex_autorunner.core.app_server_threads import pma_topic_scoped_key
+
+    record = TelegramTopicRecord(
+        pma_enabled=True,
+        workspace_path=None,
+        repo_id="repo-1",
+        agent="codex",
+    )
+    hub_root = tmp_path
+    registry = AppServerThreadRegistry(hub_root / "threads.json")
+    handler = _PMAHandler(record, _PMAClientStub(), hub_root, registry)
+    handler._config = SimpleNamespace(
+        root=hub_root,
+        concurrency=SimpleNamespace(max_parallel_turns=1, per_topic_queue=False),
+        agent_turn_timeout_seconds={"codex": None, "opencode": None},
+        require_topics=True,
+    )
+    handler._pma_registry_key(record, None)
+
+    message = TelegramMessage(
+        update_id=1,
+        message_id=10,
+        chat_id=-1001,
+        thread_id=101,
+        from_user_id=42,
+        text="test",
+        date=None,
+        is_topic_message=True,
+    )
+
+    pma_key = handler._pma_registry_key(record, message)
+    assert pma_key == "pma.-1001:101"
+
+    registry.set_thread_id(pma_key, "test-thread-id")
+    assert registry.get_thread_id(pma_key) == "test-thread-id"
+
+    def mock_topic_key(chat_id: int, thread_id: Optional[int]) -> str:
+        return f"{chat_id}:{thread_id or 'root'}"
+
+    expected_key = pma_topic_scoped_key(
+        agent="codex",
+        chat_id=-1001,
+        thread_id=101,
+        topic_key_fn=mock_topic_key,
+    )
+    assert pma_key == expected_key
 
 
 class _HelpHandlersStub:

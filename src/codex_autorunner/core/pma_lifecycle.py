@@ -21,9 +21,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .app_server_threads import (
-    PMA_KEY,
-    PMA_OPENCODE_KEY,
     AppServerThreadRegistry,
+    pma_prefixes_for_reset,
 )
 from .locks import file_lock
 from .logging_utils import log_event
@@ -109,19 +108,27 @@ class PmaLifecycleRouter:
             event_id = self._generate_event_id()
             timestamp = now_iso()
 
-            # Reset thread state
             registry = AppServerThreadRegistry(
                 self._hub_root / ".codex-autorunner" / "app_server_threads.json"
             )
 
             cleared_keys = []
-            if agent == "opencode" or not agent:
-                if registry.reset_thread(PMA_OPENCODE_KEY):
-                    cleared_keys.append(PMA_OPENCODE_KEY)
-
-            if agent != "opencode" or not agent:
-                if registry.reset_thread(PMA_KEY):
-                    cleared_keys.append(PMA_KEY)
+            prefixes = pma_prefixes_for_reset(agent)
+            for prefix in prefixes:
+                exclude_prefixes = (
+                    (pma_prefixes_for_reset("opencode")[0],)
+                    if prefix == pma_prefixes_for_reset("codex")[0]
+                    and agent not in ("all", None, "")
+                    else ()
+                )
+                cleared_keys.extend(
+                    registry.reset_threads_by_prefix(
+                        prefix, exclude_prefixes=exclude_prefixes
+                    )
+                )
+                base_key = prefix.rstrip(".")
+                if registry.reset_thread(base_key):
+                    cleared_keys.append(base_key)
 
             # Create artifact
             artifact = {
@@ -220,23 +227,27 @@ class PmaLifecycleRouter:
             event_id = self._generate_event_id()
             timestamp = now_iso()
 
-            # Reset thread state
             registry = AppServerThreadRegistry(
                 self._hub_root / ".codex-autorunner" / "app_server_threads.json"
             )
 
             cleared_keys = []
-            if agent in ("", "all", None):
-                if registry.reset_thread(PMA_KEY):
-                    cleared_keys.append(PMA_KEY)
-                if registry.reset_thread(PMA_OPENCODE_KEY):
-                    cleared_keys.append(PMA_OPENCODE_KEY)
-            elif agent == "opencode":
-                if registry.reset_thread(PMA_OPENCODE_KEY):
-                    cleared_keys.append(PMA_OPENCODE_KEY)
-            else:
-                if registry.reset_thread(PMA_KEY):
-                    cleared_keys.append(PMA_KEY)
+            prefixes = pma_prefixes_for_reset(agent)
+            for prefix in prefixes:
+                exclude_prefixes = (
+                    (pma_prefixes_for_reset("opencode")[0],)
+                    if prefix == pma_prefixes_for_reset("codex")[0]
+                    and agent not in ("all", None, "")
+                    else ()
+                )
+                cleared_keys.extend(
+                    registry.reset_threads_by_prefix(
+                        prefix, exclude_prefixes=exclude_prefixes
+                    )
+                )
+                base_key = prefix.rstrip(".")
+                if registry.reset_thread(base_key):
+                    cleared_keys.append(base_key)
 
             # Create artifact
             artifact = {
