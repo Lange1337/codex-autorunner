@@ -258,6 +258,277 @@ async def test_run_turn_maps_runtime_events_to_result_and_emits(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_run_turn_mirrors_opencode_text_parts_after_assistant_role_resolution(
+    tmp_path: Path,
+):
+    harness = _FakeHarness(
+        [
+            _HarnessScript(
+                assistant_text="hello",
+                raw_events=[
+                    _message(
+                        "message.part.updated",
+                        {
+                            "properties": {
+                                "part": {
+                                    "id": "part-1",
+                                    "messageID": "assistant-1",
+                                    "type": "text",
+                                    "text": "hello",
+                                },
+                                "delta": "hello",
+                            }
+                        },
+                    ),
+                    _message(
+                        "message.updated",
+                        {
+                            "properties": {
+                                "info": {
+                                    "id": "assistant-1",
+                                    "role": "assistant",
+                                }
+                            }
+                        },
+                    ),
+                ],
+            )
+        ]
+    )
+    pool = _make_pool(tmp_path, harness, approval_mode="yolo")
+
+    emitted = []
+
+    def _emit(event_type: FlowEventType, payload: dict):
+        emitted.append((event_type, payload))
+
+    result = await pool.run_turn(
+        AgentTurnRequest(
+            agent_id="opencode",
+            prompt="main prompt",
+            workspace_root=tmp_path,
+            emit_event=_emit,
+        )
+    )
+
+    assert result.text == "hello"
+    assert [event_type for event_type, _ in emitted] == [
+        FlowEventType.APP_SERVER_EVENT,
+        FlowEventType.APP_SERVER_EVENT,
+        FlowEventType.AGENT_STREAM_DELTA,
+    ]
+    assert emitted[2][1]["delta"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_run_turn_preserves_whitespace_in_opencode_text_part_deltas(
+    tmp_path: Path,
+):
+    harness = _FakeHarness(
+        [
+            _HarnessScript(
+                assistant_text="Debug of OpenCode  \n",
+                raw_events=[
+                    _message(
+                        "message.updated",
+                        {
+                            "properties": {
+                                "info": {
+                                    "id": "assistant-1",
+                                    "role": "assistant",
+                                }
+                            }
+                        },
+                    ),
+                    _message(
+                        "message.part.updated",
+                        {
+                            "properties": {
+                                "part": {
+                                    "id": "part-1",
+                                    "messageID": "assistant-1",
+                                    "type": "text",
+                                    "text": "Debug",
+                                },
+                                "delta": "Debug",
+                            }
+                        },
+                    ),
+                    _message(
+                        "message.part.updated",
+                        {
+                            "properties": {
+                                "part": {
+                                    "id": "part-1",
+                                    "messageID": "assistant-1",
+                                    "type": "text",
+                                    "text": "Debug of",
+                                },
+                                "delta": " of",
+                            }
+                        },
+                    ),
+                    _message(
+                        "message.part.updated",
+                        {
+                            "properties": {
+                                "part": {
+                                    "id": "part-1",
+                                    "messageID": "assistant-1",
+                                    "type": "text",
+                                    "text": "Debug of OpenCode  \n",
+                                },
+                                "delta": " OpenCode  \n",
+                            }
+                        },
+                    ),
+                ],
+            )
+        ]
+    )
+    pool = _make_pool(tmp_path, harness, approval_mode="yolo")
+
+    emitted = []
+
+    def _emit(event_type: FlowEventType, payload: dict):
+        emitted.append((event_type, payload))
+
+    await pool.run_turn(
+        AgentTurnRequest(
+            agent_id="opencode",
+            prompt="main prompt",
+            workspace_root=tmp_path,
+            emit_event=_emit,
+        )
+    )
+
+    mirrored = [
+        payload["delta"]
+        for event_type, payload in emitted
+        if event_type == FlowEventType.AGENT_STREAM_DELTA
+    ]
+    assert mirrored == ["Debug", " of", " OpenCode  \n"]
+
+
+@pytest.mark.asyncio
+async def test_run_turn_does_not_mirror_opencode_user_text_parts(tmp_path: Path):
+    harness = _FakeHarness(
+        [
+            _HarnessScript(
+                assistant_text="",
+                raw_events=[
+                    _message(
+                        "message.part.updated",
+                        {
+                            "properties": {
+                                "part": {
+                                    "id": "part-user-1",
+                                    "messageID": "user-1",
+                                    "type": "text",
+                                    "text": "user prompt",
+                                },
+                                "delta": "user prompt",
+                            }
+                        },
+                    ),
+                    _message(
+                        "message.updated",
+                        {
+                            "properties": {
+                                "info": {
+                                    "id": "user-1",
+                                    "role": "user",
+                                }
+                            }
+                        },
+                    ),
+                ],
+            )
+        ]
+    )
+    pool = _make_pool(tmp_path, harness, approval_mode="yolo")
+
+    emitted = []
+
+    def _emit(event_type: FlowEventType, payload: dict):
+        emitted.append((event_type, payload))
+
+    await pool.run_turn(
+        AgentTurnRequest(
+            agent_id="opencode",
+            prompt="main prompt",
+            workspace_root=tmp_path,
+            emit_event=_emit,
+        )
+    )
+
+    assert [event_type for event_type, _ in emitted] == [
+        FlowEventType.APP_SERVER_EVENT,
+        FlowEventType.APP_SERVER_EVENT,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_turn_does_not_mirror_cumulative_opencode_text_snapshots_without_delta(
+    tmp_path: Path,
+):
+    harness = _FakeHarness(
+        [
+            _HarnessScript(
+                assistant_text="hello",
+                raw_events=[
+                    _message(
+                        "message.updated",
+                        {
+                            "properties": {
+                                "info": {
+                                    "id": "assistant-1",
+                                    "role": "assistant",
+                                }
+                            }
+                        },
+                    ),
+                    _message(
+                        "message.part.updated",
+                        {
+                            "properties": {
+                                "part": {
+                                    "id": "part-1",
+                                    "messageID": "assistant-1",
+                                    "type": "text",
+                                    "text": "hello",
+                                }
+                            }
+                        },
+                    ),
+                ],
+            )
+        ]
+    )
+    pool = _make_pool(tmp_path, harness, approval_mode="yolo")
+
+    emitted = []
+
+    def _emit(event_type: FlowEventType, payload: dict):
+        emitted.append((event_type, payload))
+
+    result = await pool.run_turn(
+        AgentTurnRequest(
+            agent_id="opencode",
+            prompt="main prompt",
+            workspace_root=tmp_path,
+            emit_event=_emit,
+        )
+    )
+
+    assert result.text == "hello"
+    assert [event_type for event_type, _ in emitted] == [
+        FlowEventType.APP_SERVER_EVENT,
+        FlowEventType.APP_SERVER_EVENT,
+    ]
+
+
+@pytest.mark.asyncio
 async def test_run_turn_handles_failure_and_returns_error(tmp_path: Path):
     harness = _FakeHarness(
         [

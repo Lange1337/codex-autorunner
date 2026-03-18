@@ -6,7 +6,7 @@ import { CONSTANTS } from "./constants.js";
 import { subscribe } from "./bus.js";
 import { isRepoHealthy } from "./health.js";
 import { closeTicketEditor, initTicketEditor, openTicketEditor } from "./ticketEditor.js";
-import { parseAppServerEvent } from "./agentEvents.js";
+import { parseAppServerEvent, resetOpenCodeEventState } from "./agentEvents.js";
 import { summarizeEvents, renderCompactSummary, COMPACT_MAX_TEXT_LENGTH } from "./eventSummarizer.js";
 import { refreshBell, renderMarkdown } from "./messages.js";
 import { preserveScroll } from "./preserve.js";
@@ -467,6 +467,9 @@ function addLiveOutputEvent(parsed) {
         else if (mergeStrategy === "newline") {
             existing.summary = `${existing.summary || ""}\n\n`;
         }
+        else if (mergeStrategy === "replace") {
+            existing.summary = event.summary;
+        }
         existing.time = event.time;
         return;
     }
@@ -634,6 +637,7 @@ function clearLiveOutput() {
         outputEl.textContent = "";
     liveOutputEvents = [];
     liveOutputEventIndex = {};
+    resetOpenCodeEventState();
     scheduleLiveOutputRender();
 }
 function setLiveOutputStatus(status) {
