@@ -2561,15 +2561,19 @@ async def test_message_create_streaming_turn_accumulates_segmented_intermediate_
     )
     try:
         await service.run_forever()
+        progress_contents = [
+            str(msg["payload"].get("content", ""))
+            for msg in rest.edited_channel_messages
+        ]
         sent_contents = [
             str(msg["payload"].get("content", "")) for msg in rest.channel_messages
         ]
         assert any(
             "intermediate output one" in content
             and "intermediate output two" in content
-            for content in sent_contents
+            for content in progress_contents
         )
-        assert "---" in sent_contents
+        assert "---" not in sent_contents
         assert any("done from streaming turn" in content for content in sent_contents)
     finally:
         await store.close()
@@ -2621,22 +2625,28 @@ async def test_message_create_streaming_turn_final_progress_omits_duplicate_term
     )
     try:
         await service.run_forever()
+        progress_contents = [
+            str(msg["payload"].get("content", ""))
+            for msg in rest.edited_channel_messages
+        ]
         sent_contents = [
             str(msg["payload"].get("content", "")) for msg in rest.channel_messages
         ]
         intermediate_messages = [
-            content for content in sent_contents if "intermediate output one" in content
+            content
+            for content in progress_contents
+            if "intermediate output one" in content
         ]
         assert intermediate_messages
         assert all(final_text not in content for content in intermediate_messages)
-        assert "---" in sent_contents
+        assert "---" not in sent_contents
         assert any(final_text in content for content in sent_contents)
     finally:
         await store.close()
 
 
 @pytest.mark.anyio
-async def test_message_create_turn_sends_intermediate_and_final_as_separate_attachments_when_long(
+async def test_message_create_turn_sends_only_final_attachment_when_long(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2673,11 +2683,60 @@ async def test_message_create_turn_sends_intermediate_and_final_as_separate_atta
 
     try:
         await service.run_forever()
-        assert len(rest.attachment_messages) == 2
-        assert rest.attachment_messages[0]["filename"] == "intermediate-response.md"
-        assert rest.attachment_messages[1]["filename"] == "final-response.md"
-        assert any(
+        assert len(rest.attachment_messages) == 1
+        assert rest.attachment_messages[0]["filename"] == "final-response.md"
+        assert not any(
             msg["payload"].get("content", "") == "---" for msg in rest.channel_messages
+        )
+    finally:
+        await store.close()
+
+
+@pytest.mark.anyio
+async def test_message_create_turn_uses_progress_snapshot_when_final_empty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    store = DiscordStateStore(tmp_path / "discord_state.sqlite3")
+    await store.initialize()
+    await store.upsert_binding(
+        channel_id="channel-1",
+        guild_id="guild-1",
+        workspace_path=str(workspace),
+        repo_id=None,
+    )
+    rest = _FakeRest()
+    gateway = _FakeGateway([("MESSAGE_CREATE", _message_create("ship it"))])
+    service = DiscordBotService(
+        _config(tmp_path),
+        logger=logging.getLogger("test"),
+        rest_client=rest,
+        gateway_client=gateway,
+        state_store=store,
+        outbox_manager=_FakeOutboxManager(),
+    )
+
+    async def _fake_run_turn(**_kwargs: Any) -> DiscordMessageTurnResult:
+        return DiscordMessageTurnResult(
+            final_message="",
+            intermediate_message="progress snapshot output",
+            preview_message_id="preview-1",
+        )
+
+    monkeypatch.setattr(service, "_run_agent_turn_for_message", _fake_run_turn)
+
+    try:
+        await service.run_forever()
+        assert any(
+            "progress snapshot output" in msg["payload"].get("content", "")
+            for msg in rest.channel_messages
+        )
+        assert not any(
+            "(No response text returned.)" in msg["payload"].get("content", "")
+            for msg in rest.channel_messages
         )
     finally:
         await store.close()

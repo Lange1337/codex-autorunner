@@ -87,7 +87,7 @@ async def test_send_long_message_uses_markdown_document(parse_mode: str) -> None
 
 
 @pytest.mark.anyio
-async def test_deliver_turn_response_sends_intermediate_separator_and_final() -> None:
+async def test_deliver_turn_response_sends_only_final_output() -> None:
     transport = _DummyTransport(parse_mode=None)
     calls: list[dict[str, object]] = []
 
@@ -127,25 +127,61 @@ async def test_deliver_turn_response_sends_intermediate_separator_and_final() ->
     assert calls == [
         {
             "chat_id": 123,
-            "text": "intermediate output",
+            "text": "final output",
             "thread_id": 456,
             "reply_to": 789,
             "placeholder_id": 321,
-            "delete_placeholder_on_delivery": False,
-        },
-        {
-            "chat_id": 123,
-            "text": "---",
-            "thread_id": 456,
-            "reply_to": None,
-            "placeholder_id": None,
             "delete_placeholder_on_delivery": True,
         },
+    ]
+
+
+@pytest.mark.anyio
+async def test_deliver_turn_response_uses_intermediate_fallback_for_no_agent_output() -> (
+    None
+):
+    transport = _DummyTransport(parse_mode=None)
+    calls: list[dict[str, object]] = []
+
+    async def _fake_send_message_with_outbox(
+        chat_id,
+        text,
+        *,
+        thread_id,
+        reply_to,
+        placeholder_id=None,
+        delete_placeholder_on_delivery=True,
+    ):  # type: ignore[no-untyped-def]
+        calls.append(
+            {
+                "chat_id": chat_id,
+                "text": text,
+                "thread_id": thread_id,
+                "reply_to": reply_to,
+                "placeholder_id": placeholder_id,
+                "delete_placeholder_on_delivery": delete_placeholder_on_delivery,
+            }
+        )
+        return True
+
+    transport._send_message_with_outbox = _fake_send_message_with_outbox  # type: ignore[assignment]
+
+    delivered = await transport._deliver_turn_response(
+        chat_id=123,
+        thread_id=456,
+        reply_to=789,
+        placeholder_id=321,
+        intermediate_response="progress snapshot output",
+        response="No agent message produced. Check logs.\n\nTurn time: 1.0s",
+    )
+
+    assert delivered is True
+    assert calls == [
         {
             "chat_id": 123,
-            "text": "final output",
+            "text": "progress snapshot output\n\nTurn time: 1.0s",
             "thread_id": 456,
-            "reply_to": None,
+            "reply_to": 789,
             "placeholder_id": 321,
             "delete_placeholder_on_delivery": True,
         },
