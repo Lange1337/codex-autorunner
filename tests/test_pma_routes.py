@@ -11,6 +11,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from codex_autorunner.agents.opencode.runtime import OpenCodeTurnOutput
 from codex_autorunner.bootstrap import pma_active_context_content, seed_hub_files
 from codex_autorunner.core import filebox
 from codex_autorunner.core.app_server_threads import PMA_KEY, PMA_OPENCODE_KEY
@@ -61,6 +62,7 @@ def _install_fake_successful_chat_supervisor(
     *,
     turn_id: str,
     message: str = "assistant text",
+    raw_events: Optional[list[dict]] = None,
 ) -> None:
     class FakeTurnHandle:
         def __init__(self) -> None:
@@ -71,7 +73,11 @@ def _install_fake_successful_chat_supervisor(
             return type(
                 "Result",
                 (),
-                {"agent_messages": [message], "raw_events": [], "errors": []},
+                {
+                    "agent_messages": [message],
+                    "raw_events": list(raw_events or []),
+                    "errors": [],
+                },
             )()
 
     class FakeClient:
@@ -408,6 +414,81 @@ def test_pma_chat_response_omits_legacy_delivery_fields(hub_env) -> None:
     assert "delivery_status" not in payload
 
 
+def test_pma_chat_register_turn_failure_is_best_effort(hub_env) -> None:
+    _enable_pma(hub_env.hub_root)
+    app = create_hub_app(hub_env.hub_root)
+    _install_fake_successful_chat_supervisor(app, turn_id="turn-register-failure")
+
+    class _BrokenEvents:
+        async def register_turn(self, thread_id: str, turn_id: str) -> None:
+            _ = thread_id, turn_id
+            raise RuntimeError("buffer unavailable")
+
+    app.state.app_server_events = _BrokenEvents()
+
+    client = TestClient(app)
+    resp = client.post("/hub/pma/chat", json={"message": "hi"})
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+
+
+@pytest.mark.anyio
+async def test_execute_opencode_records_completion_only_messages_in_timeline(
+    hub_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _Client:
+        async def create_session(
+            self, directory: Optional[str] = None
+        ) -> dict[str, str]:
+            _ = directory
+            return {"sessionId": "session-1"}
+
+        async def prompt_async(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            return {
+                "info": {"id": "message-1", "role": "assistant"},
+                "parts": [{"type": "text", "text": "completed only reply"}],
+            }
+
+    class _Supervisor:
+        async def get_client(self, _hub_root: Path) -> _Client:
+            return _Client()
+
+        async def mark_turn_started(self, _hub_root: Path) -> None:
+            return None
+
+        async def mark_turn_finished(self, _hub_root: Path) -> None:
+            return None
+
+    async def _fake_collect(*_args: Any, **kwargs: Any) -> OpenCodeTurnOutput:
+        ready_event = kwargs.get("ready_event")
+        if ready_event is not None:
+            ready_event.set()
+        return OpenCodeTurnOutput(text="completed only reply")
+
+    monkeypatch.setattr(
+        "codex_autorunner.agents.opencode.runtime.collect_opencode_output",
+        _fake_collect,
+    )
+    monkeypatch.setattr(
+        "codex_autorunner.agents.opencode.runtime.build_turn_id",
+        lambda session_id: f"{session_id}:turn",
+    )
+
+    result = await chat_runtime._execute_opencode(
+        _Supervisor(),
+        hub_env.hub_root,
+        "hello",
+        asyncio.Event(),
+    )
+
+    assert [type(event).__name__ for event in result["timeline_events"]] == [
+        "OutputDelta",
+        "Completed",
+    ]
+    assert result["timeline_events"][0].content == "completed only reply"
+
+
 def test_pma_chat_persists_transcript_and_history_entry(hub_env) -> None:
     _enable_pma(hub_env.hub_root)
     app = create_hub_app(hub_env.hub_root)
@@ -455,6 +536,63 @@ def test_pma_chat_persists_transcript_and_history_entry(hub_env) -> None:
     assert history_entry.json()["content"].strip() == (
         "User:\npersist transcript\n\nAssistant:\nassistant transcript payload"
     )
+
+
+def test_pma_history_detail_includes_turn_timeline(hub_env) -> None:
+    _enable_pma(hub_env.hub_root)
+    app = create_hub_app(hub_env.hub_root)
+    _install_fake_successful_chat_supervisor(
+        app,
+        turn_id="turn-timeline",
+        message="assistant transcript payload",
+        raw_events=[
+            {
+                "message": {
+                    "method": "item/reasoning/summaryTextDelta",
+                    "params": {"itemId": "reason-1", "delta": "inspect state"},
+                }
+            },
+            {
+                "message": {
+                    "method": "item/toolCall/start",
+                    "params": {
+                        "item": {
+                            "toolCall": {
+                                "name": "shell",
+                                "input": {"cmd": "pwd"},
+                            }
+                        }
+                    },
+                }
+            },
+            {
+                "message": {
+                    "method": "item/toolCall/end",
+                    "params": {
+                        "name": "shell",
+                        "result": {"stdout": "/tmp"},
+                    },
+                }
+            },
+        ],
+    )
+
+    client = TestClient(app)
+    resp = client.post("/hub/pma/chat", json={"message": "persist transcript"})
+    assert resp.status_code == 200
+
+    history_entry = client.get("/hub/pma/history/turn-timeline")
+    assert history_entry.status_code == 200
+    payload = history_entry.json()
+    assert [item["event_type"] for item in payload["timeline"]] == [
+        "run_notice",
+        "tool_call",
+        "tool_result",
+        "turn_completed",
+    ]
+    assert payload["timeline"][0]["event"]["message"] == "inspect state"
+    assert payload["timeline"][1]["event"]["tool_input"] == {"cmd": "pwd"}
+    assert payload["timeline"][2]["event"]["result"] == {"stdout": "/tmp"}
 
 
 def test_pma_chat_github_injection_uses_raw_user_message(
