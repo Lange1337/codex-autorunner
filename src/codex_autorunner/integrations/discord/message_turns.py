@@ -64,6 +64,7 @@ from ...core.utils import canonicalize_path
 from ...integrations.chat.collaboration_policy import CollaborationEvaluationResult
 from ...integrations.chat.compaction import match_pending_compact_seed
 from ...integrations.chat.dispatcher import DispatchContext
+from ...integrations.chat.forwarding import compose_forwarded_message_text
 from ...integrations.chat.models import ChatMessageEvent
 from ...integrations.chat.runtime_thread_errors import (
     resolve_runtime_thread_error_detail as _resolve_runtime_thread_result_error_detail,
@@ -216,6 +217,7 @@ async def handle_message_event(
     build_ticket_flow_controller_fn: Any,
     ensure_worker_fn: Any,
 ) -> None:
+    turn_text = compose_forwarded_message_text(text, event.forwarded_from)
     binding, workspace_root = await resolve_bound_workspace_root(
         service,
         channel_id=channel_id,
@@ -317,7 +319,7 @@ async def handle_message_event(
         paused_record = paused_records.get(flow_target.run_id)
         if paused_record is None:
             return
-        reply_text = text
+        reply_text = turn_text
         if has_attachments:
             (
                 reply_text,
@@ -326,7 +328,7 @@ async def handle_message_event(
                 transcript_message,
                 _native_input_items,
             ) = await service._with_attachment_context(
-                prompt_text=text,
+                prompt_text=turn_text,
                 workspace_root=workspace_root,
                 attachments=event.attachments,
                 channel_id=channel_id,
@@ -407,7 +409,7 @@ async def handle_message_event(
     async def _submit_thread_message(
         _request: SurfaceThreadMessageRequest,
     ) -> DiscordMessageTurnResult:
-        prompt_text = text
+        prompt_text = turn_text
         (
             prompt_text,
             saved_attachments,
@@ -508,7 +510,7 @@ async def handle_message_event(
         prompt_text, _github_injected = await service._maybe_inject_github_context(
             prompt_text,
             workspace_root,
-            link_source_text=text,
+            link_source_text=turn_text,
             allow_cross_repo=pma_enabled,
         )
         if pending_compact_seed:
@@ -566,7 +568,7 @@ async def handle_message_event(
         SurfaceThreadMessageRequest(
             surface_kind="discord",
             workspace_root=workspace_root,
-            prompt_text=text,
+            prompt_text=turn_text,
             agent_id=agent,
             pma_enabled=pma_enabled,
         ),

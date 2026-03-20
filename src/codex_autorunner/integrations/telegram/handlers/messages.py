@@ -28,6 +28,10 @@ from ..adapter import (
 )
 from ..config import TelegramMediaCandidate
 from ..constants import TELEGRAM_MAX_MESSAGE_LENGTH
+from ..forwarding import (
+    format_forwarded_telegram_message_text,
+    is_forwarded_telegram_message,
+)
 from ..trigger_mode import should_trigger_run
 from .questions import handle_custom_text_input
 
@@ -271,6 +275,7 @@ async def handle_message(handlers: Any, message: TelegramMessage) -> None:
     _raw_text, text_candidate, entities = _message_text_candidate(message)
     trimmed_text = text_candidate.strip()
     has_media = message_has_media(message)
+    is_forwarded = is_forwarded_telegram_message(message)
     if not trimmed_text and not has_media:
         if placeholder_id is not None:
             await handlers._delete_message(message.chat_id, placeholder_id)
@@ -282,7 +287,7 @@ async def handle_message(handlers: Any, message: TelegramMessage) -> None:
                 handlers,
                 message,
                 text=trimmed_text,
-                is_explicit_command=True,
+                is_explicit_command=not is_forwarded,
             )
             if not policy_result.command_allowed:
                 _log_message_policy_result(handlers, message, policy_result)
@@ -295,11 +300,11 @@ async def handle_message(handlers: Any, message: TelegramMessage) -> None:
 
     should_bypass = False
     if trimmed_text:
-        if is_interrupt_alias(trimmed_text):
+        if is_interrupt_alias(trimmed_text) and not is_forwarded:
             should_bypass = True
-        elif trimmed_text.startswith("!") and not has_media:
+        elif trimmed_text.startswith("!") and not has_media and not is_forwarded:
             should_bypass = True
-        elif parse_command(
+        elif not is_forwarded and parse_command(
             text_candidate, entities=entities, bot_username=handlers._bot_username
         ):
             should_bypass = True
@@ -325,6 +330,11 @@ async def handle_message(handlers: Any, message: TelegramMessage) -> None:
         await handle_message_inner(handlers, message, placeholder_id=placeholder_id)
         return
 
+    if is_forwarded:
+        await flush_coalesced_message(handlers, message)
+        await handle_message_inner(handlers, message, placeholder_id=placeholder_id)
+        return
+
     await buffer_coalesced_message(
         handlers, message, text_candidate, placeholder_id=placeholder_id
     )
@@ -343,6 +353,8 @@ def should_bypass_topic_queue(handlers: Any, message: TelegramMessage) -> bool:
         return False
     trimmed_text = text_candidate.strip()
     if not trimmed_text:
+        return False
+    if is_forwarded_telegram_message(message):
         return False
     if is_interrupt_alias(trimmed_text):
         return True
@@ -431,12 +443,14 @@ async def handle_message_inner(
         key = await handlers._resolve_topic_key(message.chat_id, message.thread_id)
     runtime = handlers._router.runtime_for(key)
     actor_id = str(message.from_user_id) if message.from_user_id is not None else None
+    is_forwarded = is_forwarded_telegram_message(message)
+    turn_text = format_forwarded_telegram_message_text(message, text)
 
     command_policy_result = _evaluate_message_policy(
         handlers,
         message,
         text=text,
-        is_explicit_command=True,
+        is_explicit_command=not is_forwarded,
     )
 
     if text and not command_policy_result.command_allowed:
@@ -466,7 +480,7 @@ async def handle_message_inner(
         await _clear_placeholder()
         return
 
-    if text and is_interrupt_alias(text):
+    if text and is_interrupt_alias(text) and not is_forwarded:
         if not command_policy_result.command_allowed:
             _log_message_policy_result(handlers, message, command_policy_result)
             await _clear_placeholder()
@@ -475,7 +489,7 @@ async def handle_message_inner(
         await _clear_placeholder()
         return
 
-    if text and text.startswith("!") and not has_media:
+    if text and text.startswith("!") and not has_media and not is_forwarded:
         if not command_policy_result.command_allowed:
             _log_message_policy_result(handlers, message, command_policy_result)
             await _clear_placeholder()
@@ -514,7 +528,7 @@ async def handle_message_inner(
         parse_command(
             command_text, entities=entities, bot_username=handlers._bot_username
         )
-        if command_text
+        if command_text and not is_forwarded
         else None
     )
     if await handlers._handle_pending_review_custom(
@@ -682,7 +696,11 @@ async def handle_message_inner(
             return
         run_id, run_record = paused
         success, result = await handlers._write_user_reply_from_telegram(
-            workspace_root or Path("."), run_id, run_record, message, text
+            workspace_root or Path("."),
+            run_id,
+            run_record,
+            message,
+            turn_text,
         )
         await handlers._send_message(
             message.chat_id,
@@ -701,7 +719,7 @@ async def handle_message_inner(
         await handlers._handle_normal_message(
             message,
             runtime,
-            text_override=text,
+            text_override=turn_text,
             placeholder_id=placeholder_id,
         )
 
@@ -710,7 +728,7 @@ async def handle_message_inner(
             SurfaceThreadMessageRequest(
                 surface_kind="telegram",
                 workspace_root=workspace_root or Path("."),
-                prompt_text=text,
+                prompt_text=turn_text,
                 agent_id=getattr(record, "agent", None),
                 pma_enabled=pma_enabled,
             ),
@@ -1151,6 +1169,7 @@ async def handle_media_message(
 
     pma_enabled = bool(getattr(record, "pma_enabled", False))
     workspace_root = canonicalize_path(Path(record.workspace_path))
+    turn_caption_text = format_forwarded_telegram_message_text(message, caption_text)
     paused = None
     if not pma_enabled:
         preferred_run_id = handlers._ticket_flow_pause_targets.get(
@@ -1269,7 +1288,12 @@ async def handle_media_message(
             )
             return
         success, result = await handlers._write_user_reply_from_telegram(
-            workspace_root, run_id, run_record, message, reply_text, files
+            workspace_root,
+            run_id,
+            run_record,
+            message,
+            format_forwarded_telegram_message_text(message, reply_text),
+            files,
         )
         await handlers._send_message(
             message.chat_id,
@@ -1300,7 +1324,7 @@ async def handle_media_message(
                 runtime,
                 record,
                 image_candidate,
-                caption_text,
+                turn_caption_text,
                 placeholder_id=placeholder_id,
             )
             return
@@ -1320,7 +1344,7 @@ async def handle_media_message(
                 runtime,
                 record,
                 voice_candidate,
-                caption_text,
+                turn_caption_text,
                 placeholder_id=placeholder_id,
             )
             return
@@ -1340,16 +1364,16 @@ async def handle_media_message(
                 runtime,
                 record,
                 file_candidate,
-                caption_text,
+                turn_caption_text,
                 placeholder_id=placeholder_id,
             )
             return
 
-        if caption_text:
+        if turn_caption_text:
             await handlers._handle_normal_message(
                 message,
                 runtime,
-                text_override=caption_text,
+                text_override=turn_caption_text,
                 record=record,
                 placeholder_id=placeholder_id,
             )
@@ -1365,7 +1389,7 @@ async def handle_media_message(
         SurfaceThreadMessageRequest(
             surface_kind="telegram",
             workspace_root=workspace_root,
-            prompt_text=caption_text,
+            prompt_text=turn_caption_text,
             agent_id=getattr(record, "agent", None),
             pma_enabled=pma_enabled,
         ),
