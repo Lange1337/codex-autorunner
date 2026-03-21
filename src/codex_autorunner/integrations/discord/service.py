@@ -35,6 +35,10 @@ from ...core.filebox import (
     outbox_pending_dir,
     outbox_sent_dir,
 )
+from ...core.filebox_retention import (
+    prune_filebox_root,
+    resolve_filebox_retention_policy,
+)
 from ...core.flows import (
     FLOW_ACTION_SPECS,
     FLOW_ACTIONS_WITH_RUN_PICKER,
@@ -595,6 +599,7 @@ class DiscordBotService:
         self.app_server_supervisor = _DiscordAppServerSupervisorAdapter(self)
         self.opencode_supervisor = _DiscordOpenCodeSupervisorAdapter(self)
         self._opencode_prune_task: Optional[asyncio.Task[None]] = None
+        self._filebox_prune_task: Optional[asyncio.Task[None]] = None
         self._app_server_state_root = resolve_global_state_root() / "workspaces"
         self._channel_directory_store = ChannelDirectoryStore(self._config.root)
         self._guild_name_cache: dict[str, str] = {}
@@ -665,6 +670,10 @@ class DiscordBotService:
         self._outbox.start()
         outbox_task = asyncio.create_task(self._outbox.run_loop())
         self._opencode_prune_task = asyncio.create_task(self._run_opencode_prune_loop())
+        if self._filebox_housekeeping_enabled():
+            self._filebox_prune_task = asyncio.create_task(
+                self._run_filebox_prune_loop()
+            )
         pause_watch_task = asyncio.create_task(self._watch_ticket_flow_pauses())
         terminal_watch_task = asyncio.create_task(self._watch_ticket_flow_terminals())
         dispatcher_loop_task = asyncio.create_task(self._run_dispatcher_loop())
@@ -698,6 +707,11 @@ class DiscordBotService:
                 with contextlib.suppress(asyncio.CancelledError):
                     await self._opencode_prune_task
                 self._opencode_prune_task = None
+            if self._filebox_prune_task is not None:
+                self._filebox_prune_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._filebox_prune_task
+                self._filebox_prune_task = None
             pause_watch_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await pause_watch_task
@@ -2403,6 +2417,23 @@ class DiscordBotService:
                 exc=exc,
             )
 
+    def _filebox_housekeeping_enabled(self) -> bool:
+        try:
+            repo_config = load_repo_config(
+                self._config.root,
+                hub_path=self._hub_config_path,
+            )
+        except Exception as exc:
+            log_event(
+                self._logger,
+                logging.WARNING,
+                "discord.filebox.config_load_failed",
+                repo_root=str(self._config.root),
+                exc=exc,
+            )
+            return False
+        return bool(repo_config.housekeeping.enabled)
+
     async def _next_opencode_prune_interval_seconds(self) -> float:
         async with self._opencode_lock:
             intervals = [
@@ -2418,6 +2449,82 @@ class DiscordBotService:
         while True:
             await asyncio.sleep(await self._next_opencode_prune_interval_seconds())
             await self._prune_opencode_supervisors()
+
+    async def _run_filebox_prune_loop(self) -> None:
+        while True:
+            await asyncio.sleep(await self._run_filebox_prune_cycle())
+
+    async def _filebox_prune_roots(self) -> list[Path]:
+        roots: set[Path] = {self._config.root.resolve()}
+        try:
+            bindings = await self._store.list_bindings()
+        except Exception as exc:
+            log_event(
+                self._logger,
+                logging.WARNING,
+                "discord.filebox.bindings_load_failed",
+                repo_root=str(self._config.root),
+                exc=exc,
+            )
+            return sorted(roots)
+        for binding in bindings:
+            workspace_raw = binding.get("workspace_path")
+            if not isinstance(workspace_raw, str) or not workspace_raw.strip():
+                continue
+            workspace_root = canonicalize_path(Path(workspace_raw))
+            if workspace_root.exists() and workspace_root.is_dir():
+                roots.add(workspace_root)
+        return sorted(roots)
+
+    async def _run_filebox_prune_cycle(self) -> float:
+        interval_seconds = 3600.0
+        roots = await self._filebox_prune_roots()
+        for root in roots:
+            try:
+                repo_config = load_repo_config(
+                    root,
+                    hub_path=self._hub_config_path,
+                )
+            except Exception as exc:
+                log_event(
+                    self._logger,
+                    logging.WARNING,
+                    "discord.filebox.config_load_failed",
+                    repo_root=str(root),
+                    exc=exc,
+                )
+                continue
+            interval_seconds = min(
+                interval_seconds,
+                float(max(repo_config.housekeeping.interval_seconds, 1)),
+            )
+            try:
+                summary = await asyncio.to_thread(
+                    prune_filebox_root,
+                    root,
+                    policy=resolve_filebox_retention_policy(repo_config.pma),
+                )
+            except Exception as exc:
+                log_event(
+                    self._logger,
+                    logging.WARNING,
+                    "discord.filebox.cleanup_failed",
+                    repo_root=str(root),
+                    exc=exc,
+                )
+                continue
+            if summary.inbox_pruned or summary.outbox_pruned:
+                log_event(
+                    self._logger,
+                    logging.INFO,
+                    "discord.filebox.cleanup",
+                    repo_root=str(root),
+                    inbox_pruned=summary.inbox_pruned,
+                    outbox_pruned=summary.outbox_pruned,
+                    bytes_before=summary.bytes_before,
+                    bytes_after=summary.bytes_after,
+                )
+        return interval_seconds
 
     async def _prune_opencode_supervisors(self) -> None:
         async with self._opencode_lock:
