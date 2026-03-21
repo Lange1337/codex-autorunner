@@ -118,6 +118,9 @@ from ...integrations.chat.dispatcher import (
     DispatchResult,
 )
 from ...integrations.chat.forwarding import compose_forwarded_message_text
+from ...integrations.chat.handlers.approvals import (
+    normalize_backend_approval_request,
+)
 from ...integrations.chat.media import (
     audio_content_type_for_input,
     audio_extension_for_input,
@@ -2183,13 +2186,11 @@ class DiscordBotService:
     async def _handle_backend_approval_request(
         self, request: dict[str, Any]
     ) -> ApprovalDecision:
-        request_id = str(request.get("id") or "").strip()
-        params = (
-            request.get("params") if isinstance(request.get("params"), dict) else {}
-        )
-        turn_id = str(params.get("turnId") or params.get("turn_id") or "").strip()
-        if not request_id or not turn_id:
+        request_data = normalize_backend_approval_request(request)
+        if request_data is None:
             return "cancel"
+        request_id = request_data.request_id
+        turn_id = request_data.turn_id
         context = self._discord_turn_approval_contexts.get(turn_id)
         if context is None:
             return "cancel"
