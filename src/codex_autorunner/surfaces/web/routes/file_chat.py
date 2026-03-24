@@ -571,13 +571,19 @@ def build_file_chat_routes() -> APIRouter:
                 media_type="text/event-stream",
                 headers=SSE_HEADERS,
             )
-        if agent_id == "opencode":
+        if agent_id in {"opencode", "claude"}:
             supervisor = getattr(request.app.state, "opencode_supervisor", None)
             if supervisor is None:
-                raise HTTPException(status_code=404, detail="OpenCode unavailable")
-            from ....agents.opencode.harness import OpenCodeHarness
+                detail = "Claude unavailable" if agent_id == "claude" else "OpenCode unavailable"
+                raise HTTPException(status_code=404, detail=detail)
+            if agent_id == "claude":
+                from ....agents.claude.harness import ClaudeHarness
 
-            harness = OpenCodeHarness(supervisor)
+                harness = ClaudeHarness(supervisor)
+            else:
+                from ....agents.opencode.harness import OpenCodeHarness
+
+                harness = OpenCodeHarness(supervisor)
             repo_root = _resolve_repo_root(request)
             return StreamingResponse(
                 harness.stream_events(repo_root, thread_id, turn_id),

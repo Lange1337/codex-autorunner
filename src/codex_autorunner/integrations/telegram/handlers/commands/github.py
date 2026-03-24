@@ -1479,7 +1479,7 @@ class GitHubCommands(TelegramCommandSupportMixin):
                 reply_to=message.message_id,
             )
             return
-        if agent == "opencode":
+        if agent in {"opencode", "claude"}:
             await self._start_opencode_review(
                 message,
                 runtime,

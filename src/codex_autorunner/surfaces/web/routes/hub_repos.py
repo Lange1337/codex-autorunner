@@ -190,8 +190,11 @@ def build_hub_repo_routes(
         }
 
     def _normalize_agent(value: Any) -> str:
-        if isinstance(value, str) and value.strip().lower() == "opencode":
-            return "opencode"
+        if not isinstance(value, str):
+            return "codex"
+        normalized = value.strip().lower()
+        if normalized in {"opencode", "claude"}:
+            return normalized
         return "codex"
 
     def _normalize_scope(value: Any) -> Optional[str]:

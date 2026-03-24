@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 
 FILE_CHAT_TIMEOUT_SECONDS = 180
 
+_OPENCODE_LIKE_AGENTS = frozenset({"opencode", "claude"})
+
 
 class FileChatError(Exception):
     """Base error for file chat failures."""
@@ -81,7 +83,7 @@ async def execute_file_chat(
     except ValueError:
         agent_id = "codex"
 
-    if agent_id not in ("codex", "opencode"):
+    if agent_id not in ("codex", *_OPENCODE_LIKE_AGENTS):
         return {
             "status": "error",
             "detail": f"Agent '{agent_id}' is not supported on file-chat surface yet",
@@ -90,14 +92,16 @@ async def execute_file_chat(
     thread_key = f"file_chat.{target.state_key}"
     await update_turn_state(request, target, status="running", agent=agent_id)
 
-    if agent_id == "opencode":
+    if agent_id in _OPENCODE_LIKE_AGENTS:
         if opencode is None:
-            return {"status": "error", "detail": "OpenCode supervisor unavailable"}
-        result = await execute_opencode(
+            label = "Claude" if agent_id == "claude" else "OpenCode"
+            return {"status": "error", "detail": f"{label} supervisor unavailable"}
+        result = await execute_opencode_like(
             opencode,
             repo_root,
             prompt,
             interrupt_event,
+            agent_id=agent_id,
             model=model,
             reasoning=reasoning,
             thread_registry=threads,
@@ -283,12 +287,13 @@ async def execute_app_server(
     }
 
 
-async def execute_opencode(
+async def execute_opencode_like(
     supervisor: Any,
     repo_root: Path,
     prompt: str,
     interrupt_event: asyncio.Event,
     *,
+    agent_id: str,
     model: Optional[str] = None,
     reasoning: Optional[str] = None,
     thread_registry: Optional[Any] = None,
@@ -321,11 +326,11 @@ async def execute_opencode(
     turn_id = build_turn_id(session_id)
     if on_meta is not None:
         try:
-            maybe = on_meta("opencode", session_id, turn_id)
+            maybe = on_meta(agent_id, session_id, turn_id)
             if asyncio.iscoroutine(maybe):
                 await maybe
         except Exception:
-            logger.debug("file chat opencode meta failed", exc_info=True)
+            logger.debug("file chat %s meta failed", agent_id, exc_info=True)
 
     model_payload = split_model_id(model)
     await supervisor.mark_turn_started(repo_root)
@@ -422,7 +427,7 @@ async def execute_opencode(
         "message": output_result.text,
         "thread_id": session_id,
         "turn_id": turn_id,
-        "agent": "opencode",
+        "agent": agent_id,
     }
     if usage_parts:
         result["usage_parts"] = usage_parts

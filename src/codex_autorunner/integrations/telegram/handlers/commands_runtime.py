@@ -379,7 +379,7 @@ class TelegramCommandHandlers(
         resolved_agent = self._effective_agent(outcome.record)
         response_text = outcome.response
         intermediate_response = outcome.intermediate_response
-        if resolved_agent == "opencode":
+        if resolved_agent in {"opencode", "claude"}:
             if (
                 isinstance(response_text, str)
                 and response_text.strip() == "No response."
@@ -397,7 +397,7 @@ class TelegramCommandHandlers(
             intermediate_response = None
             if getattr(self._config, "message_overflow", "document") == "document":
                 overflow_mode_override = "split"
-        elif resolved_agent == "opencode":
+        elif resolved_agent in {"opencode", "claude"}:
             response_text = compose_turn_response_with_footer(
                 response_text,
                 summary_text=outcome.intermediate_response,
@@ -1337,10 +1337,10 @@ class TelegramCommandHandlers(
                 reply_to=message.message_id,
             )
             return
-        if agent == "opencode" and "/" not in model:
+        if agent in {"opencode", "claude"} and "/" not in model:
             await self._send_message(
                 message.chat_id,
-                "OpenCode models must be in provider/model format (e.g., openai/gpt-4o).",
+                "OpenCode/Claude models must be in provider/model format (e.g., openai/gpt-4o).",
                 thread_id=message.thread_id,
                 reply_to=message.message_id,
             )

@@ -236,6 +236,9 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
     def _agent_supports_resume(self, agent: str) -> bool:
         return self._agent_supports_capability(agent, "durable_threads")
 
+    def _is_opencode_agent(self, agent: str) -> bool:
+        return agent in ("opencode", "claude")
+
     def _agent_rate_limit_source(self, agent: str) -> Optional[str]:
         if agent == "codex":
             return "app_server"
@@ -258,7 +261,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
         client: CodexAppServerClient,
         list_params: dict[str, Any],
     ) -> Any:
-        if agent == "opencode":
+        if self._is_opencode_agent(agent):
             supervisor = getattr(self, "_opencode_supervisor", None)
             if supervisor is None:
                 from .....agents.opencode.supervisor import OpenCodeSupervisorError
@@ -293,7 +296,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
         self, message: TelegramMessage, record: "TelegramTopicRecord"
     ) -> Optional["TelegramTopicRecord"]:
         agent = self._effective_agent(record)
-        if agent == "opencode":
+        if self._is_opencode_agent(agent):
             if not record.active_thread_id:
                 return record
             supervisor = getattr(self, "_opencode_supervisor", None)
@@ -643,7 +646,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
             if thread_id:
                 return thread_id
         agent = self._effective_agent(record)
-        if agent == "opencode":
+        if self._is_opencode_agent(agent):
             supervisor = getattr(self, "_opencode_supervisor", None)
             if supervisor is None:
                 await self._send_message(
@@ -1145,7 +1148,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
             )
             return
         agent = self._effective_agent(record)
-        if agent == "opencode":
+        if self._is_opencode_agent(agent):
             supervisor = getattr(self, "_opencode_supervisor", None)
             if supervisor is None:
                 await self._send_message(
@@ -1384,7 +1387,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
         agent = self._effective_agent(record)
         from .execution import _sync_telegram_thread_binding
 
-        if agent == "opencode":
+        if self._is_opencode_agent(agent):
             supervisor = getattr(self, "_opencode_supervisor", None)
             if supervisor is None:
                 await self._send_message(
@@ -1700,7 +1703,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
         agent = self._effective_agent(record)
         from .execution import _sync_telegram_thread_binding
 
-        if agent == "opencode":
+        if self._is_opencode_agent(agent):
             supervisor = getattr(self, "_opencode_supervisor", None)
             if supervisor is None:
                 await self._send_message(
@@ -2043,7 +2046,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
                     topic_record = (
                         store_state.topics.get(topic_key) if store_state else None
                     )
-                    if topic_record and topic_record.agent == "opencode":
+                    if topic_record and self._is_opencode_agent(topic_record.agent):
                         allowed_thread_ids.add(thread_id)
                         break
             if allowed_thread_ids:
@@ -2121,7 +2124,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
                 show_unscoped=True,
                 refresh=parsed_args.refresh,
             )
-        if self._effective_agent(record) == "opencode":
+        if self._effective_agent(record) in ("opencode", "claude"):
             await self._handle_opencode_resume(
                 message,
                 record,
@@ -2719,7 +2722,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
         chat_id, thread_id_val = _split_topic_key(key)
         self._resume_options.pop(key, None)
         record = await self._router.get_topic(key)
-        if record is not None and self._effective_agent(record) == "opencode":
+        if record is not None and self._effective_agent(record) in ("opencode", "claude"):
             await self._resume_opencode_thread_by_id(key, thread_id, callback=callback)
             return
         workspace_path, error = self._resolve_workspace_path(record, allow_pma=True)

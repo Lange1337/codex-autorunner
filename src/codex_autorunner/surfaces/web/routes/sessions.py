@@ -143,7 +143,11 @@ def build_sessions_routes() -> APIRouter:
             candidates: list[str] = []
             if normalized_repo_path:
                 candidates.extend(
-                    [normalized_repo_path, f"{normalized_repo_path}:opencode"]
+                    [
+                        normalized_repo_path,
+                        f"{normalized_repo_path}:opencode",
+                        f"{normalized_repo_path}:claude",
+                    ]
                 )
             for key in candidates:
                 mapped = repo_to_session.get(key)

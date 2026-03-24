@@ -153,7 +153,7 @@ class TelegramSelectionHandlers(ChatSelectionHandlers):
         record = await self._router.ensure_topic(callback.chat_id, callback.thread_id)
         current = self._effective_agent(record)
         desired = parsed.agent
-        if desired == "opencode" and not self._opencode_available():
+        if desired in {"opencode", "claude"} and not self._opencode_available():
             await self._answer_callback(callback, "OpenCode missing")
             await self._finalize_selection(
                 key,

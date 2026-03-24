@@ -91,6 +91,9 @@ def _default_agents_section() -> Dict[str, Any]:
                 "subagent": "zai-coding-plan/glm-4.7-flashx",
             },
         },
+        "claude": {
+            "binary": "claude",
+        },
         "zeroclaw": {
             "binary": "zeroclaw",
         },

@@ -2381,7 +2381,7 @@ class DiscordBotService:
                     hub_path=self._hub_config_path,
                 )
                 shared_opencode_supervisor = None
-                if agent_id == "opencode":
+                if agent_id in {"opencode", "claude"}:
                     # Share the Discord service's workspace supervisor with the
                     # backend orchestrator so idle pruning sees the same
                     # active-turn bookkeeping as the running managed turn.
@@ -2965,6 +2965,22 @@ class DiscordBotService:
                 label = f"{model_id} ({model.display_name})"
             options.append((model_id, label))
         return options
+
+    async def _list_claude_models_for_picker(
+        self,
+        *,
+        workspace_path: Optional[str],
+    ) -> Optional[list[tuple[str, str]]]:
+        options = await self._list_opencode_models_for_picker(
+            workspace_path=workspace_path
+        )
+        if options is None:
+            return None
+        filtered: list[tuple[str, str]] = []
+        for model_id, label in options:
+            if model_id.startswith("anthropic/") or model_id.startswith("claude/"):
+                filtered.append((model_id, label))
+        return filtered
 
     async def _list_threads_paginated(
         self,
@@ -5006,6 +5022,10 @@ class DiscordBotService:
                 return rate_limits
         return None
 
+    @staticmethod
+    def _is_opencode_agent(agent: str) -> bool:
+        return agent in ("opencode", "claude")
+
     async def _list_model_items_for_binding(
         self,
         *,
@@ -5015,6 +5035,10 @@ class DiscordBotService:
     ) -> Optional[list[tuple[str, str]]]:
         if agent == "opencode":
             return await self._list_opencode_models_for_picker(
+                workspace_path=binding.get("workspace_path")
+            )
+        if agent == "claude":
+            return await self._list_claude_models_for_picker(
                 workspace_path=binding.get("workspace_path")
             )
         client = await self._client_for_workspace(binding.get("workspace_path"))
@@ -7236,7 +7260,6 @@ class DiscordBotService:
             deferred=deferred,
             text=text,
         )
-
     def _agent_descriptor(self, agent: object) -> AgentDescriptor | None:
         normalized = self._normalize_agent(agent)
         return get_agent_descriptor(normalized)
@@ -7458,12 +7481,16 @@ class DiscordBotService:
                     ),
                 )
                 return
-
-            if current_agent == "opencode":
+            if current_agent in {"opencode", "claude"}:
                 try:
-                    model_items = await self._list_opencode_models_for_picker(
-                        workspace_path=binding.get("workspace_path")
-                    )
+                    if current_agent == "claude":
+                        model_items = await self._list_claude_models_for_picker(
+                            workspace_path=binding.get("workspace_path")
+                        )
+                    else:
+                        model_items = await self._list_opencode_models_for_picker(
+                            workspace_path=binding.get("workspace_path")
+                        )
                 except Exception as exc:
                     log_event(
                         self._logger,
@@ -7629,13 +7656,13 @@ class DiscordBotService:
                 return
             model_name = resolved_model_name
 
-        if current_agent == "opencode" and not _is_valid_opencode_model_name(
+        if current_agent in {"opencode", "claude"} and not _is_valid_opencode_model_name(
             model_name
         ):
             await self._respond_ephemeral(
                 interaction_id,
                 interaction_token,
-                "OpenCode model must be in `provider/model` format.",
+                "OpenCode/Claude model must be in `provider/model` format.",
             )
             return
 

@@ -19,6 +19,7 @@ from ....core.utils import (
     apply_codex_options,
     extract_flag_value,
     resolve_opencode_binary,
+    supports_flag,
     supports_reasoning,
 )
 
@@ -103,6 +104,13 @@ def build_opencode_terminal_cmd(binary: str, model: Optional[str] = None) -> lis
     resolved = resolve_opencode_binary(binary)
     cmd = [resolved or binary]
     if model:
+        cmd.extend(["--model", model])
+    return cmd
+
+
+def build_claude_terminal_cmd(binary: str, model: Optional[str] = None) -> list[str]:
+    cmd = [binary]
+    if model and supports_flag(binary, "--model"):
         cmd.extend(["--model", model])
     return cmd
 

@@ -25,6 +25,7 @@ from ..services import terminal as terminal_service
 from ..static_assets import index_response_headers, render_index_html
 from ..static_refresh import refresh_static_assets
 from .shared import (
+    build_claude_terminal_cmd,
     build_codex_terminal_cmd,
     build_opencode_terminal_cmd,
 )
@@ -262,6 +263,11 @@ def build_base_routes(static_dir: Path) -> APIRouter:
                 if agent == "opencode":
                     cmd = build_opencode_terminal_cmd(
                         engine.config.agent_binary("opencode"),
+                        model,
+                    )
+                elif agent == "claude":
+                    cmd = build_claude_terminal_cmd(
+                        engine.config.agent_binary("claude"),
                         model,
                     )
                 else:

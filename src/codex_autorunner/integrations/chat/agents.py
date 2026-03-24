@@ -6,18 +6,27 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Literal, Optional, Tuple
 
+from ...agents.claude.constants import DEFAULT_TICKET_MODEL as DEFAULT_CLAUDE_MODEL
+
 DEFAULT_CHAT_AGENT = "codex"
 DEFAULT_CHAT_AGENT_MODELS = MappingProxyType(
     {
         "codex": "gpt-5.4",
         "opencode": "zai-coding-plan/glm-5.1",
+        "claude": DEFAULT_CLAUDE_MODEL,
     }
 )
 
 AgentModelResetMode = Literal["clear", "agent_default"]
 CHAT_EFFORT_CAPABILITY = "review"
 
-VALID_CHAT_AGENT_VALUES: Tuple[str, ...] = ("codex", "opencode", "hermes", "zeroclaw")
+VALID_CHAT_AGENT_VALUES: Tuple[str, ...] = (
+    "codex",
+    "opencode",
+    "claude",
+    "hermes",
+    "zeroclaw",
+)
 
 
 @dataclass(frozen=True)
@@ -29,6 +38,7 @@ class ChatAgentDefinition:
 CHAT_AGENT_DEFINITIONS: tuple[ChatAgentDefinition, ...] = (
     ChatAgentDefinition(value="codex", description="Codex"),
     ChatAgentDefinition(value="opencode", description="OpenCode"),
+    ChatAgentDefinition(value="claude", description="Claude"),
     ChatAgentDefinition(value="hermes", description="Hermes"),
     ChatAgentDefinition(value="zeroclaw", description="ZeroClaw"),
 )

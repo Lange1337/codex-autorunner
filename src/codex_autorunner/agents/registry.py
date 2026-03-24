@@ -10,6 +10,7 @@ from typing import Any, Callable, Iterable, Optional, cast
 from ..core.config import load_hub_config, load_repo_config
 from ..plugin_api import CAR_AGENT_ENTRYPOINT_GROUP, CAR_PLUGIN_API_VERSION
 from .base import AgentHarness
+from .claude.harness import ClaudeHarness
 from .codex.harness import CodexHarness
 from .hermes.harness import HERMES_CAPABILITIES, HermesHarness
 from .hermes.supervisor import (
@@ -77,12 +78,31 @@ def _make_opencode_harness(ctx: Any) -> AgentHarness:
     return OpenCodeHarness(supervisor)
 
 
+def _make_claude_harness(ctx: Any) -> AgentHarness:
+    supervisor = ctx.opencode_supervisor
+    if supervisor is None:
+        raise RuntimeError("Claude harness unavailable: supervisor missing")
+    return ClaudeHarness(supervisor)
+
+
 def _check_codex_health(ctx: Any) -> bool:
     supervisor = ctx.app_server_supervisor
     return supervisor is not None
 
 
 def _check_opencode_health(ctx: Any) -> bool:
+    supervisor = ctx.opencode_supervisor
+    return supervisor is not None
+
+
+def _make_claude_harness(ctx: Any) -> AgentHarness:
+    supervisor = ctx.opencode_supervisor
+    if supervisor is None:
+        raise RuntimeError("Claude harness unavailable: supervisor missing")
+    return ClaudeHarness(supervisor)
+
+
+def _check_claude_health(ctx: Any) -> bool:
     supervisor = ctx.opencode_supervisor
     return supervisor is not None
 
@@ -249,6 +269,23 @@ _BUILTIN_AGENTS: dict[str, AgentDescriptor] = {
         ),
         make_harness=_make_opencode_harness,
         healthcheck=_check_opencode_health,
+    ),
+    "claude": AgentDescriptor(
+        id="claude",
+        name="Claude",
+        capabilities=frozenset(
+            [
+                RuntimeCapability("durable_threads"),
+                RuntimeCapability("message_turns"),
+                RuntimeCapability("interrupt"),
+                RuntimeCapability("active_thread_discovery"),
+                RuntimeCapability("review"),
+                RuntimeCapability("model_listing"),
+                RuntimeCapability("event_streaming"),
+            ]
+        ),
+        make_harness=_make_claude_harness,
+        healthcheck=_check_claude_health,
     ),
     "zeroclaw": AgentDescriptor(
         id="zeroclaw",

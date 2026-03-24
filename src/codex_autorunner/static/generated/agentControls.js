@@ -11,6 +11,8 @@ const STORAGE_KEYS = {
 };
 const FALLBACK_AGENTS = [
     { id: "codex", name: "Codex" },
+    { id: "opencode", name: "OpenCode" },
+    { id: "claude", name: "Claude" },
 ];
 const controls = [];
 let agentsLoaded = false;

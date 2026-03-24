@@ -13,6 +13,7 @@ from ...core.state import RunnerState
 from ...core.types import AppServerSupervisorFactory, BackendFactory
 from ..app_server.env import build_app_server_env
 from ..app_server.supervisor import WorkspaceAppServerSupervisor
+from ...agents.claude.constants import DEFAULT_TICKET_MODEL as DEFAULT_CLAUDE_MODEL
 from .codex_backend import CodexAppServerBackend
 from .destination_wrapping import (
     resolve_destination_from_config,
@@ -163,6 +164,57 @@ class AgentBackendFactory:
                     cached.configure(
                         model=state.autorunner_model_override,
                         reasoning=state.autorunner_effort_override,
+                        approval_policy=state.autorunner_approval_policy,
+                    )
+            return cached
+
+        if agent_id == "claude":
+            agent_cfg = self._config.agents.get("claude")
+            base_url = agent_cfg.base_url if agent_cfg else None
+            username = os.environ.get("OPENCODE_SERVER_USERNAME")
+            password = os.environ.get("OPENCODE_SERVER_PASSWORD")
+            if password and not username:
+                username = "opencode"
+            auth = (username, password) if username and password else None
+
+            model = state.autorunner_model_override or DEFAULT_CLAUDE_MODEL
+            reasoning = state.autorunner_effort_override
+
+            cached = self._backend_cache.get(agent_id)
+            if cached is None:
+                if not base_url:
+                    supervisor = self._ensure_opencode_supervisor()
+                    if supervisor is None:
+                        raise ValueError("claude backend is not configured")
+                    cached = OpenCodeBackend(
+                        supervisor=supervisor,
+                        workspace_root=self._repo_root,
+                        auth=auth,
+                        timeout=self._config.app_server.request_timeout,
+                        model=model,
+                        reasoning=reasoning,
+                        approval_policy=state.autorunner_approval_policy,
+                        session_stall_timeout_seconds=self._config.opencode.session_stall_timeout_seconds,
+                        logger=self._logger,
+                    )
+                else:
+                    cached = OpenCodeBackend(
+                        base_url=base_url,
+                        workspace_root=self._repo_root,
+                        auth=auth,
+                        timeout=self._config.app_server.request_timeout,
+                        model=model,
+                        reasoning=reasoning,
+                        approval_policy=state.autorunner_approval_policy,
+                        session_stall_timeout_seconds=self._config.opencode.session_stall_timeout_seconds,
+                        logger=self._logger,
+                    )
+                self._backend_cache[agent_id] = cached
+            else:
+                if isinstance(cached, OpenCodeBackend):
+                    cached.configure(
+                        model=model,
+                        reasoning=reasoning,
                         approval_policy=state.autorunner_approval_policy,
                     )
             return cached

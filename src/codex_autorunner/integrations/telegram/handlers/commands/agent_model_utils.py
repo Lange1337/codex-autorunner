@@ -91,7 +91,7 @@ async def _handle_agent_command(
             reply_to=message.message_id,
         )
         return
-    if desired == "opencode" and not commands._opencode_available():
+    if desired in {"opencode", "claude"} and not commands._opencode_available():
         await commands._send_message(
             message.chat_id,
             "OpenCode binary not found. Install opencode or switch to /agent codex.",
@@ -154,7 +154,7 @@ def _build_agent_options(
         label = agent
         if agent == current:
             label = f"{label} (current)"
-        if agent == "opencode" and availability != "available":
+        if agent in {"opencode", "claude"} and availability != "available":
             label = f"{label} ({availability})"
         items.append((agent, label))
     return items

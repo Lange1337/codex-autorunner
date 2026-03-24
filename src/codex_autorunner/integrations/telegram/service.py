@@ -1217,7 +1217,7 @@ class TelegramBotService(
             hub_root = getattr(self, "_hub_root", None)
             if hub_root is not None:
                 workspace_path = str(hub_root)
-        if record and record.agent == "opencode":
+        if record and record.agent in {"opencode", "claude"}:
             session_id = record.active_thread_id or codex_thread_id
             if (
                 not session_id

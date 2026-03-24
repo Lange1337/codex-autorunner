@@ -3908,7 +3908,7 @@ class ExecutionCommands(TelegramCommandSupportMixin):
         )
 
         agent = self._effective_agent(record)
-        if agent == "opencode":
+        if agent in {"opencode", "claude"}:
             return await self._execute_opencode_turn(
                 message,
                 runtime,

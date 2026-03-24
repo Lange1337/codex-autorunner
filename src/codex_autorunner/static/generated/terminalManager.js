@@ -408,7 +408,8 @@ export class TerminalManager {
         this.connectBtn.addEventListener("click", () => this.connect({ mode: "new" }));
         this.resumeBtn.addEventListener("click", () => {
             const selectedAgent = getSelectedAgent();
-            if (selectedAgent && selectedAgent.toLowerCase() === "opencode") {
+            const normalized = selectedAgent ? selectedAgent.toLowerCase() : "";
+            if (normalized === "opencode" || normalized === "claude") {
                 this.connect({ mode: "new" });
             }
             else {
@@ -2143,8 +2144,9 @@ export class TerminalManager {
             this.disconnectBtn.disabled = !connected;
         if (this.resumeBtn) {
             const selectedAgent = getSelectedAgent();
-            const isOpencode = selectedAgent && selectedAgent.toLowerCase() === "opencode";
-            if (isOpencode) {
+            const normalized = selectedAgent ? selectedAgent.toLowerCase() : "";
+            const isOpencodeLike = normalized === "opencode" || normalized === "claude";
+            if (isOpencodeLike) {
                 this.resumeBtn.classList.add("hidden");
             }
             else {

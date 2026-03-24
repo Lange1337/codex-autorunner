@@ -1289,7 +1289,7 @@ function resetThread(): void {
 async function startNewThreadOnServer(): Promise<void> {
   const elements = getElements();
   const rawAgent = (elements.agentSelect?.value || getSelectedAgent() || "").trim().toLowerCase();
-  const selectedAgent = rawAgent === "codex" || rawAgent === "opencode" ? rawAgent : undefined;
+  const selectedAgent = rawAgent === "codex" || rawAgent === "opencode" || rawAgent === "claude" ? rawAgent : undefined;
   await api("/hub/pma/new", {
     method: "POST",
     body: { agent: selectedAgent, lane_id: DEFAULT_PMA_LANE_ID },

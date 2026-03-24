@@ -154,8 +154,11 @@ class HubChannelService:
         return names
 
     def _normalize_agent(self, value: Any) -> str:
-        if isinstance(value, str) and value.strip().lower() == "opencode":
-            return "opencode"
+        if not isinstance(value, str):
+            return "codex"
+        normalized = value.strip().lower()
+        if normalized in {"opencode", "claude"}:
+            return normalized
         return "codex"
 
     def _normalize_scope(self, value: Any) -> Optional[str]:
