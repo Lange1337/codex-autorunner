@@ -1,7 +1,7 @@
 # State Roots Contract
 
 This document defines the canonical locations for all durable state and artifacts
-in Codex Autorunner (CAR), and the "no shadow state" contract.
+in Codex Autorunner (CAR), the retention taxonomy, and the "no shadow state" contract.
 
 ## Canonical State Roots
 
@@ -119,6 +119,79 @@ runtime as part of the state-root contract.
 **Resolution**: `resolve_global_state_root()` in `core/state_roots.py`
 
 **Config Override**: Set `state_roots.global` in config or `CAR_GLOBAL_STATE_ROOT` env var.
+
+## Retention Taxonomy
+
+Canonical roots define where CAR is allowed to store state. Retention classes
+define how long that state should be kept.
+
+A path can be canonical without being retained forever. For example,
+`state.sqlite3`, `lock`, and workspace directories are canonical locations but
+are runtime state, not durable artifacts.
+
+### Retention Classes
+
+| Class | Description | Cleanup Behavior |
+|-------|-------------|------------------|
+| `durable` | Source-of-truth or long-lived artifacts | Never deleted; may be compacted in place |
+| `reviewable` | Bounded review artifacts | Pruned by explicit age/count/byte policy |
+| `ephemeral` | Runtime, staging, or transient artifacts | Aggressively pruned when inactive |
+| `cache-only` | Rebuildable caches | Deleted freely when not in active use |
+
+### Per-Artifact Retention Mapping
+
+The canonical retention contract is defined in
+`.codex-autorunner/contextspace/spec.md` with detailed per-path mappings.
+
+Key durable artifacts (never deleted):
+- `tickets/` — ticket queue
+- `contextspace/` — durable context docs (active_context.md, decisions.md, spec.md)
+- `context_log.md` — context log snapshots
+- `runs/<run_id>/dispatch_history/` and `reply_history/` — turn history
+- `flows.db` — flow engine store
+- Hub `orchestration.sqlite3` — orchestration store
+- Stable reports (`reports/latest-*`, `final_report.md`)
+
+Key reviewable artifacts (bounded pruning):
+- `archive/worktrees/**` — worktree snapshots
+- `archive/runs/**` — run archives
+- `flows/<run_id>/` — flow artifacts
+- `reports/` history files
+- `github_context/`
+- `review/runs/` — review run artifacts
+
+Key ephemeral artifacts (aggressive pruning):
+- `state.sqlite3` — runtime state database
+- `app_server_workspaces/` — repo-local workspace state
+- `filebox/inbox/`, `filebox/outbox/` — attachment staging
+- `*.log` files
+- `uploads/**`
+- `update-standalone.log`
+- `lock` files
+
+Key cache-only artifacts:
+- `update_cache/` — update artifacts cache
+
+### Cleanup Command
+
+Use `car cleanup state` to reclaim disk space across all retention families:
+
+```bash
+# Preview what would be deleted
+car cleanup state --dry-run
+
+# Clean repo-local state only
+car cleanup state --scope repo
+
+# Clean global state only
+car cleanup state --scope global
+
+# Clean all scopes
+car cleanup state --scope all
+```
+
+For details on the cleanup contract and safety guards, see
+[State Cleanup Operations](ops/state-cleanup.md).
 
 ## Non-Canonical Locations (Caches Only)
 

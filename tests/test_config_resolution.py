@@ -11,10 +11,13 @@ from codex_autorunner.core.config import (
     DEFAULT_REPO_CONFIG,
     REPO_OVERRIDE_FILENAME,
     ConfigError,
+    default_housekeeping_rule_named,
     load_hub_config,
     load_repo_config,
     resolve_env_for_root,
+    resolve_housekeeping_rule,
 )
+from codex_autorunner.housekeeping import HousekeepingConfig, HousekeepingRule
 from tests.conftest import write_test_config
 
 
@@ -204,6 +207,79 @@ def test_load_repo_config_accepts_github_mutation_policy_bool_and_enum_values(
     assert (
         config.raw["github"]["automation"]["policy"]["merge_pr"] == "require_approval"
     )
+
+
+def test_resolve_housekeeping_rule_matches_by_name() -> None:
+    config = HousekeepingConfig(
+        enabled=True,
+        interval_seconds=60,
+        min_file_age_seconds=10,
+        dry_run=False,
+        rules=[
+            HousekeepingRule(
+                name="update_cache",
+                kind="directory",
+                path="~/.codex-autorunner/update_cache",
+                recursive=True,
+                max_files=77,
+            )
+        ],
+    )
+
+    rule = resolve_housekeeping_rule(config, "UPDATE_CACHE")
+
+    assert rule is not None
+    assert rule.max_files == 77
+
+
+@pytest.mark.parametrize(
+    ("rule_name", "include_repo_review_runs", "include_hub_update_rules", "path"),
+    [
+        ("run_logs", True, False, ".codex-autorunner/runs"),
+        (
+            "terminal_image_uploads",
+            True,
+            False,
+            ".codex-autorunner/uploads/terminal-images",
+        ),
+        (
+            "telegram_images",
+            True,
+            False,
+            ".codex-autorunner/uploads/telegram-images",
+        ),
+        (
+            "telegram_voice",
+            True,
+            False,
+            ".codex-autorunner/uploads/telegram-voice",
+        ),
+        (
+            "telegram_files",
+            True,
+            False,
+            ".codex-autorunner/uploads/telegram-files",
+        ),
+        ("github_context", True, False, ".codex-autorunner/github_context"),
+        ("review_runs", True, False, ".codex-autorunner/review/runs"),
+        ("update_cache", False, True, "~/.codex-autorunner/update_cache"),
+        ("update_log", False, True, "~/.codex-autorunner/update-standalone.log"),
+    ],
+)
+def test_default_housekeeping_rule_named_exposes_canonical_defaults(
+    rule_name: str,
+    include_repo_review_runs: bool,
+    include_hub_update_rules: bool,
+    path: str,
+) -> None:
+    rule = default_housekeeping_rule_named(
+        rule_name,
+        include_repo_review_runs=include_repo_review_runs,
+        include_hub_update_rules=include_hub_update_rules,
+    )
+
+    assert rule is not None
+    assert rule.path == path
 
 
 @pytest.mark.parametrize("field", ["max_payload_bytes", "max_raw_payload_bytes"])
@@ -701,6 +777,33 @@ def test_housekeeping_validation_rejects_negative_min_file_age_seconds(
     with pytest.raises(
         ConfigError, match="housekeeping.min_file_age_seconds must be >= 0"
     ):
+        load_hub_config(hub_root)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    (
+        ("report_max_history_files", "bad"),
+        ("report_max_total_bytes", "bad"),
+        ("app_server_workspace_max_age_days", "bad"),
+    ),
+)
+def test_pma_validation_rejects_invalid_state_cleanup_knobs(
+    tmp_path: Path, key: str, value: object
+) -> None:
+    hub_root = tmp_path / "hub"
+    hub_root.mkdir()
+    write_test_config(
+        hub_root / CONFIG_FILENAME,
+        {
+            "mode": "hub",
+            "pma": {
+                key: value,
+            },
+        },
+    )
+
+    with pytest.raises(ConfigError, match=key):
         load_hub_config(hub_root)
 
 
