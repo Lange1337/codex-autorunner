@@ -234,9 +234,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
         return chat_agent_supports_effort(agent)
 
     def _agent_supports_resume(self, agent: str) -> bool:
-        return self._agent_supports_capability(
-            agent, "durable_threads"
-        ) and self._agent_supports_capability(agent, "active_thread_discovery")
+        return self._agent_supports_capability(agent, "durable_threads")
 
     def _agent_rate_limit_source(self, agent: str) -> Optional[str]:
         if agent == "codex":
@@ -2242,16 +2240,13 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
             supported_agents = set(
                 self._agents_supporting_capability("durable_threads")
             )
-            supported_agents &= set(
-                self._agents_supporting_capability("active_thread_discovery")
-            )
             supported = ", ".join(sorted(supported_agents))
             agent_label = self._agent_display_name(agent)
             await self._send_message(
                 message.chat_id,
                 (
                     f"Resume is unavailable for {agent_label}. "
-                    "The active agent must support durable threads and thread discovery."
+                    "The active agent must support durable threads."
                     + (f" Available agents: {supported}." if supported else "")
                 ),
                 thread_id=message.thread_id,

@@ -18,7 +18,7 @@ native target, and it is not an `agent_workspace` runtime in v1.
 - CAR stores the binding from `thread_target_id` to Hermes `session_id` in the
   existing runtime-binding path (`backend_thread_id` plus optional
   `backend_runtime_instance_id` metadata).
-- Hermes owns native session durability, resume semantics, and session listing.
+- Hermes owns native session durability and resume semantics.
 - CAR must not treat Hermes as a first-class CAR-managed `agent_workspace`.
 - CAR must not infer extra isolation guarantees from session selection alone.
 
@@ -42,8 +42,8 @@ native target, and it is not an `agent_workspace` runtime in v1.
   session ID as `backend_thread_id`.
 - `resume_conversation()` resumes that Hermes session ID; if Hermes reports the
   session as missing, CAR clears the binding and starts fresh.
-- `list_conversations()` is the only supported source for active-thread
-  discovery in v1.
+- `list_conversations()` is not part of the stable Hermes ACP contract in v1,
+  so CAR must not advertise active-thread discovery for Hermes.
 - `start_turn()` sends the user prompt plus any CAR-injected context to the
   bound Hermes session.
 - `interrupt()` targets the active Hermes turn for the bound session.
@@ -61,7 +61,7 @@ native target, and it is not an `agent_workspace` runtime in v1.
 | `durable_threads` | Supported | Hermes sessions are durable and can be created, resumed, and bound to CAR thread targets. |
 | `message_turns` | Supported | Hermes can execute normal message turns against a durable session. |
 | `interrupt` | Supported | Hermes can cancel an in-flight turn for a bound session. |
-| `active_thread_discovery` | Supported | Hermes can list resumable sessions/threads through ACP. |
+| `active_thread_discovery` | Unsupported on the current stable ACP surface | Hermes stable ACP does not currently expose session listing, so CAR must not advertise discovery support. |
 | `event_streaming` | Supported | Hermes can stream progress/events for active turns. |
 | `approvals` | Supported target for v1 | Hermes permission requests are part of the v1 contract, but CAR must not advertise this capability until TICKET-160 delivers the full approval bridge end to end. |
 
