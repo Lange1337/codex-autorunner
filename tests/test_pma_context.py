@@ -749,6 +749,8 @@ def test_build_hub_snapshot_includes_action_queue_with_supersession(hub_env) -> 
         if item.get("managed_thread_id") == thread["managed_thread_id"]
     )
     assert thread_item["queue_source"] == "managed_thread_followup"
+    assert thread_item["followup_state"] == "awaiting_followup"
+    assert thread_item["recommended_action"] == "resume_managed_thread"
     assert thread_item["supersession"]["status"] == "superseded"
     assert thread_item["supersession"]["superseded_by"] == queue[0]["action_queue_id"]
 
@@ -2300,21 +2302,38 @@ class TestIssue975CharacterizationMixedPmaState:
         assert failed_run["supersession"]["status"] == "superseded"
         assert failed_run["supersession"]["superseded_by"] == primary["action_queue_id"]
 
-        thread_group = next(
+        reusable_summary = next(
             item
             for item in queue
-            if item.get("item_type") == "managed_thread_followup_group"
+            if item.get("item_type") == "managed_thread_followup_summary"
+            and item.get("followup_state") == "reusable"
         )
-        assert thread_group["queue_source"] == "managed_thread_followup"
-        assert thread_group["thread_count"] == 2
-        assert thread_group["followup_state"] == "reusable"
-        assert thread_group["followup_state_counts"] == {
-            "reusable": 1,
-            "idle_archive_candidate": 1,
-        }
-        assert thread_group["supersession"]["status"] == "superseded"
+        assert reusable_summary["queue_source"] == "managed_thread_followup"
+        assert reusable_summary["thread_count"] == 1
+        assert reusable_summary["followup_state"] == "reusable"
+        assert reusable_summary["followup_state_counts"] == {"reusable": 1}
+        assert reusable_summary["recommended_action"] == "show_reusable_threads"
+        assert reusable_summary["supersession"]["status"] == "superseded"
         assert (
-            thread_group["supersession"]["superseded_by"] == primary["action_queue_id"]
+            reusable_summary["supersession"]["superseded_by"]
+            == primary["action_queue_id"]
+        )
+
+        cleanup_summary = next(
+            item
+            for item in queue
+            if item.get("item_type") == "managed_thread_followup_summary"
+            and item.get("followup_state") == "idle_archive_candidate"
+        )
+        assert cleanup_summary["queue_source"] == "managed_thread_followup"
+        assert cleanup_summary["thread_count"] == 1
+        assert cleanup_summary["followup_state"] == "idle_archive_candidate"
+        assert cleanup_summary["followup_state_counts"] == {"idle_archive_candidate": 1}
+        assert cleanup_summary["recommended_action"] == "show_cleanup_candidates"
+        assert cleanup_summary["supersession"]["status"] == "superseded"
+        assert (
+            cleanup_summary["supersession"]["superseded_by"]
+            == primary["action_queue_id"]
         )
 
         file_item = next(item for item in queue if item.get("item_type") == "pma_file")
@@ -2335,9 +2354,10 @@ class TestIssue975CharacterizationMixedPmaState:
         assert "source=ticket_flow_inbox" in result
         assert "status=primary" in result
         assert "status=superseded" in result
-        assert "item_type=managed_thread_followup_group" in result
-        assert "thread_count=2" in result
+        assert "item_type=managed_thread_followup_summary" in result
+        assert "name=Reusable managed threads (1)" in result
         assert "followup_state=reusable" in result
+        assert "show reusable threads" in result
 
     def test_completed_thread_queue_item_is_optional_reuse_not_immediate_followup(
         self, tmp_path: Path
@@ -2369,15 +2389,76 @@ class TestIssue975CharacterizationMixedPmaState:
             stale_threshold_seconds=3600,
         )
         reusable_item = next(
-            item for item in queue if item.get("managed_thread_id") == "thread-idle-1"
+            item
+            for item in queue
+            if item.get("item_type") == "managed_thread_followup_summary"
+            and item.get("followup_state") == "reusable"
         )
 
         assert reusable_item["followup_state"] == "reusable"
         assert reusable_item["operator_need"] == "optional"
-        assert reusable_item["recommended_action"] == "consider_resuming_managed_thread"
-        assert "no immediate follow-up signal" in (
-            reusable_item.get("why_selected") or ""
+        assert reusable_item["thread_count"] == 1
+        assert reusable_item["recommended_action"] == "show_reusable_threads"
+        assert "counts-first summary" in (reusable_item.get("why_selected") or "")
+        assert "thread-idle-1" in (reusable_item.get("managed_thread_ids") or [])
+
+    def test_low_signal_reusable_summary_does_not_inherit_repo_id_from_mixed_owners(
+        self, tmp_path: Path
+    ) -> None:
+        seed_hub_files(tmp_path, force=True)
+        snapshot = self.build_mixed_pma_snapshot(
+            include_failed_run=False,
+            include_completed_run=False,
+            include_pma_file=False,
         )
+        pma_threads = snapshot.get("pma_threads") or []
+        pma_threads.append(
+            {
+                "managed_thread_id": "thread-unowned-1",
+                "agent": "codex",
+                "repo_id": "",
+                "resource_kind": "",
+                "resource_id": "",
+                "workspace_root": "",
+                "name": "unowned-thread",
+                "status": "idle",
+                "lifecycle_status": "active",
+                "status_reason": "managed_turn_completed",
+                "status_terminal": False,
+                "status_changed_at": "2026-03-16T11:10:00Z",
+                "last_turn_id": "turn-003",
+                "last_message_preview": "Unowned reusable thread.",
+                "updated_at": "2026-03-16T11:40:00Z",
+                "freshness": {
+                    "generated_at": "2026-03-16T12:00:00Z",
+                    "recency_basis": "thread_status_changed_at",
+                    "basis_at": "2026-03-16T11:10:00Z",
+                    "is_stale": False,
+                },
+            }
+        )
+
+        from codex_autorunner.core.pma_context import build_pma_action_queue
+
+        queue = build_pma_action_queue(
+            inbox=snapshot.get("inbox") or [],
+            pma_threads=pma_threads,
+            pma_files_detail={"inbox": [], "outbox": []},
+            automation={},
+            generated_at="2026-03-16T12:00:00Z",
+            stale_threshold_seconds=3600,
+        )
+        reusable_item = next(
+            item
+            for item in queue
+            if item.get("item_type") == "managed_thread_followup_summary"
+            and item.get("followup_state") == "reusable"
+        )
+
+        assert reusable_item["repo_id"] is None
+        assert reusable_item["supersession"]["status"] == "non_primary"
+        assert "thread-idle-1" in (reusable_item.get("managed_thread_ids") or [])
+        assert "thread-unowned-1" in (reusable_item.get("managed_thread_ids") or [])
 
     def test_recently_resumed_thread_with_history_stays_awaiting_followup(
         self, tmp_path: Path
@@ -2451,12 +2532,15 @@ class TestIssue975CharacterizationMixedPmaState:
         archive_item = next(
             item
             for item in queue
-            if item.get("managed_thread_id") == "thread-completed-1"
+            if item.get("item_type") == "managed_thread_followup_summary"
+            and item.get("followup_state") == "idle_archive_candidate"
         )
         assert archive_item["followup_state"] == "idle_archive_candidate"
         assert archive_item["operator_need"] == "cleanup"
-        assert archive_item["recommended_action"] == "review_or_archive_managed_thread"
-        assert "cleanup candidate" in (archive_item.get("why_selected") or "")
+        assert archive_item["thread_count"] == 1
+        assert archive_item["recommended_action"] == "show_cleanup_candidates"
+        assert "counts-first summary" in (archive_item.get("why_selected") or "")
+        assert "thread-completed-1" in (archive_item.get("managed_thread_ids") or [])
 
     def test_stale_pma_file_queue_item_is_marked_as_review_not_process(
         self, tmp_path: Path
@@ -2483,11 +2567,14 @@ class TestIssue975CharacterizationMixedPmaState:
             stale_threshold_seconds=3600,
         )
 
-        file_item = next(item for item in queue if item.get("item_type") == "pma_file")
-        assert file_item["recommended_action"] == "review_stale_uploaded_file"
+        file_item = next(
+            item for item in queue if item.get("item_type") == "pma_file_summary"
+        )
+        assert file_item["recommended_action"] == "show_stale_uploaded_files"
         assert file_item["next_action"] == "review_stale_uploaded_file"
+        assert file_item["file_count"] == 1
         assert file_item["likely_false_positive"] is True
-        assert "leftover" in (file_item["why_selected"] or "").lower()
+        assert "counts-first summary" in (file_item["why_selected"] or "")
 
 
 class TestIssue975CharacterizationManagedThreadPayload:
