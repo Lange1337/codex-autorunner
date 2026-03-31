@@ -6,7 +6,7 @@ import { api, resolvePath, getAuthToken, flash, escapeHtml } from "./utils.js";
 import { createDocChat, } from "./docChatCore.js";
 import { initChatPasteUpload } from "./chatUploads.js";
 import { DEFAULT_FILEBOX_BOX, FILEBOX_BOXES, } from "./fileboxCatalog.js";
-import { getSelectedAgent, getSelectedModel, getSelectedReasoning, initAgentControls, refreshAgentControls, } from "./agentControls.js";
+import { getSelectedAgent, getSelectedProfile, getSelectedModel, getSelectedReasoning, initAgentControls, refreshAgentControls, } from "./agentControls.js";
 import { createFileBoxWidget } from "./fileboxUi.js";
 import { handleStreamEvent } from "./streamUtils.js";
 import { initNotificationBell } from "./notificationBell.js";
@@ -426,6 +426,7 @@ function getElements() {
         messagesEl: document.getElementById("pma-chat-messages"),
         historyHeader: document.getElementById("pma-chat-history-header"),
         agentSelect: document.getElementById("pma-chat-agent-select"),
+        profileSelect: document.getElementById("pma-chat-profile-select"),
         modelSelect: document.getElementById("pma-chat-model-select"),
         modelInput: document.getElementById("pma-chat-model-input"),
         reasoningSelect: document.getElementById("pma-chat-reasoning-select"),
@@ -587,6 +588,7 @@ async function initPMA() {
     }, 100);
     initAgentControls({
         agentSelect: elements.agentSelect,
+        profileSelect: elements.profileSelect,
         modelSelect: elements.modelSelect,
         modelInput: elements.modelInput,
         reasoningSelect: elements.reasoningSelect,
@@ -739,6 +741,7 @@ async function sendMessage() {
     elements.input.value = "";
     elements.input.style.height = "auto";
     const agent = elements.agentSelect?.value || getSelectedAgent();
+    const profile = elements.profileSelect?.value || getSelectedProfile(agent);
     const model = elements.modelSelect?.value || getSelectedModel(agent);
     const reasoning = elements.reasoningSelect?.value || getSelectedReasoning(agent);
     const clientTurnId = newClientTurnId();
@@ -780,6 +783,8 @@ async function sendMessage() {
         };
         if (agent)
             payload.agent = agent;
+        if (profile)
+            payload.profile = profile;
         if (model)
             payload.model = model;
         if (reasoning)
@@ -1141,10 +1146,15 @@ function resetThread() {
 async function startNewThreadOnServer() {
     const elements = getElements();
     const rawAgent = (elements.agentSelect?.value || getSelectedAgent() || "").trim().toLowerCase();
-    const selectedAgent = rawAgent === "codex" || rawAgent === "opencode" ? rawAgent : undefined;
+    const selectedAgent = rawAgent || undefined;
+    const selectedProfile = elements.profileSelect?.value || getSelectedProfile(rawAgent);
     await api("/hub/pma/new", {
         method: "POST",
-        body: { agent: selectedAgent, lane_id: DEFAULT_PMA_LANE_ID },
+        body: {
+            agent: selectedAgent,
+            profile: selectedProfile || undefined,
+            lane_id: DEFAULT_PMA_LANE_ID,
+        },
     });
 }
 function attachHandlers() {

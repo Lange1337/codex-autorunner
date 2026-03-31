@@ -12,7 +12,7 @@ import { renderDiff } from "./diffRenderer.js";
 import { newClientTurnId, streamTurnEvents } from "./fileChat.js";
 import { loadPendingTurn, savePendingTurn, clearPendingTurn } from "./turnResume.js";
 import { resumeFileChatTurn } from "./turnEvents.js";
-import { getSelectedAgent, getSelectedModel, getSelectedReasoning } from "./agentControls.js";
+import { getSelectedAgent, getSelectedProfile, getSelectedModel, getSelectedReasoning, } from "./agentControls.js";
 // Limits for events display
 export const TICKET_CHAT_EVENT_LIMIT = 8;
 export const TICKET_CHAT_EVENT_MAX = 50;
@@ -80,6 +80,7 @@ export function getTicketChatElements() {
         applyBtn: document.getElementById("ticket-patch-apply"),
         discardBtn: document.getElementById("ticket-patch-discard"),
         agentSelect: document.getElementById("ticket-chat-agent-select"),
+        profileSelect: document.getElementById("ticket-chat-profile-select"),
         modelSelect: document.getElementById("ticket-chat-model-select"),
         modelInput: document.getElementById("ticket-chat-model-input"),
         reasoningSelect: document.getElementById("ticket-chat-reasoning-select"),
@@ -323,6 +324,9 @@ export async function sendTicketChat() {
     const agent = els.agentSelect
         ? (els.agentSelect.value || "codex")
         : (getSelectedAgent() || "codex");
+    const profile = els.profileSelect
+        ? (els.profileSelect.value || undefined)
+        : (getSelectedProfile(agent) || undefined);
     const model = resolveTicketChatModel(agent, els);
     const reasoning = els.reasoningSelect
         ? (els.reasoningSelect.value || undefined)
@@ -330,6 +334,7 @@ export async function sendTicketChat() {
     try {
         await performTicketChatRequest(ticketChatState.ticketIndex, message, ticketChatState.controller.signal, {
             agent,
+            profile,
             model,
             reasoning,
             clientTurnId,

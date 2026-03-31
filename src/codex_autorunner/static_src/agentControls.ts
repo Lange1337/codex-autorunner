@@ -10,6 +10,13 @@ interface Agent {
   version?: string;
   protocol_version?: string;
   capabilities?: string[];
+  default_profile?: string | null;
+  profiles?: AgentProfile[];
+}
+
+interface AgentProfile {
+  id: string;
+  display_name?: string;
 }
 
 interface ModelCatalogModel {
@@ -26,6 +33,7 @@ interface ModelCatalog {
 
 interface AgentControlConfig {
   agentSelect?: HTMLSelectElement | null;
+  profileSelect?: HTMLSelectElement | null;
   modelSelect?: HTMLSelectElement | null;
   modelInput?: HTMLInputElement | null;
   reasoningSelect?: HTMLSelectElement | null;
@@ -33,6 +41,7 @@ interface AgentControlConfig {
 
 interface AgentControl extends AgentControlConfig {
   agentSelect?: HTMLSelectElement | null;
+  profileSelect?: HTMLSelectElement | null;
   modelSelect?: HTMLSelectElement | null;
   modelInput?: HTMLInputElement | null;
   reasoningSelect?: HTMLSelectElement | null;
@@ -42,6 +51,7 @@ interface AgentControlsPayload {
   agents: Agent[];
   defaultAgent: string;
   selectedAgent: string;
+  selectedProfile: string;
   mode: ModelControlMode;
   catalog: ModelCatalog | null;
 }
@@ -51,6 +61,7 @@ type ModelControlMode = "catalog" | "manual" | "none";
 const STORAGE_PREFIX = REPO_ID ? "car.agent" : "car.pma.agent";
 const STORAGE_KEYS = {
   selected: `${STORAGE_PREFIX}.selected`,
+  profile: (agent: string) => `${STORAGE_PREFIX}.${agent}.profile`,
   model: (agent: string) => `${STORAGE_PREFIX}.${agent}.model`,
   reasoning: (agent: string) => `${STORAGE_PREFIX}.${agent}.reasoning`,
 } as const;
@@ -70,14 +81,27 @@ const modelCatalogPromises = new Map<string, Promise<ModelCatalog | null>>();
 const agentControlsRefresh = createSmartRefresh<AgentControlsPayload>({
   getSignature: (payload) => {
     const agentsSig = payload.agents
-      .map((agent) => `${agent.id}:${agent.name || ""}:${agent.version || ""}:${agent.protocol_version || ""}`)
+      .map((agent) => {
+        const profileSig = Array.isArray(agent.profiles)
+          ? agent.profiles
+            .map((profile) => `${profile.id}:${profile.display_name || ""}`)
+            .join(",")
+          : "";
+        const capabilitySig = Array.isArray(agent.capabilities)
+          ? agent.capabilities.join(",")
+          : "";
+        return `${agent.id}:${agent.name || ""}:${agent.version || ""}:${agent.protocol_version || ""}:${capabilitySig}:${agent.default_profile || ""}:${profileSig}`;
+      })
       .join("|");
     const catalogSig = payload.catalog
       ? `${payload.catalog.default_model || ""}:${payload.catalog.models
-        .map((model) => `${model.id}:${model.display_name || ""}:${model.supports_reasoning ? "1" : "0"}:${model.reasoning_options.join(",")}`)
+        .map(
+          (model) =>
+            `${model.id}:${model.display_name || ""}:${model.supports_reasoning ? "1" : "0"}:${model.reasoning_options.join(",")}`
+        )
         .join("|")}`
       : "none";
-    return `${agentsSig}::${payload.defaultAgent}::${payload.mode}::${catalogSig}`;
+    return `${agentsSig}::${payload.defaultAgent}::${payload.selectedProfile}::${payload.mode}::${catalogSig}`;
   },
   render: (payload) => {
     renderAgentControls(payload);
@@ -116,12 +140,20 @@ export function getSelectedModel(agent: string = getSelectedAgent()): string {
   return safeGetStorage(STORAGE_KEYS.model(agent)) || "";
 }
 
+export function getSelectedProfile(agent: string = getSelectedAgent()): string {
+  return safeGetStorage(STORAGE_KEYS.profile(agent)) || "";
+}
+
 export function getSelectedReasoning(agent: string = getSelectedAgent()): string {
   return safeGetStorage(STORAGE_KEYS.reasoning(agent)) || "";
 }
 
 function setSelectedAgent(agent: string): void {
   safeSetStorage(STORAGE_KEYS.selected, agent);
+}
+
+function setSelectedProfile(agent: string, profile: string): void {
+  safeSetStorage(STORAGE_KEYS.profile(agent), profile);
 }
 
 function setSelectedModel(agent: string, model: string): void {
@@ -141,6 +173,15 @@ function ensureFallbackAgents(): void {
   }
 }
 
+function getAgentEntry(agentId: string): Agent | undefined {
+  return agentList.find((agent) => agent.id === agentId);
+}
+
+function agentProfiles(agentId: string): AgentProfile[] {
+  const entry = getAgentEntry(agentId);
+  return Array.isArray(entry?.profiles) ? entry.profiles : [];
+}
+
 async function loadAgents(): Promise<void> {
   if (agentsLoaded) return;
   if (agentsLoadPromise) {
@@ -150,9 +191,13 @@ async function loadAgents(): Promise<void> {
   agentsLoadPromise = (async () => {
     try {
       const data = await api(`${API_PREFIX}/agents`, { method: "GET" });
-      const agents = Array.isArray((data as { agents?: unknown[] })?.agents) ? (data as { agents: unknown[] }).agents : [];
-      // Only use API response if it contains valid agents
-      if (agents.length > 0 && agents.every((a) => a && typeof (a as Agent).id === "string")) {
+      const agents = Array.isArray((data as { agents?: unknown[] })?.agents)
+        ? (data as { agents: unknown[] }).agents
+        : [];
+      if (
+        agents.length > 0 &&
+        agents.every((a) => a && typeof (a as Agent).id === "string")
+      ) {
         agentList = agents as Agent[];
         defaultAgent = (data as { default?: string })?.default || defaultAgent;
       }
@@ -185,7 +230,9 @@ function normalizeCatalog(raw: unknown): ModelCatalog {
           : id;
       const supportsReasoning = Boolean(entryObj.supports_reasoning);
       const reasoningOptions = Array.isArray(entryObj.reasoning_options)
-        ? (entryObj.reasoning_options as unknown[]).filter((value) => typeof value === "string")
+        ? (entryObj.reasoning_options as unknown[]).filter(
+          (value) => typeof value === "string"
+        )
         : [];
       return {
         id,
@@ -228,7 +275,7 @@ async function loadModelCatalog(agent: string): Promise<ModelCatalog | null> {
 }
 
 function getLabelText(agentId: string): string {
-  const entry = agentList.find((agent) => agent.id === agentId);
+  const entry = getAgentEntry(agentId);
   return entry?.name || agentId;
 }
 
@@ -266,6 +313,33 @@ function ensureAgentOptions(select: HTMLSelectElement | null | undefined): void 
   select.value = selected;
 }
 
+function ensureProfileOptions(
+  select: HTMLSelectElement | null | undefined,
+  agentId: string
+): void {
+  if (!select) return;
+  const profiles = agentProfiles(agentId);
+  select.innerHTML = "";
+  if (!profiles.length) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "No profiles";
+    select.appendChild(option);
+    select.disabled = true;
+    return;
+  }
+  select.disabled = false;
+  profiles.forEach((profile) => {
+    const option = document.createElement("option");
+    option.value = profile.id;
+    option.textContent =
+      profile.display_name && profile.display_name !== profile.id
+        ? `${profile.display_name} (${profile.id})`
+        : profile.id;
+    select.appendChild(option);
+  });
+}
+
 function ensureModelOptions(
   select: HTMLSelectElement | null | undefined,
   catalog: ModelCatalog | null,
@@ -273,7 +347,12 @@ function ensureModelOptions(
 ): void {
   if (!select) return;
   select.innerHTML = "";
-  if (mode !== "catalog" || !catalog || !Array.isArray(catalog.models) || !catalog.models.length) {
+  if (
+    mode !== "catalog" ||
+    !catalog ||
+    !Array.isArray(catalog.models) ||
+    !catalog.models.length
+  ) {
     const option = document.createElement("option");
     option.value = "";
     option.textContent = mode === "manual" ? "Manual override" : "No models";
@@ -293,7 +372,10 @@ function ensureModelOptions(
   });
 }
 
-function ensureReasoningOptions(select: HTMLSelectElement | null | undefined, model: ModelCatalogModel | null): void {
+function ensureReasoningOptions(
+  select: HTMLSelectElement | null | undefined,
+  model: ModelCatalogModel | null
+): void {
   if (!select) return;
   select.innerHTML = "";
   if (!model || !model.supports_reasoning || !model.reasoning_options?.length) {
@@ -348,7 +430,26 @@ function resolveSelectedModel(agent: string, catalog: ModelCatalog | null): stri
   return catalog.models[0].id;
 }
 
-function resolveSelectedReasoning(agent: string, model: ModelCatalogModel | null): string {
+function resolveSelectedProfile(agent: string): string {
+  const profiles = agentProfiles(agent);
+  if (!profiles.length) return "";
+  const stored = getSelectedProfile(agent);
+  if (stored && profiles.some((entry) => entry.id === stored)) {
+    return stored;
+  }
+  const entry = getAgentEntry(agent);
+  const defaultProfile =
+    typeof entry?.default_profile === "string" ? entry.default_profile : "";
+  if (defaultProfile && profiles.some((profile) => profile.id === defaultProfile)) {
+    return defaultProfile;
+  }
+  return profiles[0]?.id || "";
+}
+
+function resolveSelectedReasoning(
+  agent: string,
+  model: ModelCatalogModel | null
+): string {
   if (!model || !model.reasoning_options?.length) return "";
   const stored = getSelectedReasoning(agent);
   if (stored && model.reasoning_options.includes(stored)) {
@@ -386,6 +487,7 @@ async function loadAgentControlsPayload(): Promise<AgentControlsPayload> {
     agents: [...agentList],
     defaultAgent,
     selectedAgent,
+    selectedProfile: resolveSelectedProfile(selectedAgent),
     mode,
     catalog,
   };
@@ -393,18 +495,26 @@ async function loadAgentControlsPayload(): Promise<AgentControlsPayload> {
 
 function renderAgentControls(payload: AgentControlsPayload): void {
   const selectedAgent = payload.selectedAgent;
+  const selectedProfile = payload.selectedProfile;
 
-  // Always update agent options first (uses in-memory agentList)
   controls.forEach((control) => {
     ensureAgentOptions(control.agentSelect);
+    ensureProfileOptions(control.profileSelect, selectedAgent);
+    if (control.profileSelect) {
+      control.profileSelect.value = selectedProfile;
+    }
   });
 
   const { catalog, mode } = payload;
 
-  // Update model and reasoning options
   controls.forEach((control) => {
     ensureModelOptions(control.modelSelect, catalog, mode);
     ensureManualModelInput(control.modelInput, { agent: selectedAgent, mode });
+    if (selectedProfile) {
+      setSelectedProfile(selectedAgent, selectedProfile);
+    } else {
+      setSelectedProfile(selectedAgent, "");
+    }
     if (mode === "catalog" && catalog) {
       const selectedModelId = resolveSelectedModel(selectedAgent, catalog);
       setSelectedModel(selectedAgent, selectedModelId);
@@ -413,7 +523,10 @@ function renderAgentControls(payload: AgentControlsPayload): void {
       }
       const modelEntry = catalog.models.find((entry) => entry.id === selectedModelId);
       ensureReasoningOptions(control.reasoningSelect, modelEntry || null);
-      const selectedReasoning = resolveSelectedReasoning(selectedAgent, modelEntry || null);
+      const selectedReasoning = resolveSelectedReasoning(
+        selectedAgent,
+        modelEntry || null
+      );
       setSelectedReasoning(selectedAgent, selectedReasoning);
       if (control.reasoningSelect) {
         control.reasoningSelect.value = selectedReasoning;
@@ -456,6 +569,12 @@ async function handleModelChange(nextModel: string): Promise<void> {
   await refreshAgentControls({ force: true, reason: "manual" });
 }
 
+async function handleProfileChange(nextProfile: string): Promise<void> {
+  const agent = getSelectedAgent();
+  setSelectedProfile(agent, nextProfile);
+  await refreshAgentControls({ force: true, reason: "manual" });
+}
+
 function handleManualModelInput(nextModel: string): void {
   const agent = getSelectedAgent();
   setSelectedModel(agent, nextModel.trim());
@@ -471,15 +590,28 @@ async function handleReasoningChange(nextReasoning: string): Promise<void> {
  * @param {AgentControlConfig} [config]
  */
 export function initAgentControls(config: AgentControlConfig = {}): void {
-  const { agentSelect, modelSelect, modelInput, reasoningSelect } = config;
-  if (!agentSelect && !modelSelect && !modelInput && !reasoningSelect) {
+  const { agentSelect, profileSelect, modelSelect, modelInput, reasoningSelect } =
+    config;
+  if (
+    !agentSelect &&
+    !profileSelect &&
+    !modelSelect &&
+    !modelInput &&
+    !reasoningSelect
+  ) {
     return;
   }
-  const control: AgentControl = { agentSelect, modelSelect, modelInput, reasoningSelect };
+  const control: AgentControl = {
+    agentSelect,
+    profileSelect,
+    modelSelect,
+    modelInput,
+    reasoningSelect,
+  };
   controls.push(control);
 
-  // Immediately populate agent options from in-memory list (synchronous)
   ensureAgentOptions(agentSelect);
+  ensureProfileOptions(profileSelect, getSelectedAgent());
   ensureModelOptions(modelSelect, null, "none");
   ensureManualModelInput(modelInput, { agent: getSelectedAgent(), mode: "none" });
   ensureReasoningOptions(reasoningSelect, null);
@@ -502,6 +634,12 @@ export function initAgentControls(config: AgentControlConfig = {}): void {
       handleManualModelInput(target.value);
     });
   }
+  if (profileSelect) {
+    profileSelect.addEventListener("change", (event) => {
+      const target = event.target as HTMLSelectElement;
+      void handleProfileChange(target.value);
+    });
+  }
   if (reasoningSelect) {
     reasoningSelect.addEventListener("change", (event) => {
       const target = event.target as HTMLSelectElement;
@@ -509,7 +647,6 @@ export function initAgentControls(config: AgentControlConfig = {}): void {
     });
   }
 
-  // Async refresh to load from API (will update if API returns different data)
   refreshAgentControls({ force: true, reason: "initial" }).catch((err) => {
     console.warn("Failed to refresh agent controls", err);
   });

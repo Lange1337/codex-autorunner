@@ -2,6 +2,7 @@ import { api, flash, setButtonLoading } from "./utils.js";
 import {
   initAgentControls,
   getSelectedAgent,
+  getSelectedProfile,
   getSelectedModel,
   getSelectedReasoning,
 } from "./agentControls.js";
@@ -136,6 +137,7 @@ function els() {
     chatEventsList: document.getElementById("contextspace-chat-events-list") as HTMLElement | null,
     chatEventsToggle: document.getElementById("contextspace-chat-events-toggle") as HTMLButtonElement | null,
     agentSelect: document.getElementById("contextspace-chat-agent-select") as HTMLSelectElement | null,
+    profileSelect: document.getElementById("contextspace-chat-profile-select") as HTMLSelectElement | null,
     modelSelect: document.getElementById("contextspace-chat-model-select") as HTMLSelectElement | null,
     modelInput: document.getElementById("contextspace-chat-model-input") as HTMLInputElement | null,
     reasoningSelect: document.getElementById("contextspace-chat-reasoning-select") as HTMLSelectElement | null,
@@ -646,6 +648,7 @@ async function sendChat(): Promise<void> {
   });
 
   const agent = getSelectedAgent();
+  const profile = getSelectedProfile(agent) || undefined;
   const model = getSelectedModel(agent) || undefined;
   const reasoning = getSelectedReasoning(agent) || undefined;
 
@@ -701,7 +704,7 @@ async function sendChat(): Promise<void> {
           clearPendingTurnState();
         },
       },
-      { agent, model, reasoning, clientTurnId }
+      { agent, profile, model, reasoning, clientTurnId }
     );
   } catch (err) {
     const message = (err as Error).message || "Chat failed";
@@ -771,6 +774,7 @@ export async function initContextspace(): Promise<void> {
     chatCancel,
     chatNewThread,
     agentSelect,
+    profileSelect,
     modelSelect,
     modelInput,
     reasoningSelect,
@@ -778,7 +782,13 @@ export async function initContextspace(): Promise<void> {
   if (!root) return;
 
   hideRemovedControls();
-  initAgentControls({ agentSelect, modelSelect, modelInput, reasoningSelect });
+  initAgentControls({
+    agentSelect,
+    profileSelect,
+    modelSelect,
+    modelInput,
+    reasoningSelect,
+  });
   await initDocChatVoice({
     buttonId: "contextspace-chat-voice",
     inputId: "contextspace-chat-input",
