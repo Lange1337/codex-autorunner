@@ -10,10 +10,10 @@ from .....integrations.app_server.client import (
     CodexAppServerClient,
     CodexAppServerResponseError,
 )
+from ....chat.agents import chat_agent_definitions, normalize_chat_agent
 from ...adapter import TelegramMessage
 from ...config import AppServerUnavailableError
-from ...constants import AGENT_PICKER_PROMPT, VALID_AGENT_VALUES
-from ...state import normalize_agent
+from ...constants import AGENT_PICKER_PROMPT
 from ...types import SelectionState
 
 _INVALID_PARAMS_ERROR_CODES = {-32600, -32602}
@@ -41,7 +41,7 @@ async def _handle_agent_command(
             message_id=message.message_id,
         )
         return
-    desired = normalize_agent(argv[0])
+    desired = normalize_chat_agent(argv[0], context=commands)
     if desired is None:
         choices = ", ".join(
             sorted(commands._agents_supporting_capability("message_turns"))
@@ -130,7 +130,11 @@ async def _send_agent_picker(
     availability = "available"
     if not commands._opencode_available():
         availability = "missing binary"
-    items = _build_agent_options(current=current, availability=availability)
+    items = _build_agent_options(
+        current=current,
+        availability=availability,
+        context=commands,
+    )
     state = SelectionState(items=items)
     keyboard = commands._build_agent_keyboard(state)
     commands._agent_options[key] = state
@@ -148,9 +152,11 @@ def _build_agent_options(
     *,
     current: str,
     availability: str,
+    context: Any = None,
 ) -> list[tuple[str, str]]:
     items: list[tuple[str, str]] = []
-    for agent in sorted(VALID_AGENT_VALUES):
+    for definition in chat_agent_definitions(context):
+        agent = definition.value
         label = agent
         if agent == current:
             label = f"{label} (current)"
