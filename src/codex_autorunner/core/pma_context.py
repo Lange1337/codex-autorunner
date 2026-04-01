@@ -141,15 +141,16 @@ First-turn routine:
    - If request is exploratory/review/debug/quick-fix work in one managed resource, prefer managed threads.
    - If `hub_snapshot.pma_threads` has a relevant active thread, resume it instead of spawning a new one.
    - Treat `chat_bound=true` managed threads as continuity artifacts protected from cleanup by default. Broad requests like "clean up workspace" do not authorize archiving or removing them; only explicit user direction does.
+   - For hub-scoped PMA CLI commands, include `--path <hub_root>` so they resolve the intended hub config instead of relying on the current working directory.
    - If no suitable thread exists, spawn one, run work, and keep it compact:
-     - `car pma thread spawn --agent codex --repo <repo_id> --name <label>`
-     - `car pma thread spawn --resource-kind agent_workspace --resource-id <workspace_id> --name <label>`
-     - `car pma thread send --id <managed_thread_id> --message "..." --watch`
-     - `car pma thread send --id <managed_thread_id> --message-file prompt.md --watch`
-     - `car pma thread send --id <managed_thread_id> --message "..." --notify-on terminal --notify-lane <lane_id>`
-     - `car pma thread status --id <managed_thread_id>`
-     - `car pma thread compact --id <id> --summary "..."`
-     - `car pma thread archive --id <id>`
+     - `car pma thread spawn --agent codex --repo <repo_id> --name <label> --path <hub_root>`
+     - `car pma thread spawn --resource-kind agent_workspace --resource-id <workspace_id> --name <label> --path <hub_root>`
+     - `car pma thread send --id <managed_thread_id> --message "..." --watch --path <hub_root>`
+     - `car pma thread send --id <managed_thread_id> --message-file prompt.md --watch --path <hub_root>`
+     - `car pma thread send --id <managed_thread_id> --message "..." --notify-on terminal --notify-lane <lane_id> --path <hub_root>`
+     - `car pma thread status --id <managed_thread_id> --path <hub_root>`
+     - `car pma thread compact --id <id> --summary "..." --path <hub_root>`
+     - `car pma thread archive --id <id> --path <hub_root>`
    - If request is a multi-step deliverable or cross-repo change, prefer tickets/ticket_flow.
 4) BRANCH C - PMA File Inbox (fresh uploads vs stale leftovers):
    - If PMA File Inbox shows next_action="process_uploaded_file" and hub_snapshot.inbox is empty:
@@ -1107,7 +1108,9 @@ def _thread_followup_semantics(entry: Mapping[str, Any]) -> dict[str, Any]:
             "operator_need": "urgent",
             "recommended_action": "inspect_managed_thread_failure",
             "why_selected": "Managed thread failed and needs inspection before reuse",
-            "recommended_detail_template": "car pma thread status --id {managed_thread_id}",
+            "recommended_detail_template": (
+                "car pma thread status --id {managed_thread_id} --path <hub_root>"
+            ),
         }
     if status == "paused":
         return {
@@ -1116,7 +1119,7 @@ def _thread_followup_semantics(entry: Mapping[str, Any]) -> dict[str, Any]:
             "recommended_action": "resume_managed_thread",
             "why_selected": "Managed thread is paused and likely waiting for the next turn",
             "recommended_detail_template": (
-                'car pma thread send --id {managed_thread_id} --message "..." --watch'
+                'car pma thread send --id {managed_thread_id} --message "..." --watch --path <hub_root>'
             ),
         }
     if status in {"completed", "interrupted"}:
@@ -1147,8 +1150,8 @@ def _thread_followup_semantics(entry: Mapping[str, Any]) -> dict[str, Any]:
                 ),
                 "recommended_detail_template": (
                     "Review before cleanup: car pma thread archive --id "
-                    "{managed_thread_id} if dormant, or reuse it with "
-                    'car pma thread send --id {managed_thread_id} --message "..." --watch'
+                    "{managed_thread_id} --path <hub_root> if dormant, or reuse it with "
+                    'car pma thread send --id {managed_thread_id} --message "..." --watch --path <hub_root>'
                 ),
             }
         return {
@@ -1161,7 +1164,7 @@ def _thread_followup_semantics(entry: Mapping[str, Any]) -> dict[str, Any]:
             ),
             "recommended_detail_template": (
                 "Optional reuse: car pma thread send --id {managed_thread_id} "
-                '--message "..." --watch'
+                '--message "..." --watch --path <hub_root>'
             ),
         }
     if status == "idle":
@@ -1180,7 +1183,7 @@ def _thread_followup_semantics(entry: Mapping[str, Any]) -> dict[str, Any]:
                 ),
                 "recommended_detail_template": (
                     "Optional reuse: car pma thread send --id {managed_thread_id} "
-                    '--message "..." --watch'
+                    '--message "..." --watch --path <hub_root>'
                 ),
             }
         if is_stale:
@@ -1210,8 +1213,8 @@ def _thread_followup_semantics(entry: Mapping[str, Any]) -> dict[str, Any]:
                 ),
                 "recommended_detail_template": (
                     "Review before cleanup: car pma thread archive --id "
-                    "{managed_thread_id} if dormant, or reuse it with "
-                    'car pma thread send --id {managed_thread_id} --message "..." --watch'
+                    "{managed_thread_id} --path <hub_root> if dormant, or reuse it with "
+                    'car pma thread send --id {managed_thread_id} --message "..." --watch --path <hub_root>'
                 ),
             }
         return {
@@ -1224,7 +1227,7 @@ def _thread_followup_semantics(entry: Mapping[str, Any]) -> dict[str, Any]:
             ),
             "recommended_detail_template": (
                 "Optional reuse: car pma thread send --id {managed_thread_id} "
-                '--message "..." --watch'
+                '--message "..." --watch --path <hub_root>'
             ),
         }
     return {
@@ -1234,7 +1237,7 @@ def _thread_followup_semantics(entry: Mapping[str, Any]) -> dict[str, Any]:
         "why_selected": "Managed thread can accept another turn if PMA needs it",
         "recommended_detail_template": (
             "Optional reuse: car pma thread send --id {managed_thread_id} "
-            '--message "..." --watch'
+            '--message "..." --watch --path <hub_root>'
         ),
     }
 
