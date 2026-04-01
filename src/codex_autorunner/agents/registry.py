@@ -465,6 +465,7 @@ _BUILTIN_AGENTS: dict[str, AgentDescriptor] = {
         capabilities=HERMES_CAPABILITIES,
         make_harness=_make_hermes_harness,
         healthcheck=_check_hermes_health,
+        runtime_kind="hermes",
     ),
 }
 

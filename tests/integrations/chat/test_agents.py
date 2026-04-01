@@ -4,6 +4,7 @@ import pytest
 
 from codex_autorunner.integrations.chat.agents import (
     DEFAULT_CHAT_AGENT,
+    _strip_runtime_kind_prefix,
     build_agent_switch_state,
     chat_agent_command_choices,
     chat_agent_definitions,
@@ -12,6 +13,7 @@ from codex_autorunner.integrations.chat.agents import (
     chat_hermes_profile_options,
     default_chat_model_for_agent,
     normalize_chat_agent,
+    normalize_hermes_profile,
     resolve_chat_agent_and_profile,
     resolve_chat_runtime_agent,
     valid_chat_agent_values,
@@ -145,3 +147,64 @@ def test_resolve_chat_agent_and_profile_uses_context_for_config_aliases(
         )
         == "hermes-m4-pma"
     )
+
+
+def test_resolve_chat_agent_and_profile_underscore_hermes_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _registered(context=None):
+        if context != "repo-root":
+            return {}
+        return {
+            "hermes_m4_pma": SimpleNamespace(name="Hermes (hermes_m4_pma)"),
+        }
+
+    monkeypatch.setattr(
+        "codex_autorunner.agents.registry.get_registered_agents",
+        _registered,
+    )
+
+    assert chat_hermes_profile_options("repo-root")[0].profile == "m4_pma"
+    assert resolve_chat_agent_and_profile("hermes_m4_pma", context="repo-root") == (
+        "hermes",
+        "m4_pma",
+    )
+    assert (
+        resolve_chat_runtime_agent("hermes", "m4_pma", context="repo-root")
+        == "hermes_m4_pma"
+    )
+    assert normalize_hermes_profile("m4_pma", context="repo-root") == "m4_pma"
+    assert normalize_hermes_profile("hermes_m4_pma", context="repo-root") == "m4_pma"
+
+
+def test_strip_runtime_kind_prefix() -> None:
+    assert _strip_runtime_kind_prefix("hermes-m4-pma", "hermes") == "m4-pma"
+    assert _strip_runtime_kind_prefix("hermes_m4_pma", "hermes") == "m4_pma"
+    assert _strip_runtime_kind_prefix("m4-pma", "hermes") == "m4-pma"
+    assert _strip_runtime_kind_prefix("hermes", "hermes") == "hermes"
+    assert _strip_runtime_kind_prefix("HERMES-M4-PMA", "hermes") == "m4-pma"
+
+
+def test_hermes_profile_explicit_runtime_kind_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "codex_autorunner.agents.registry.get_registered_agents",
+        lambda context=None: {
+            "custom-alias": SimpleNamespace(
+                runtime_kind="hermes",
+                name="Custom Alias",
+            ),
+        },
+    )
+
+    opts = chat_hermes_profile_options()
+    assert len(opts) == 1
+    assert opts[0].profile == "custom-alias"
+    assert normalize_hermes_profile("custom-alias") == "custom-alias"
+
+
+def test_normalize_hermes_profile_fallback_without_context() -> None:
+    assert normalize_hermes_profile("hermes-m4-pma") == "m4-pma"
+    assert normalize_hermes_profile("hermes_m4_pma") == "m4_pma"
+    assert normalize_hermes_profile("m4-pma") is None
