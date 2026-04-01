@@ -66,24 +66,29 @@ def _agent_runtime_kind(agent_id: str, descriptor: Any) -> str:
     if isinstance(raw_runtime_kind, str) and raw_runtime_kind.strip():
         return raw_runtime_kind.strip().lower()
     normalized_agent_id = str(agent_id or "").strip().lower()
-    if normalized_agent_id == "hermes" or normalized_agent_id.startswith("hermes-"):
+    if (
+        normalized_agent_id == "hermes"
+        or normalized_agent_id.startswith("hermes-")
+        or normalized_agent_id.startswith("hermes_")
+    ):
         return "hermes"
     return normalized_agent_id
 
 
-def _legacy_hermes_profile_from_agent(agent_id: object) -> Optional[str]:
-    if not isinstance(agent_id, str):
-        return None
-    normalized = agent_id.strip().lower()
-    prefix = "hermes-"
-    if not normalized.startswith(prefix):
-        return None
-    profile = normalized[len(prefix) :].strip()
-    return profile or None
-
-
-def _hermes_profile_from_runtime_agent(agent_id: str) -> str:
-    return _legacy_hermes_profile_from_agent(agent_id) or str(agent_id).strip().lower()
+def _strip_runtime_kind_prefix(agent_id: str, runtime_kind: str) -> str:
+    aid = str(agent_id or "").strip().lower()
+    rk = str(runtime_kind or "").strip().lower()
+    if not rk:
+        return aid
+    dash = f"{rk}-"
+    under = f"{rk}_"
+    if aid.startswith(dash):
+        suffix = aid[len(dash) :].strip()
+        return suffix if suffix else aid
+    if aid.startswith(under):
+        suffix = aid[len(under) :].strip()
+        return suffix if suffix else aid
+    return aid
 
 
 def _valid_chat_agent_values(context: Any = None) -> tuple[str, ...]:
@@ -142,7 +147,7 @@ def chat_hermes_profile_options(
             continue
         if _agent_runtime_kind(agent_id, descriptor) != "hermes":
             continue
-        profile = _hermes_profile_from_runtime_agent(agent_id)
+        profile = _strip_runtime_kind_prefix(agent_id, "hermes")
         if not profile or profile in seen_profiles:
             continue
         options.append(
@@ -172,7 +177,8 @@ def normalize_hermes_profile(value: object, *, context: Any = None) -> Optional[
             "".join(ch for ch in option.runtime_agent if ch.isalnum()),
         }:
             return option.profile
-    return _legacy_hermes_profile_from_agent(normalized)
+    result = _strip_runtime_kind_prefix(normalized, "hermes")
+    return result if result != normalized else None
 
 
 def resolve_chat_agent_and_profile(

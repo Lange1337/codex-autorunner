@@ -7,7 +7,11 @@ from typing import Any, Optional
 
 import pytest
 
-from codex_autorunner.integrations.telegram.adapter import TelegramMessage
+from codex_autorunner.integrations.telegram.adapter import (
+    AgentProfileCallback,
+    TelegramCallbackQuery,
+    TelegramMessage,
+)
 from codex_autorunner.integrations.telegram.handlers.commands import (
     execution as execution_commands_module,
 )
@@ -19,7 +23,11 @@ from codex_autorunner.integrations.telegram.handlers.commands_runtime import (
     TelegramCommandHandlers,
     _RuntimeStub,
 )
+from codex_autorunner.integrations.telegram.handlers.selections import (
+    TelegramSelectionHandlers,
+)
 from codex_autorunner.integrations.telegram.state import TelegramTopicRecord
+from codex_autorunner.integrations.telegram.types import SelectionState
 
 
 class _RouterStub:
@@ -185,6 +193,25 @@ class _HermesHandler(TelegramCommandHandlers):
             record.thread_ids.insert(0, resolved_thread_id)
 
         return await self._router.update_topic(chat_id, thread_id, apply)
+
+
+class _HermesSelectionHandler(TelegramSelectionHandlers, _HermesHandler):
+    def __init__(self, record: TelegramTopicRecord, client: _ClientStub) -> None:
+        _HermesHandler.__init__(self, record, client)
+        self.callback_answers: list[str] = []
+
+    async def _answer_callback(self, _callback: object, text: str) -> None:
+        self.callback_answers.append(text)
+
+    async def _edit_callback_message(
+        self,
+        _callback: object,
+        text: str,
+        reply_markup: Optional[dict[str, object]] = None,
+    ) -> bool:
+        _ = reply_markup
+        self.sent_messages.append(text)
+        return True
 
 
 def _message(text: str) -> TelegramMessage:
@@ -415,3 +442,42 @@ async def test_resume_thread_by_id_works_for_hermes(tmp_path: Path) -> None:
     assert any(
         "Resumed thread `hermes-thread-2`" in text for text in handler.sent_messages
     )
+
+
+@pytest.mark.anyio
+async def test_underscore_hermes_alias_profile_options_and_callback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        "codex_autorunner.agents.registry.get_registered_agents",
+        lambda context=None: {
+            "hermes_m4_pma": SimpleNamespace(name="Hermes (hermes_m4_pma)"),
+        },
+    )
+    workspace = str(tmp_path)
+    record = TelegramTopicRecord(agent="hermes", workspace_path=workspace)
+    handler = _HermesSelectionHandler(record, _ClientStub(workspace))
+    options = _build_agent_profile_options(current=None, context=handler)
+    assert ("m4_pma", "m4_pma") in options
+
+    key = "123:root"
+    handler._agent_profile_options[key] = SelectionState(
+        items=[("clear", "(default profile)"), ("m4_pma", "m4_pma")],
+        requester_user_id="456",
+    )
+    callback = TelegramCallbackQuery(
+        update_id=1,
+        callback_id="cb-1",
+        from_user_id=456,
+        data="agent_profile:m4_pma",
+        message_id=99,
+        chat_id=123,
+        thread_id=None,
+    )
+    await handler._handle_agent_profile_callback(
+        key, callback, AgentProfileCallback(profile="m4_pma")
+    )
+    assert record.agent == "hermes"
+    assert record.agent_profile == "m4_pma"
+    assert "Hermes profile set" in handler.callback_answers
