@@ -21,6 +21,7 @@ from codex_autorunner.integrations.chat.models import (
     ChatMessageRef,
     ChatThreadRef,
 )
+from codex_autorunner.integrations.chat.queue_control import ChatQueueControlStore
 
 
 def _message_event(
@@ -374,3 +375,82 @@ def test_is_bypass_event_rejects_scalar_string_iterables(
 ) -> None:
     with pytest.raises(TypeError, match=expected_param):
         is_bypass_event(_interaction_event("u-1"), **kwargs)
+
+
+@pytest.mark.anyio
+async def test_dispatcher_force_reset_cancels_active_handler_and_clears_snapshot(
+    tmp_path,
+) -> None:
+    store = ChatQueueControlStore(tmp_path)
+    dispatcher = ChatDispatcher(queue_control_store=store)
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def handler(event, _context) -> None:
+        if event.update_id != "normal-1":
+            return
+        entered.set()
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    await dispatcher.dispatch(_message_event("normal-1", message_id="m-1"), handler)
+    await entered.wait()
+    await dispatcher.dispatch(_message_event("normal-2", message_id="m-2"), handler)
+
+    snapshot = store.read_snapshot("fake:chat-1:thread-1")
+    assert isinstance(snapshot, dict)
+    assert snapshot["active"] is True
+    assert snapshot["pending_count"] == 1
+
+    result = await asyncio.wait_for(
+        dispatcher.force_reset("fake:chat-1:thread-1"),
+        timeout=1.0,
+    )
+    await asyncio.wait_for(cancelled.wait(), timeout=1.0)
+    await asyncio.wait_for(dispatcher.wait_idle(), timeout=1.0)
+
+    assert result["cancelled_active"] is True
+    assert result["cancelled_pending"] == 1
+    assert store.read_snapshot("fake:chat-1:thread-1") is None
+
+
+@pytest.mark.anyio
+async def test_dispatcher_force_reset_preserves_messages_enqueued_during_reset(
+    tmp_path,
+) -> None:
+    dispatcher = ChatDispatcher(queue_control_store=ChatQueueControlStore(tmp_path))
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+    release_cancel = asyncio.Event()
+    processed: list[str] = []
+
+    async def handler(event, _context) -> None:
+        if event.update_id == "normal-1":
+            entered.set()
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                cancelled.set()
+                await release_cancel.wait()
+                raise
+        else:
+            processed.append(event.update_id)
+
+    await dispatcher.dispatch(_message_event("normal-1", message_id="m-1"), handler)
+    await entered.wait()
+    await dispatcher.dispatch(_message_event("normal-2", message_id="m-2"), handler)
+
+    reset_task = asyncio.create_task(dispatcher.force_reset("fake:chat-1:thread-1"))
+    await asyncio.wait_for(cancelled.wait(), timeout=1.0)
+    await dispatcher.dispatch(_message_event("normal-3", message_id="m-3"), handler)
+    release_cancel.set()
+
+    result = await asyncio.wait_for(reset_task, timeout=1.0)
+    await asyncio.wait_for(dispatcher.wait_idle(), timeout=1.0)
+
+    assert result["cancelled_active"] is True
+    assert result["cancelled_pending"] == 1
+    assert processed == ["normal-3"]
