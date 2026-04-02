@@ -11,13 +11,11 @@ from ....core.runtime import RuntimeContext
 from ....core.utils import atomic_write
 from ....tickets.bulk import bulk_clear_model_pin, bulk_set_agent
 from ....tickets.doctor import format_or_doctor_tickets
-from ....tickets.import_pack import (
+from ....tickets.hub_pack import (
     TicketPackImportError,
+    TicketPackSetupError,
     import_ticket_pack,
     load_template_frontmatter,
-)
-from ....tickets.pack_import import (
-    TicketPackSetupError,
     parse_assignment_specs,
     setup_ticket_pack,
 )
