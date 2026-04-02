@@ -30,6 +30,8 @@ class _StubClient:
         self.question_rejections: list[str] = []
         self.prompt_calls: list[dict[str, object]] = []
         self.get_session_calls: list[str] = []
+        self.list_messages_calls: list[str] = []
+        self.messages_response: Any = []
         self.get_session_error: Exception | None = None
         self.prompt_error: Exception | None = None
         self.send_command_error: Exception | None = None
@@ -69,6 +71,10 @@ class _StubClient:
         if self.get_session_error is not None:
             raise self.get_session_error
         return {"id": session_id}
+
+    async def list_messages(self, session_id: str, **_kwargs: Any) -> Any:
+        self.list_messages_calls.append(session_id)
+        return self.messages_response
 
     async def send_command(self, session_id: str, **kwargs: object) -> dict[str, str]:
         self.prompt_calls.append({"session_id": session_id, **kwargs})
@@ -1311,3 +1317,44 @@ async def test_opencode_harness_wait_for_turn_recovers_sessionless_roleless_text
     result = await harness.wait_for_turn(workspace, "session-1", turn.turn_id)
     assert result.status == "ok"
     assert result.assistant_text == "Agent reply"
+
+
+@pytest.mark.asyncio
+async def test_opencode_harness_wait_for_turn_recovers_final_text_from_session_messages() -> (
+    None
+):
+    workspace = Path("/tmp/workspace").resolve()
+    client = _StubClient(
+        [
+            SSEEvent(
+                event="session.idle",
+                data='{"sessionID":"session-1"}',
+            ),
+        ]
+    )
+    client.messages_response = [
+        {
+            "info": {"id": "user-1", "role": "user"},
+            "parts": [{"type": "text", "text": "Can you echo hello world?"}],
+        },
+        {
+            "info": {"id": "assistant-1", "role": "assistant"},
+            "parts": [{"type": "text", "text": "hello world"}],
+        },
+    ]
+    harness = OpenCodeHarness(_StubSupervisor(client))
+    turn = await harness.start_turn(
+        workspace,
+        "session-1",
+        prompt="Can you echo hello world?",
+        model=None,
+        reasoning=None,
+        approval_mode=None,
+        sandbox_policy=None,
+    )
+
+    result = await harness.wait_for_turn(workspace, "session-1", turn.turn_id)
+
+    assert result.status == "ok"
+    assert result.assistant_text == "hello world"
+    assert client.list_messages_calls == ["session-1"]

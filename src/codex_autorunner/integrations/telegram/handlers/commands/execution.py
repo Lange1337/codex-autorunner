@@ -793,7 +793,7 @@ async def _finalize_telegram_managed_thread_execution(
                 managed_turn_id,
                 status="ok",
                 assistant_text=resolved_assistant_text,
-                error=None,
+                error=outcome.error,
                 backend_turn_id=outcome.backend_turn_id,
                 transcript_turn_id=transcript_turn_id,
             )
@@ -976,13 +976,14 @@ def _ensure_telegram_managed_thread_queue_worker(
                         message_text = str(
                             finalized.get("assistant_text") or ""
                         ).strip()
-                        if message_text:
-                            await handlers._send_message(
-                                chat_id,
-                                message_text,
-                                thread_id=thread_id,
-                                reply_to=None,
-                            )
+                        if not message_text:
+                            message_text = "(No response text returned.)"
+                        await handlers._send_message(
+                            chat_id,
+                            message_text,
+                            thread_id=thread_id,
+                            reply_to=None,
+                        )
                         await handlers._flush_outbox_files(
                             record,
                             chat_id=chat_id,

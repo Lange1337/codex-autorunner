@@ -1144,6 +1144,9 @@ class OpenCodeHarness(AgentHarness):
             async def _fetch_providers() -> Any:
                 return await client.providers(directory=str(workspace_root))
 
+            async def _fetch_messages() -> Any:
+                return await client.list_messages(conversation_id, limit=10)
+
             async def _respond_permission(request_id: str, reply: str) -> None:
                 await client.respond_permission(request_id=request_id, reply=reply)
 
@@ -1191,6 +1194,7 @@ class OpenCodeHarness(AgentHarness):
                     event_stream_factory=_event_stream,
                     session_fetcher=_fetch_session,
                     provider_fetcher=_fetch_providers,
+                    messages_fetcher=_fetch_messages,
                     stall_timeout_seconds=await self._supervisor.session_stall_timeout_seconds_for_workspace(
                         workspace_root
                     ),

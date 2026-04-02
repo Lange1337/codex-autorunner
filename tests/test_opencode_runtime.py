@@ -9,6 +9,7 @@ from codex_autorunner.agents.opencode.runtime import (
     collect_opencode_output_from_events,
     extract_session_id,
     parse_message_response,
+    recover_last_assistant_message,
 )
 from codex_autorunner.core.sse import SSEEvent
 
@@ -1098,3 +1099,47 @@ async def test_collect_output_sessionless_completed_suppresses_echoed_prompt() -
     )
     assert output.text == ""
     assert output.error is None
+
+
+@pytest.mark.anyio
+async def test_collect_output_recovers_final_text_from_session_messages() -> None:
+    events = [
+        SSEEvent(event="session.idle", data='{"sessionID":"s1"}'),
+    ]
+
+    async def _messages_fetcher():
+        return [
+            {
+                "info": {"id": "user-1", "role": "user"},
+                "parts": [{"type": "text", "text": "Can you echo hello world?"}],
+            },
+            {
+                "info": {"id": "assistant-1", "role": "assistant"},
+                "parts": [{"type": "text", "text": "hello world"}],
+            },
+        ]
+
+    output = await collect_opencode_output_from_events(
+        _iter_events(events),
+        session_id="s1",
+        prompt="Can you echo hello world?",
+        messages_fetcher=_messages_fetcher,
+    )
+
+    assert output.text == "hello world"
+    assert output.error is None
+
+
+def test_recover_last_assistant_message_ignores_ignored_text_parts() -> None:
+    payload = [
+        {
+            "info": {"id": "assistant-1", "role": "assistant"},
+            "parts": [
+                {"type": "text", "text": "user echo", "ignored": True},
+                {"type": "text", "text": "final answer"},
+            ],
+        }
+    ]
+    result = recover_last_assistant_message(payload, prompt="user echo")
+    assert result.text == "final answer"
+    assert result.error is None

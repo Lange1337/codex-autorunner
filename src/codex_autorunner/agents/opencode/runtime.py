@@ -246,6 +246,61 @@ def _extract_error_text(payload: Any) -> Optional[str]:
     return None
 
 
+def _extract_visible_message_text(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    parts_raw = payload.get("parts")
+    text_parts: list[str] = []
+    if isinstance(parts_raw, list):
+        for part in parts_raw:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") != "text" or bool(part.get("ignored")):
+                continue
+            text = part.get("text")
+            if isinstance(text, str) and text:
+                text_parts.append(text)
+    return "".join(text_parts).strip()
+
+
+def recover_last_assistant_message(
+    payload: Any, *, prompt: Optional[str] = None
+) -> OpenCodeMessageResult:
+    messages_raw: Any = payload
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, list):
+            messages_raw = data
+    if not isinstance(messages_raw, list):
+        return OpenCodeMessageResult(text="", error=None)
+
+    normalized_prompt = (
+        prompt.strip() if isinstance(prompt, str) and prompt.strip() else None
+    )
+
+    for entry in reversed(messages_raw):
+        if not isinstance(entry, dict):
+            continue
+        info = entry.get("info")
+        role = info.get("role") if isinstance(info, dict) else entry.get("role")
+        if role != "assistant":
+            continue
+        text = _extract_visible_message_text(entry)
+        if not text:
+            parsed = parse_message_response(entry)
+            text = parsed.text.strip() if parsed.text else ""
+            error = parsed.error
+        else:
+            error = None
+        if error is None:
+            error = _extract_error_text(info) or _extract_error_text(entry)
+        if normalized_prompt and text and text == normalized_prompt:
+            continue
+        if text or error:
+            return OpenCodeMessageResult(text=text, error=error)
+    return OpenCodeMessageResult(text="", error=None)
+
+
 def _normalize_message_phase(value: Any) -> Optional[str]:
     if not isinstance(value, str):
         return None
@@ -735,6 +790,7 @@ async def collect_opencode_output_from_events(
     event_stream_factory: Optional[Callable[[], AsyncIterator[SSEEvent]]] = None,
     session_fetcher: Optional[Callable[[], Awaitable[Any]]] = None,
     provider_fetcher: Optional[Callable[[], Awaitable[Any]]] = None,
+    messages_fetcher: Optional[Callable[[], Awaitable[Any]]] = None,
     stall_timeout_seconds: Optional[float] = _OPENCODE_STREAM_STALL_TIMEOUT_SECONDS,
 ) -> OpenCodeTurnOutput:
     text_parts: list[str] = []
@@ -1634,6 +1690,27 @@ async def collect_opencode_output_from_events(
         ):
             text_parts.append(text)
 
+    if not text_parts and messages_fetcher is not None:
+        try:
+            messages_payload = await messages_fetcher()
+        except Exception as exc:
+            log_event(
+                logger,
+                logging.DEBUG,
+                "opencode.messages.fetch_failed",
+                session_id=session_id,
+                exc=exc,
+            )
+        else:
+            recovered = recover_last_assistant_message(
+                messages_payload,
+                prompt=prompt,
+            )
+            if recovered.text:
+                text_parts.append(recovered.text)
+            if recovered.error and not error:
+                error = recovered.error
+
     return OpenCodeTurnOutput(
         text="".join(text_parts).strip(),
         error=error,
@@ -1692,6 +1769,9 @@ async def collect_opencode_output(
     async def _fetch_providers() -> Any:
         return await client.providers(directory=workspace_path)
 
+    async def _fetch_messages() -> Any:
+        return await client.list_messages(session_id, limit=10)
+
     return await collect_opencode_output_from_events(
         None,
         session_id=session_id,
@@ -1710,6 +1790,7 @@ async def collect_opencode_output(
         model_payload=model_payload,
         session_fetcher=_fetch_session,
         provider_fetcher=_fetch_providers,
+        messages_fetcher=_fetch_messages,
         stall_timeout_seconds=stall_timeout_seconds,
     )
 
@@ -1731,5 +1812,6 @@ __all__ = [
     "map_approval_policy_to_permission",
     "opencode_missing_env",
     "parse_message_response",
+    "recover_last_assistant_message",
     "split_model_id",
 ]

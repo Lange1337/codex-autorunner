@@ -362,6 +362,32 @@ class OpenCodeClient:
     async def get_session(self, session_id: str) -> Any:
         return await self._request("GET", f"/session/{session_id}", expect_json=True)
 
+    async def list_messages(
+        self,
+        session_id: str,
+        *,
+        limit: Optional[int] = None,
+        before: Optional[str] = None,
+    ) -> Any:
+        params: dict[str, Any] = {}
+        if isinstance(limit, int) and limit >= 0:
+            params["limit"] = limit
+        if isinstance(before, str) and before:
+            params["before"] = before
+        return await self._request(
+            "GET",
+            f"/session/{session_id}/message",
+            params=params or None,
+            expect_json=True,
+        )
+
+    async def get_message(self, session_id: str, message_id: str) -> Any:
+        return await self._request(
+            "GET",
+            f"/session/{session_id}/message/{message_id}",
+            expect_json=True,
+        )
+
     async def session_status(self, *, directory: Optional[str] = None) -> Any:
         return await self._request(
             "GET",

@@ -29,7 +29,7 @@ def _raw_events_show_completion(raw_events: tuple[Any, ...]) -> bool:
             message = raw_event.get("message")
             if isinstance(message, dict):
                 method = str(message.get("method") or "").strip().lower()
-        if method in {"turn/completed", "prompt/completed"}:
+        if method in {"turn/completed", "prompt/completed", "session.idle"}:
             return True
     return False
 
@@ -245,6 +245,10 @@ async def await_runtime_thread_outcome(
     raw_events = tuple(getattr(result, "raw_events", ()) or ())
     successful_completion = status in _SUCCESSFUL_COMPLETION_STATUSES
     if errors:
+        detail = next(
+            (str(error or "").strip() for error in errors if str(error or "").strip()),
+            "",
+        )
         # Some runtimes can emit a trailing transport error after a completed turn.
         # Only prefer the final text when the runtime explicitly reported success
         # and the raw event stream confirms completion was already observed.
@@ -261,10 +265,17 @@ async def await_runtime_thread_outcome(
                 backend_turn_id=backend_turn_id,
                 raw_events=raw_events,
             )
-        detail = next(
-            (str(error or "").strip() for error in errors if str(error or "").strip()),
-            "",
-        )
+        # OpenCode sets output.error while still returning assistant text; preserve text
+        # for Telegram/Discord even when the harness reports a secondary error list.
+        if assistant_text.strip():
+            return RuntimeThreadOutcome(
+                status="ok",
+                assistant_text=assistant_text,
+                error=detail or None,
+                backend_thread_id=backend_thread_id,
+                backend_turn_id=backend_turn_id,
+                raw_events=raw_events,
+            )
         return RuntimeThreadOutcome(
             status="error",
             assistant_text="",

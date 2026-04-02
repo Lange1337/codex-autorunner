@@ -1264,7 +1264,7 @@ async def _finalize_discord_thread_execution(
                 managed_turn_id,
                 status="ok",
                 assistant_text=resolved_assistant_text,
-                error=None,
+                error=outcome.error,
                 backend_turn_id=outcome.backend_turn_id,
                 transcript_turn_id=transcript_turn_id,
             )
