@@ -1,12 +1,20 @@
+import asyncio
 import logging
+import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
 
 from codex_autorunner.bootstrap import seed_hub_files
 from codex_autorunner.core.app_server_command import GLOBAL_APP_SERVER_COMMAND_ENV
 from codex_autorunner.core.config import CONFIG_FILENAME
+from codex_autorunner.core.hub_diagnostics import (
+    hub_clean_shutdown_path,
+    hub_pid_path,
+)
 from codex_autorunner.integrations.app_server.event_buffer import AppServerEventBuffer
 from codex_autorunner.integrations.app_server.threads import (
     AppServerThreadRegistry,
@@ -85,6 +93,50 @@ def test_hub_lifespan_reaper_uses_config_root(hub_env, monkeypatch) -> None:
         pass
 
     assert called_roots == [app.state.config.root]
+
+
+def test_hub_lifespan_records_pid_and_clean_shutdown(hub_env, monkeypatch) -> None:
+    _stub_opencode_supervisor(monkeypatch)
+    app = create_hub_app(hub_env.hub_root)
+    pid_path = hub_pid_path(hub_env.hub_root)
+    clean_shutdown_path = hub_clean_shutdown_path(hub_env.hub_root)
+
+    with TestClient(app):
+        assert pid_path.exists()
+        assert pid_path.read_text(encoding="utf-8").strip().isdigit()
+        assert clean_shutdown_path.exists() is False
+
+    assert clean_shutdown_path.exists()
+    assert clean_shutdown_path.read_text(encoding="utf-8").strip()
+
+
+@pytest.mark.asyncio
+async def test_hub_lifespan_restores_exception_hooks_on_startup_failure(
+    hub_env, monkeypatch
+) -> None:
+    _stub_opencode_supervisor(monkeypatch)
+    original_sys_excepthook = sys.excepthook
+    original_threading_excepthook = threading.excepthook
+    loop = asyncio.get_running_loop()
+    original_asyncio_exception_handler = loop.get_exception_handler()
+
+    async def _boom_start_repo_lifespans(self) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(
+        web_app_module.HubMountManager,
+        "start_repo_lifespans",
+        _boom_start_repo_lifespans,
+    )
+    app = create_hub_app(hub_env.hub_root)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        async with app.router.lifespan_context(app):
+            pass
+
+    assert sys.excepthook is original_sys_excepthook
+    assert threading.excepthook is original_threading_excepthook
+    assert loop.get_exception_handler() is original_asyncio_exception_handler
 
 
 def test_hub_opencode_prune_interval_uses_opencode_ttl(
