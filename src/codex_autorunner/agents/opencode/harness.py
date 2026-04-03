@@ -39,17 +39,22 @@ from .event_fields import (
     extract_part_type as _extract_part_type,
 )
 from .runtime import (
+    OpenCodeTurnOutput,
+    build_turn_id,
     collect_opencode_output_from_events,
     extract_session_id,
     extract_turn_id,
     map_approval_policy_to_permission,
     opencode_stream_timeouts,
+    parse_message_response,
+    recover_last_assistant_message,
     split_model_id,
 )
 from .supervisor_protocol import OpenCodeHarnessSupervisorProtocol
 
 _logger = logging.getLogger(__name__)
 _GLOB_META_RE = re.compile(r"[*?\[\]{]")
+_SILENT_TURN_HEARTBEAT_SECONDS = 20.0
 
 
 @dataclass
@@ -64,16 +69,21 @@ class _PendingTurnConfig:
     event_buffer: TurnEventBuffer = field(default_factory=TurnEventBuffer)
     pre_connected_event_queue: Optional[asyncio.Queue[Any]] = None
     pre_connected_stream_task: Optional[asyncio.Task[None]] = None
+    pre_connected_event_seen: asyncio.Event = field(default_factory=asyncio.Event)
     pre_connected_queue_exhausted: bool = False
+    synthetic_raw_events: list[dict[str, Any]] = field(default_factory=list)
     progress_events_published: int = 0
     progress_events_skipped_session: int = 0
     progress_events_idle: int = 0
+    heartbeat_task: Optional[asyncio.Task[None]] = None
 
 
 async def _pre_connect_event_stream(
     client: Any,
     workspace_root: Path,
     conversation_id: str,
+    *,
+    event_seen: Optional[asyncio.Event] = None,
 ) -> tuple[asyncio.Queue[Any], asyncio.Task[None]]:
     """Start SSE event stream before prompt so no events are missed."""
     event_queue: asyncio.Queue[Any] = asyncio.Queue()
@@ -86,6 +96,8 @@ async def _pre_connect_event_stream(
                 session_id=conversation_id,
                 ready_event=ready_event,
             ):
+                if event_seen is not None:
+                    event_seen.set()
                 await event_queue.put(event)
         except Exception:
             _logger.debug("Pre-connected SSE stream error", exc_info=True)
@@ -178,6 +190,57 @@ def _progress_event_shape_hint(payload: Any) -> Optional[str]:
         if item_keys:
             hints.append(f"item={','.join(item_keys[:6])}")
     return " ".join(hints) or None
+
+
+def _wrap_runtime_raw_event(method: str, params: dict[str, Any]) -> dict[str, Any]:
+    return {"message": {"method": method, "params": params}}
+
+
+def _with_session_id(payload: Any, conversation_id: str) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {"sessionID": conversation_id}
+    normalized = dict(payload)
+    if not extract_session_id(normalized, allow_fallback_id=True):
+        normalized["sessionID"] = conversation_id
+    return normalized
+
+
+def _synthetic_command_result_events(
+    conversation_id: str, payload: Any
+) -> list[dict[str, Any]]:
+    normalized = _with_session_id(payload, conversation_id)
+    parsed = parse_message_response(normalized)
+    events: list[dict[str, Any]] = []
+    if parsed.text:
+        events.append(_wrap_runtime_raw_event("message.completed", normalized))
+    elif parsed.error:
+        events.append(
+            _wrap_runtime_raw_event(
+                "error",
+                {
+                    "sessionID": conversation_id,
+                    "message": parsed.error,
+                },
+            )
+        )
+    if events:
+        events.append(
+            _wrap_runtime_raw_event(
+                "session.idle",
+                {
+                    "sessionID": conversation_id,
+                },
+            )
+        )
+    return events
+
+
+def _observe_background_task(task: asyncio.Task[Any]) -> None:
+    def _consume_exception(done: asyncio.Task[Any]) -> None:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            done.exception()
+
+    task.add_done_callback(_consume_exception)
 
 
 def _fresh_conversation_error(
@@ -825,30 +888,15 @@ class OpenCodeHarness(AgentHarness):
         if model is None:
             model = DEFAULT_CHAT_AGENT_MODELS.get("opencode")
         model_payload = split_model_id(model)
+        pre_connected_event_seen = asyncio.Event()
         event_queue, stream_task = await _pre_connect_event_stream(
-            client, canonical_workspace, conversation_id
+            client,
+            canonical_workspace,
+            conversation_id,
+            event_seen=pre_connected_event_seen,
         )
-        try:
-            result = await client.prompt_async(
-                conversation_id,
-                message=prompt,
-                model=model_payload,
-                variant=reasoning,
-            )
-        except Exception as exc:
-            stream_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await stream_task
-            await self._release_turn_client(reserved_workspace)
-            _raise_fresh_conversation_error(
-                exc,
-                conversation_id=conversation_id,
-                operation="start_turn",
-            )
-        turn_id = extract_turn_id(conversation_id, result)
-        if turn_id:
-            _logger.debug("OpenCode turn started: %s", turn_id)
-        self._pending_turns[(conversation_id, turn_id)] = _PendingTurnConfig(
+        turn_id = build_turn_id(conversation_id)
+        pending = _PendingTurnConfig(
             model_payload=model_payload,
             approval_mode=approval_mode,
             sandbox_policy=sandbox_policy,
@@ -861,7 +909,75 @@ class OpenCodeHarness(AgentHarness):
             ),
             pre_connected_event_queue=event_queue,
             pre_connected_stream_task=stream_task,
+            pre_connected_event_seen=pre_connected_event_seen,
         )
+        self._pending_turns[(conversation_id, turn_id)] = pending
+
+        async def _run_prompt_async() -> Any:
+            try:
+                result = await client.prompt_async(
+                    conversation_id,
+                    message=prompt,
+                    model=model_payload,
+                    variant=reasoning,
+                )
+            except Exception as exc:
+                _raise_fresh_conversation_error(
+                    exc,
+                    conversation_id=conversation_id,
+                    operation="start_turn",
+                )
+            if (
+                pending.progress_events_published == 0
+                and not pending.pre_connected_event_seen.is_set()
+            ):
+                for raw_event in _synthetic_command_result_events(
+                    conversation_id, result
+                ):
+                    pending.synthetic_raw_events.append(raw_event)
+                    await pending.event_buffer.append(raw_event)
+            return result
+
+        command_task = asyncio.create_task(_run_prompt_async())
+        _observe_background_task(command_task)
+        pending.command_task = command_task
+        await asyncio.sleep(0)
+        if command_task.done():
+            exc = command_task.exception()
+            if exc is not None:
+                self._pending_turns.pop((conversation_id, turn_id), None)
+                stream_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await stream_task
+                await self._release_turn_client(reserved_workspace)
+                raise exc
+            result = command_task.result()
+            resolved_turn_id = extract_turn_id(conversation_id, result)
+            if resolved_turn_id and resolved_turn_id != turn_id:
+                self._pending_turns.pop((conversation_id, turn_id), None)
+                self._pending_turns[(conversation_id, resolved_turn_id)] = pending
+                turn_id = resolved_turn_id
+        else:
+
+            async def _emit_busy_heartbeats() -> None:
+                try:
+                    while not command_task.done():
+                        if pending.pre_connected_event_seen.is_set():
+                            break
+                        raw_event = _wrap_runtime_raw_event(
+                            "session.status",
+                            {
+                                "sessionID": conversation_id,
+                                "status": {"type": "busy"},
+                            },
+                        )
+                        pending.synthetic_raw_events.append(raw_event)
+                        await pending.event_buffer.append(raw_event)
+                        await asyncio.sleep(_SILENT_TURN_HEARTBEAT_SECONDS)
+                except asyncio.CancelledError:
+                    raise
+
+            pending.heartbeat_task = asyncio.create_task(_emit_busy_heartbeats())
         return TurnRef(
             conversation_id=conversation_id,
             turn_id=turn_id,
@@ -893,31 +1009,15 @@ class OpenCodeHarness(AgentHarness):
         if model is None:
             model = DEFAULT_CHAT_AGENT_MODELS.get("opencode")
         arguments = prompt if prompt else ""
+        pre_connected_event_seen = asyncio.Event()
         event_queue, stream_task = await _pre_connect_event_stream(
-            client, canonical_workspace, conversation_id
+            client,
+            canonical_workspace,
+            conversation_id,
+            event_seen=pre_connected_event_seen,
         )
-        try:
-            result = await client.send_command(
-                conversation_id,
-                command="review",
-                arguments=arguments,
-                model=model,
-            )
-        except Exception as exc:
-            stream_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await stream_task
-            await self._release_turn_client(reserved_workspace)
-            _raise_fresh_conversation_error(
-                exc,
-                conversation_id=conversation_id,
-                operation="start_review",
-            )
-        turn_id = extract_turn_id(conversation_id, result)
-        if turn_id:
-            _logger.debug("OpenCode review started: %s", turn_id)
-
-        self._pending_turns[(conversation_id, turn_id)] = _PendingTurnConfig(
+        turn_id = build_turn_id(conversation_id)
+        pending = _PendingTurnConfig(
             model_payload=split_model_id(model),
             approval_mode=approval_mode,
             sandbox_policy=sandbox_policy,
@@ -930,7 +1030,75 @@ class OpenCodeHarness(AgentHarness):
             ),
             pre_connected_event_queue=event_queue,
             pre_connected_stream_task=stream_task,
+            pre_connected_event_seen=pre_connected_event_seen,
         )
+        self._pending_turns[(conversation_id, turn_id)] = pending
+
+        async def _run_review_command() -> Any:
+            try:
+                result = await client.send_command(
+                    conversation_id,
+                    command="review",
+                    arguments=arguments,
+                    model=model,
+                )
+            except Exception as exc:
+                _raise_fresh_conversation_error(
+                    exc,
+                    conversation_id=conversation_id,
+                    operation="start_review",
+                )
+            if (
+                pending.progress_events_published == 0
+                and not pending.pre_connected_event_seen.is_set()
+            ):
+                for raw_event in _synthetic_command_result_events(
+                    conversation_id, result
+                ):
+                    pending.synthetic_raw_events.append(raw_event)
+                    await pending.event_buffer.append(raw_event)
+            return result
+
+        command_task = asyncio.create_task(_run_review_command())
+        _observe_background_task(command_task)
+        pending.command_task = command_task
+        await asyncio.sleep(0)
+        if command_task.done():
+            exc = command_task.exception()
+            if exc is not None:
+                self._pending_turns.pop((conversation_id, turn_id), None)
+                stream_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await stream_task
+                await self._release_turn_client(reserved_workspace)
+                raise exc
+            result = command_task.result()
+            resolved_turn_id = extract_turn_id(conversation_id, result)
+            if resolved_turn_id and resolved_turn_id != turn_id:
+                self._pending_turns.pop((conversation_id, turn_id), None)
+                self._pending_turns[(conversation_id, resolved_turn_id)] = pending
+                turn_id = resolved_turn_id
+        else:
+
+            async def _emit_busy_heartbeats() -> None:
+                try:
+                    while not command_task.done():
+                        if pending.pre_connected_event_seen.is_set():
+                            break
+                        raw_event = _wrap_runtime_raw_event(
+                            "session.status",
+                            {
+                                "sessionID": conversation_id,
+                                "status": {"type": "busy"},
+                            },
+                        )
+                        pending.synthetic_raw_events.append(raw_event)
+                        await pending.event_buffer.append(raw_event)
+                        await asyncio.sleep(_SILENT_TURN_HEARTBEAT_SECONDS)
+                except asyncio.CancelledError:
+                    raise
+
+            pending.heartbeat_task = asyncio.create_task(_emit_busy_heartbeats())
         return TurnRef(conversation_id=conversation_id, turn_id=turn_id)
 
     async def interrupt(
@@ -1150,6 +1318,8 @@ class OpenCodeHarness(AgentHarness):
                 if isinstance(statuses, dict):
                     session_status = statuses.get(conversation_id)
                     if session_status is None:
+                        if command_task is not None and not command_task.done():
+                            return {"status": {"type": "busy"}}
                         return {"status": {"type": "idle"}}
                     if isinstance(session_status, dict):
                         return {"status": session_status}
@@ -1228,11 +1398,18 @@ class OpenCodeHarness(AgentHarness):
                 output = await collect_task
             else:
                 try:
+                    command_result: Any = None
                     done, _pending = await asyncio.wait(
                         {collect_task, command_task},
-                        return_when=asyncio.FIRST_EXCEPTION,
+                        return_when=asyncio.FIRST_COMPLETED,
                     )
-                    if command_task in done:
+                    if collect_task in done:
+                        output = await collect_task
+                        if command_task in done:
+                            command_result = command_task.result()
+                        else:
+                            command_result = await command_task
+                    elif command_task in done:
                         command_exc = command_task.exception()
                         if command_exc is not None:
                             collect_task.cancel()
@@ -1241,14 +1418,49 @@ class OpenCodeHarness(AgentHarness):
                             except asyncio.CancelledError:
                                 pass
                             raise command_exc
-                    output = await collect_task
-                    await command_task
+                        command_result = command_task.result()
+                        if (
+                            pending.progress_events_published == 0
+                            and not pending.pre_connected_event_seen.is_set()
+                        ):
+                            collect_task.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await collect_task
+                            recovered = parse_message_response(command_result)
+                            if not recovered.text and not recovered.error:
+                                messages_payload = await _fetch_messages()
+                                recovered = recover_last_assistant_message(
+                                    messages_payload,
+                                    prompt=pending.prompt,
+                                )
+                            output = OpenCodeTurnOutput(
+                                text=recovered.text,
+                                error=recovered.error,
+                            )
+                        else:
+                            output = await collect_task
+                    if (
+                        command_result is not None
+                        and not output.text
+                        and not output.error
+                    ):
+                        recovered = parse_message_response(command_result)
+                        if recovered.text or recovered.error:
+                            output = OpenCodeTurnOutput(
+                                text=recovered.text or output.text,
+                                error=recovered.error or output.error,
+                                usage=output.usage,
+                            )
                 except Exception as exc:
                     return TerminalTurnResult(
                         status="error",
                         assistant_text="",
                         errors=[str(exc)],
-                        raw_events=raw_events,
+                        raw_events=(
+                            list(pending.synthetic_raw_events) + raw_events
+                            if pending is not None
+                            else raw_events
+                        ),
                     )
 
             errors = [output.error] if output.error else []
@@ -1256,7 +1468,11 @@ class OpenCodeHarness(AgentHarness):
                 status="error" if errors else "ok",
                 assistant_text=output.text,
                 errors=errors,
-                raw_events=raw_events,
+                raw_events=(
+                    list(pending.synthetic_raw_events) + raw_events
+                    if pending is not None
+                    else raw_events
+                ),
             )
 
         try:
@@ -1264,6 +1480,7 @@ class OpenCodeHarness(AgentHarness):
                 return await _collect()
             return await asyncio.wait_for(_collect(), timeout=timeout)
         finally:
+            heartbeat_task = pending.heartbeat_task if pending is not None else None
             pre_stream_task = (
                 pending.pre_connected_stream_task if pending is not None else None
             )
@@ -1272,6 +1489,10 @@ class OpenCodeHarness(AgentHarness):
             )
             if turn_id is not None:
                 self._pending_turns.pop((conversation_id, turn_id), None)
+            if heartbeat_task is not None and not heartbeat_task.done():
+                heartbeat_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await heartbeat_task
             if pre_stream_task is not None and not pre_stream_task.done():
                 pre_stream_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):

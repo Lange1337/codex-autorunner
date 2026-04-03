@@ -447,6 +447,62 @@ async def test_opencode_harness_start_review_uses_backend_turn_id_from_command_r
 
 
 @pytest.mark.asyncio
+async def test_opencode_harness_start_turn_returns_before_prompt_finishes_and_synthesizes_events() -> (
+    None
+):
+    workspace = Path("/tmp/workspace").resolve()
+    client = _StubClient([])
+    release_prompt = asyncio.Event()
+
+    async def _prompt_async(session_id: str, **kwargs: object) -> dict[str, object]:
+        _ = kwargs
+        await release_prompt.wait()
+        return {
+            "info": {"id": "backend-turn-1"},
+            "sessionID": session_id,
+            "parts": [{"type": "text", "text": "Agent reply"}],
+        }
+
+    client.prompt_async = _prompt_async  # type: ignore[method-assign]
+    harness = OpenCodeHarness(_StubSupervisor(client))
+
+    turn = await harness.start_turn(
+        workspace,
+        "session-1",
+        prompt="hello",
+        model=None,
+        reasoning=None,
+        approval_mode=None,
+        sandbox_policy=None,
+    )
+
+    assert turn.turn_id.startswith("session-1:")
+    pending = harness._pending_turns[("session-1", turn.turn_id)]
+    assert pending.command_task is not None
+    assert not pending.command_task.done()
+
+    event_iter = harness.stream_events(workspace, "session-1", turn.turn_id)
+    first_event = await asyncio.wait_for(event_iter.__anext__(), timeout=1.0)
+    await event_iter.aclose()
+
+    assert first_event["message"]["method"] == "session.status"
+    assert first_event["message"]["params"]["status"]["type"] == "busy"
+
+    release_prompt.set()
+    result = await harness.wait_for_turn(workspace, "session-1", turn.turn_id)
+
+    assert result.status == "ok"
+    assert result.assistant_text == "Agent reply"
+    methods = [
+        event.get("message", {}).get("method")
+        for event in result.raw_events
+        if isinstance(event, dict)
+    ]
+    assert "message.completed" in methods
+    assert "session.idle" in methods
+
+
+@pytest.mark.asyncio
 async def test_opencode_harness_releases_reserved_turn_when_start_turn_setup_fails() -> (
     None
 ):
