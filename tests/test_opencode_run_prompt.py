@@ -39,6 +39,10 @@ class _SupervisorStub:
         self.started: list[Path] = []
         self.finished: list[Path] = []
 
+    @property
+    def session_stall_timeout_seconds(self) -> Optional[float]:
+        return None
+
     async def get_client(self, _workspace_root: Path) -> _ClientStub:
         return self._client
 

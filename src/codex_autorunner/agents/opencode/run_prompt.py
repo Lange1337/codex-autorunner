@@ -16,6 +16,7 @@ from .runtime import (
     collect_opencode_output,
     extract_session_id,
     opencode_missing_env,
+    opencode_stream_timeouts,
     parse_message_response,
     split_model_id,
 )
@@ -148,6 +149,14 @@ async def run_opencode_prompt(
 
         permission_policy = config.permission_policy or PERMISSION_ALLOW
         ready_event = asyncio.Event()
+        collector_kwargs: dict[str, Any] = {}
+        supervisor_stall = supervisor.session_stall_timeout_seconds
+        if supervisor_stall is not None:
+            stall_timeout, first_event_timeout = opencode_stream_timeouts(
+                supervisor_stall,
+            )
+            collector_kwargs["stall_timeout_seconds"] = stall_timeout
+            collector_kwargs["first_event_timeout_seconds"] = first_event_timeout
         output_task = asyncio.create_task(
             collect_opencode_output(
                 client,
@@ -157,6 +166,8 @@ async def run_opencode_prompt(
                 permission_policy=permission_policy,
                 should_stop=should_stop,
                 ready_event=ready_event,
+                logger=logger,
+                **collector_kwargs,
             )
         )
         with contextlib.suppress(asyncio.TimeoutError):

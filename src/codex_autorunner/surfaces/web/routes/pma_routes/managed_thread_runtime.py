@@ -872,11 +872,35 @@ def ensure_managed_thread_queue_worker(app: Any, managed_thread_id: str) -> None
                     thread=current_thread_row,
                     started=started,
                 )
-        except Exception:
+        except BaseException:
             logger.exception(
                 "Managed-thread queue worker failed (managed_thread_id=%s)",
                 managed_thread_id,
             )
+            try:
+                _thread_store = PmaThreadStore(app.state.config.root)
+                _service = _build_managed_thread_orchestration_service_for_app(
+                    app,
+                    thread_store=_thread_store,
+                )
+                running = _service.get_running_execution(managed_thread_id)
+                if running is not None:
+                    _service.record_execution_result(
+                        managed_thread_id,
+                        running.execution_id,
+                        status="error",
+                        assistant_text="",
+                        error="Queue worker terminated unexpectedly",
+                        backend_turn_id=None,
+                        transcript_turn_id=None,
+                    )
+            except Exception:
+                logger.exception(
+                    "Failed to clean up running execution after queue worker failure "
+                    "(managed_thread_id=%s)",
+                    managed_thread_id,
+                )
+            raise
         finally:
             if (
                 worker_task is not None
@@ -1570,7 +1594,7 @@ def build_managed_thread_runtime_routes(
                 try:
                     await _run_execution(started_execution)
                     ensure_managed_thread_queue_worker(request.app, managed_thread_id)
-                except Exception:
+                except BaseException:
                     logger.exception(
                         "Managed-thread background execution failed (managed_thread_id=%s, managed_turn_id=%s)",
                         managed_thread_id,
@@ -1593,7 +1617,12 @@ def build_managed_thread_runtime_routes(
                                 transcript_turn_id=None,
                             )
                         except KeyError:
-                            pass
+                            logger.warning(
+                                "Failed to record error for cancelled managed thread turn "
+                                "(managed_thread_id=%s, managed_turn_id=%s)",
+                                managed_thread_id,
+                                managed_turn_id,
+                            )
                         await notify_managed_thread_terminal_transition(
                             request,
                             thread=thread,
@@ -1602,6 +1631,12 @@ def build_managed_thread_runtime_routes(
                             to_state="failed",
                             reason=detail,
                         )
+                    else:
+                        # Turn is no longer running (e.g. send completed, then
+                        # ensure_managed_thread_queue_worker failed). No store cleanup.
+                        pass
+                    # Must stay outside the ``if``: always propagate CancelledError etc.
+                    raise
 
             _track_managed_thread_task(
                 request.app, asyncio.create_task(_background_run())

@@ -212,6 +212,24 @@ def _should_suppress_tail_event(message: Any) -> bool:
 
 _NO_STREAM_AVAILABLE_IDLE_SECONDS = 15
 _LIKELY_HUNG_IDLE_SECONDS = 90
+_STALL_IDLE_SECONDS = 30
+
+
+def _running_turn_stall_flags(
+    *,
+    idle_seconds: Optional[int],
+    last_event_at: Optional[str],
+) -> tuple[bool, Optional[str]]:
+    """Return (stalled, stall_reason) for a running turn."""
+    stalled = idle_seconds is not None and idle_seconds >= _STALL_IDLE_SECONDS
+    if not stalled:
+        return (False, None)
+    reason = (
+        "no_events_yet"
+        if last_event_at is None
+        else "no_new_events_since_last_progress"
+    )
+    return (True, reason)
 
 
 def _truncate_tool_name(value: Any) -> str | None:
@@ -528,16 +546,13 @@ def _derive_active_turn_diagnostics(
     idle_seconds_raw = snapshot.get("idle_seconds")
     idle_seconds = int(idle_seconds_raw) if isinstance(idle_seconds_raw, int) else None
     last_event_at = normalize_optional_text(snapshot.get("last_event_at"))
-    stalled = bool(
-        turn_status == "running" and idle_seconds is not None and idle_seconds >= 30
-    )
-    stall_reason = None
-    if stalled:
-        stall_reason = (
-            "no_events_yet"
-            if last_event_at is None
-            else "no_new_events_since_last_progress"
+    stalled, stall_reason = (
+        _running_turn_stall_flags(
+            idle_seconds=idle_seconds, last_event_at=last_event_at
         )
+        if turn_status == "running"
+        else (False, None)
+    )
 
     return {
         "managed_turn_id": managed_turn_id,
@@ -607,10 +622,12 @@ def _refresh_active_turn_diagnostics(
                 )
             elif isinstance(snapshot.get("idle_seconds"), (int, float)):
                 resolved_idle = max(0, int(snapshot.get("idle_seconds") or 0))
-    stalled = bool(
-        resolved_status == "running"
-        and resolved_idle is not None
-        and resolved_idle >= 30
+    stalled, stall_reason = (
+        _running_turn_stall_flags(
+            idle_seconds=resolved_idle, last_event_at=resolved_last_event_at
+        )
+        if resolved_status == "running"
+        else (False, None)
     )
     updated["phase"] = normalize_optional_text(phase) or normalize_optional_text(
         snapshot.get("phase")
@@ -622,11 +639,7 @@ def _refresh_active_turn_diagnostics(
     updated["last_event_type"] = normalize_optional_text(last_event.get("event_type"))
     updated["last_event_summary"] = normalize_optional_text(last_event.get("summary"))
     updated["stalled"] = stalled
-    updated["stall_reason"] = (
-        "no_events_yet"
-        if stalled and resolved_last_event_at is None
-        else ("no_new_events_since_last_progress" if stalled else None)
-    )
+    updated["stall_reason"] = stall_reason
     return updated
 
 
@@ -1055,9 +1068,10 @@ async def _build_managed_thread_tail_snapshot(
 
     activity = "idle"
     if turn_status == "running":
-        activity = (
-            "stalled" if idle_seconds is not None and idle_seconds >= 30 else "running"
+        is_stalled, _ = _running_turn_stall_flags(
+            idle_seconds=idle_seconds, last_event_at=None
         )
+        activity = "stalled" if is_stalled else "running"
     elif turn_status == "ok":
         activity = "completed"
     elif turn_status == "interrupted":
