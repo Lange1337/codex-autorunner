@@ -4,7 +4,7 @@ Agent harness support routes (models + event streaming).
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, AsyncIterator, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -12,6 +12,7 @@ from fastapi.responses import StreamingResponse
 from ....agents.registry import get_agent_descriptor, get_available_agents
 from ....agents.types import ModelCatalog
 from ....core.orchestration.catalog import map_agent_capabilities
+from ....core.sse import format_sse
 from ..services.validation import normalize_agent_id
 from .shared import SSE_HEADERS
 
@@ -226,10 +227,23 @@ def build_agents_routes() -> APIRouter:
             raise HTTPException(status_code=400, detail="thread_id is required")
         try:
             harness = descriptor.make_harness(request.app.state)
-            return StreamingResponse(
-                harness.stream_events(
+
+            async def _stream_harness_events() -> AsyncIterator[str]:
+                async for raw_event in harness.stream_events(
                     request.app.state.engine.repo_root, thread_id, turn_id
-                ),
+                ):
+                    if isinstance(raw_event, str):
+                        yield raw_event
+                        continue
+                    payload = (
+                        raw_event
+                        if isinstance(raw_event, dict)
+                        else {"value": raw_event}
+                    )
+                    yield format_sse("app-server", payload)
+
+            return StreamingResponse(
+                _stream_harness_events(),
                 media_type="text/event-stream",
                 headers=SSE_HEADERS,
             )

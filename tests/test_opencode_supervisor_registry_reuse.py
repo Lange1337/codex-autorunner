@@ -286,6 +286,9 @@ async def test_ensure_started_reuses_healthy_registry_record(
         supervisor_module, "read_process_record", lambda *_a, **_k: registry_record
     )
     monkeypatch.setattr(supervisor, "_pid_is_running", lambda _pid: True)
+    monkeypatch.setattr(
+        supervisor_module, "process_command_matches", lambda *_a, **_k: True
+    )
     monkeypatch.setattr(supervisor, "_attach_to_base_url", _fake_attach)
     monkeypatch.setattr(supervisor, "_start_process", _fake_start_process)
     monkeypatch.setattr(supervisor, "_refresh_registry_ownership", _capture_refresh)
@@ -520,6 +523,9 @@ async def test_ensure_started_from_registry_skips_restart_on_auth_failure(
         supervisor_module, "read_process_record", lambda *_a, **_k: registry_record
     )
     monkeypatch.setattr(supervisor, "_pid_is_running", lambda _pid: True)
+    monkeypatch.setattr(
+        supervisor_module, "process_command_matches", lambda *_a, **_k: True
+    )
     monkeypatch.setattr(supervisor, "_attach_to_base_url", _fake_attach)
     monkeypatch.setattr(supervisor, "_start_process", _fake_start_process)
     monkeypatch.setattr(
@@ -599,6 +605,9 @@ async def test_ensure_started_from_registry_acquires_registry_lock_for_attach_pa
         supervisor_module, "read_process_record", lambda *_a, **_k: registry_record
     )
     monkeypatch.setattr(supervisor, "_pid_is_running", lambda _pid: True)
+    monkeypatch.setattr(
+        supervisor_module, "process_command_matches", lambda *_a, **_k: True
+    )
     monkeypatch.setattr(supervisor, "_attach_to_base_url", _fake_attach)
     monkeypatch.setattr(supervisor_module, "file_lock", _fake_lock)
 
@@ -668,6 +677,9 @@ async def test_ensure_started_reaps_unhealthy_registry_record_then_spawns(
     )
     monkeypatch.setattr(
         supervisor, "_pid_is_running", lambda _pid: pid_state["running"]
+    )
+    monkeypatch.setattr(
+        supervisor_module, "process_command_matches", lambda *_a, **_k: True
     )
     monkeypatch.setattr(supervisor, "_attach_to_base_url", _fake_attach)
     monkeypatch.setattr(supervisor, "_start_process", _fake_start_process)

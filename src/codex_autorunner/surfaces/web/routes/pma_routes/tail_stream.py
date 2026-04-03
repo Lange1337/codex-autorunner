@@ -1316,6 +1316,42 @@ def build_managed_thread_tail_routes(
                         snapshot["stream_available"] = True
                         snapshot["backend_thread_id"] = refreshed_backend_thread_id
                         snapshot["backend_turn_id"] = refreshed_backend_turn_id
+                        refreshed_snapshot = await _build_managed_thread_tail_snapshot(
+                            request=request,
+                            service=service,
+                            managed_thread_id=managed_thread_id,
+                            harness=harness,
+                            limit=min(limit, 200),
+                            level=normalized_level,
+                            since_ms=since_ms,
+                            resume_after=resolve_resume_after(request, since_event_id),
+                        )
+                        for key in (
+                            "events",
+                            "last_event_id",
+                            "phase",
+                            "phase_source",
+                            "guidance",
+                            "last_tool",
+                            "idle_seconds",
+                            "active_turn_diagnostics",
+                        ):
+                            if key in refreshed_snapshot:
+                                snapshot[key] = refreshed_snapshot[key]
+                        for event in snapshot.get("events", []):
+                            if not isinstance(event, dict):
+                                continue
+                            event_id = event.get("event_id")
+                            event_id_line = (
+                                f"id: {event_id}\n"
+                                if isinstance(event_id, int) and event_id > 0
+                                else ""
+                            )
+                            yield (
+                                f"event: tail\n"
+                                f"{event_id_line}"
+                                f"data: {json.dumps(event, ensure_ascii=True)}\n\n"
+                            )
                         break
 
                     now = datetime.now(timezone.utc)
