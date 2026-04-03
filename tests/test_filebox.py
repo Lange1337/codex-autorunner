@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from codex_autorunner.core import filebox
+from codex_autorunner.core import filebox, filebox_lifecycle
 
 
 def _write(dir_path: Path, name: str, content: bytes = b"x") -> Path:
@@ -40,6 +40,69 @@ def test_save_resolve_and_delete(tmp_path: Path) -> None:
     removed = filebox.delete_file(repo, "inbox", "note.md")
     assert removed
     assert filebox.resolve_file(repo, "inbox", "note.md") is None
+
+
+def test_consume_inbox_file_moves_file_out_of_active_inbox(tmp_path: Path) -> None:
+    repo = tmp_path
+    filebox.save_file(repo, "inbox", "note.md", b"hello")
+
+    archived = filebox_lifecycle.consume_inbox_file(repo, "note.md")
+
+    assert archived.box == "consumed"
+    assert archived.path.read_bytes() == b"hello"
+    assert filebox.resolve_file(repo, "inbox", "note.md") is None
+    archived_entries = filebox_lifecycle.list_consumed_files(repo)
+    assert [(entry.box, entry.name) for entry in archived_entries] == [
+        ("consumed", "note.md")
+    ]
+
+
+def test_dismiss_and_restore_file_preserve_contents(tmp_path: Path) -> None:
+    repo = tmp_path
+    filebox.save_file(repo, "inbox", "skip.md", b"skip")
+
+    dismissed = filebox_lifecycle.dismiss_inbox_file(repo, "skip.md")
+    assert filebox.resolve_file(repo, "inbox", "skip.md") is None
+    restored = filebox_lifecycle.unconsume_inbox_file(repo, "skip.md")
+
+    assert dismissed.box == "dismissed"
+    assert restored.box == "inbox"
+    assert restored.path.read_bytes() == b"skip"
+    assert not (filebox_lifecycle.dismissed_dir(repo) / "skip.md").exists()
+    inbox_entry = filebox.resolve_file(repo, "inbox", "skip.md")
+    assert inbox_entry is not None
+    assert inbox_entry.path.read_bytes() == b"skip"
+
+
+def test_consume_inbox_file_suffixes_archive_name_on_collision(tmp_path: Path) -> None:
+    repo = tmp_path
+    _write(filebox_lifecycle.consumed_dir(repo), "note.md", b"first")
+    filebox.save_file(repo, "inbox", "note.md", b"second")
+
+    archived = filebox_lifecycle.consume_inbox_file(repo, "note.md")
+
+    assert archived.box == "consumed"
+    assert archived.name == "note-2.md"
+    assert archived.path.read_bytes() == b"second"
+    assert (filebox_lifecycle.consumed_dir(repo) / "note.md").read_bytes() == b"first"
+    assert filebox.resolve_file(repo, "inbox", "note.md") is None
+
+
+def test_restore_chooses_newest_archive_when_same_name_exists_in_both_boxes(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path
+    consumed = _write(filebox_lifecycle.consumed_dir(repo), "brief.md", b"consumed")
+    dismissed = _write(filebox_lifecycle.dismissed_dir(repo), "brief.md", b"dismissed")
+    os.utime(consumed, (1, 1))
+    os.utime(dismissed, (2, 2))
+
+    restored = filebox_lifecycle.unconsume_inbox_file(repo, "brief.md")
+
+    assert restored.box == "inbox"
+    assert restored.path.read_bytes() == b"dismissed"
+    assert consumed.exists()
+    assert not dismissed.exists()
 
 
 def test_list_regular_files_sorts_newest_first(tmp_path: Path) -> None:
