@@ -845,6 +845,354 @@ async def test_orchestrated_turn_interrupt_send_falls_back_when_progress_ack_edi
     assert service._discord_reusable_progress_messages == {}
 
 
+@pytest.mark.asyncio
+async def test_orchestrated_turn_placeholder_sent_before_runtime_begin(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    call_order: list[str] = []
+    rest = _FakeRest()
+    thread = SimpleNamespace(thread_target_id="thread-1")
+    started_execution = SimpleNamespace(
+        execution=SimpleNamespace(status="running"),
+        thread=thread,
+    )
+
+    async def _fake_begin(*args: Any, **kwargs: Any) -> Any:
+        _ = args, kwargs
+        call_order.append("begin")
+        return started_execution
+
+    async def _fake_finalize(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        _ = args, kwargs
+        call_order.append("finalize")
+        return {"status": "ok", "assistant_text": "ok", "token_usage": None}
+
+    class _Store:
+        async def get_binding(self, *, channel_id: str) -> dict[str, Any]:
+            assert channel_id == "channel-1"
+            return {}
+
+    class _Service:
+        def __init__(self) -> None:
+            self._config = _config(tmp_path)
+            self._store = _Store()
+            self._rest = rest
+
+        async def _send_channel_message(
+            self, channel_id: str, payload: dict[str, Any]
+        ) -> dict[str, Any]:
+            call_order.append("placeholder")
+            return await rest.create_channel_message(
+                channel_id=channel_id,
+                payload=payload,
+            )
+
+        async def _delete_channel_message_safe(
+            self,
+            channel_id: str,
+            message_id: str,
+            *,
+            record_id: Optional[str] = None,
+        ) -> None:
+            _ = record_id
+            await rest.delete_channel_message(
+                channel_id=channel_id,
+                message_id=message_id,
+            )
+
+        def _register_discord_turn_approval_context(self, **kwargs: Any) -> None:
+            _ = kwargs
+
+        def _clear_discord_turn_approval_context(self, **kwargs: Any) -> None:
+            _ = kwargs
+
+        def _resolve_agent_state(self, binding: Any) -> tuple[str, Optional[str]]:
+            _ = binding
+            return "codex", None
+
+        def _runtime_agent_for_binding(self, binding: Any) -> str:
+            _ = binding
+            return "codex"
+
+    monkeypatch.setattr(
+        discord_message_turns_module,
+        "resolve_discord_thread_target",
+        lambda *args, **kwargs: (SimpleNamespace(), thread),
+    )
+    monkeypatch.setattr(
+        discord_message_turns_module,
+        "begin_runtime_thread_execution",
+        _fake_begin,
+    )
+    monkeypatch.setattr(
+        discord_message_turns_module,
+        "_finalize_discord_thread_execution",
+        _fake_finalize,
+    )
+    monkeypatch.setattr(
+        discord_message_turns_module,
+        "_ensure_discord_thread_queue_worker",
+        lambda *args, **kwargs: None,
+    )
+
+    service = _Service()
+    await discord_message_turns_module._run_discord_orchestrated_turn_for_message(
+        service,
+        workspace_root=tmp_path,
+        prompt_text="hi",
+        input_items=None,
+        source_message_id=None,
+        agent="codex",
+        model_override=None,
+        reasoning_effort=None,
+        session_key="s1",
+        orchestrator_channel_key="channel-1",
+        mode="pma",
+        pma_enabled=True,
+        execution_prompt="<user_message>\nhi\n</user_message>\n",
+        public_execution_error="err",
+        timeout_error="timeout",
+        interrupted_error="interrupt",
+        approval_mode="never",
+        sandbox_policy="dangerFullAccess",
+        max_actions=12,
+        min_edit_interval_seconds=1.0,
+        heartbeat_interval_seconds=2.0,
+    )
+
+    assert call_order == ["placeholder", "begin", "finalize"]
+
+
+@pytest.mark.asyncio
+async def test_orchestrated_turn_begin_failure_deletes_progress_placeholder(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    rest = _FakeRest()
+    thread = SimpleNamespace(thread_target_id="thread-1")
+
+    async def _fake_begin(*args: Any, **kwargs: Any) -> Any:
+        _ = args, kwargs
+        raise RuntimeError("simulated begin failure")
+
+    class _Store:
+        async def get_binding(self, *, channel_id: str) -> dict[str, Any]:
+            assert channel_id == "channel-1"
+            return {}
+
+    class _Service:
+        def __init__(self) -> None:
+            self._config = _config(tmp_path)
+            self._store = _Store()
+            self._rest = rest
+
+        async def _send_channel_message(
+            self, channel_id: str, payload: dict[str, Any]
+        ) -> dict[str, Any]:
+            return await rest.create_channel_message(
+                channel_id=channel_id,
+                payload=payload,
+            )
+
+        async def _delete_channel_message_safe(
+            self,
+            channel_id: str,
+            message_id: str,
+            *,
+            record_id: Optional[str] = None,
+        ) -> None:
+            _ = record_id
+            await rest.delete_channel_message(
+                channel_id=channel_id,
+                message_id=message_id,
+            )
+
+        def _register_discord_turn_approval_context(self, **kwargs: Any) -> None:
+            _ = kwargs
+
+        def _clear_discord_turn_approval_context(self, **kwargs: Any) -> None:
+            _ = kwargs
+
+        def _resolve_agent_state(self, binding: Any) -> tuple[str, Optional[str]]:
+            _ = binding
+            return "codex", None
+
+        def _runtime_agent_for_binding(self, binding: Any) -> str:
+            _ = binding
+            return "codex"
+
+    monkeypatch.setattr(
+        discord_message_turns_module,
+        "resolve_discord_thread_target",
+        lambda *args, **kwargs: (SimpleNamespace(), thread),
+    )
+    monkeypatch.setattr(
+        discord_message_turns_module,
+        "begin_runtime_thread_execution",
+        _fake_begin,
+    )
+
+    service = _Service()
+    with pytest.raises(RuntimeError, match="simulated begin failure"):
+        await discord_message_turns_module._run_discord_orchestrated_turn_for_message(
+            service,
+            workspace_root=tmp_path,
+            prompt_text="hi",
+            input_items=None,
+            source_message_id=None,
+            agent="codex",
+            model_override=None,
+            reasoning_effort=None,
+            session_key="s1",
+            orchestrator_channel_key="channel-1",
+            mode="pma",
+            pma_enabled=True,
+            execution_prompt="<user_message>\nhi\n</user_message>\n",
+            public_execution_error="err",
+            timeout_error="timeout",
+            interrupted_error="interrupt",
+            approval_mode="never",
+            sandbox_policy="dangerFullAccess",
+            max_actions=12,
+            min_edit_interval_seconds=1.0,
+            heartbeat_interval_seconds=2.0,
+        )
+
+    assert len(rest.channel_messages) == 1
+    assert rest.deleted_channel_messages
+    assert rest.deleted_channel_messages[-1]["message_id"] == "msg-1"
+
+
+@pytest.mark.asyncio
+async def test_orchestrated_turn_queued_updates_placeholder_skips_finalize(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    finalized_called = False
+    rest = _FakeRest()
+    thread = SimpleNamespace(thread_target_id="thread-1")
+    started_execution = SimpleNamespace(
+        execution=SimpleNamespace(status="queued"),
+        thread=thread,
+    )
+    queue_worker_calls = 0
+
+    async def _fake_begin(*args: Any, **kwargs: Any) -> Any:
+        _ = args, kwargs
+        return started_execution
+
+    async def _fake_finalize(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        nonlocal finalized_called
+        finalized_called = True
+        _ = args, kwargs
+        return {"status": "ok", "assistant_text": "nope", "token_usage": None}
+
+    def _fake_ensure_queue(*args: Any, **kwargs: Any) -> None:
+        nonlocal queue_worker_calls
+        queue_worker_calls += 1
+
+    class _Store:
+        async def get_binding(self, *, channel_id: str) -> dict[str, Any]:
+            assert channel_id == "channel-1"
+            return {}
+
+    class _Service:
+        def __init__(self) -> None:
+            self._config = _config(tmp_path)
+            self._store = _Store()
+            self._rest = rest
+
+        async def _send_channel_message(
+            self, channel_id: str, payload: dict[str, Any]
+        ) -> dict[str, Any]:
+            return await rest.create_channel_message(
+                channel_id=channel_id,
+                payload=payload,
+            )
+
+        async def _delete_channel_message_safe(
+            self,
+            channel_id: str,
+            message_id: str,
+            *,
+            record_id: Optional[str] = None,
+        ) -> None:
+            _ = record_id
+            await rest.delete_channel_message(
+                channel_id=channel_id,
+                message_id=message_id,
+            )
+
+        def _register_discord_turn_approval_context(self, **kwargs: Any) -> None:
+            _ = kwargs
+
+        def _clear_discord_turn_approval_context(self, **kwargs: Any) -> None:
+            _ = kwargs
+
+        def _resolve_agent_state(self, binding: Any) -> tuple[str, Optional[str]]:
+            _ = binding
+            return "codex", None
+
+        def _runtime_agent_for_binding(self, binding: Any) -> str:
+            _ = binding
+            return "codex"
+
+    monkeypatch.setattr(
+        discord_message_turns_module,
+        "resolve_discord_thread_target",
+        lambda *args, **kwargs: (SimpleNamespace(), thread),
+    )
+    monkeypatch.setattr(
+        discord_message_turns_module,
+        "begin_runtime_thread_execution",
+        _fake_begin,
+    )
+    monkeypatch.setattr(
+        discord_message_turns_module,
+        "_finalize_discord_thread_execution",
+        _fake_finalize,
+    )
+    monkeypatch.setattr(
+        discord_message_turns_module,
+        "_ensure_discord_thread_queue_worker",
+        _fake_ensure_queue,
+    )
+
+    service = _Service()
+    result = (
+        await discord_message_turns_module._run_discord_orchestrated_turn_for_message(
+            service,
+            workspace_root=tmp_path,
+            prompt_text="hi",
+            input_items=None,
+            source_message_id=None,
+            agent="codex",
+            model_override=None,
+            reasoning_effort=None,
+            session_key="s1",
+            orchestrator_channel_key="channel-1",
+            mode="pma",
+            pma_enabled=True,
+            execution_prompt="<user_message>\nhi\n</user_message>\n",
+            public_execution_error="err",
+            timeout_error="timeout",
+            interrupted_error="interrupt",
+            approval_mode="never",
+            sandbox_policy="dangerFullAccess",
+            max_actions=12,
+            min_edit_interval_seconds=1.0,
+            heartbeat_interval_seconds=2.0,
+        )
+    )
+
+    assert not finalized_called
+    assert queue_worker_calls == 1
+    assert "Queued" in (result.final_message or "")
+    assert rest.edited_channel_messages
+    assert "queued" in rest.edited_channel_messages[-1]["payload"]["content"].lower()
+
+
 class _FailingChannelRest(_FakeRest):
     async def create_channel_message(
         self, *, channel_id: str, payload: dict[str, Any]

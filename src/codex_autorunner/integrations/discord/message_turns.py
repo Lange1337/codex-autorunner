@@ -1123,6 +1123,8 @@ async def _finalize_discord_thread_execution(
     ):
 
         async def _pump_runtime_events() -> None:
+            raw_events_received = 0
+            run_events_dispatched = 0
             try:
                 async for raw_event in harness_progress_event_stream(
                     started.harness,
@@ -1130,6 +1132,7 @@ async def _finalize_discord_thread_execution(
                     stream_backend_thread_id,
                     stream_backend_turn_id,
                 ):
+                    raw_events_received += 1
                     run_events: list[Any]
                     if isinstance(
                         raw_event,
@@ -1155,6 +1158,7 @@ async def _finalize_discord_thread_execution(
                     if on_progress_event is None:
                         continue
                     for run_event in run_events:
+                        run_events_dispatched += 1
                         try:
                             await on_progress_event(run_event)
                         except Exception:
@@ -1166,7 +1170,15 @@ async def _finalize_discord_thread_execution(
                             continue
             except Exception:
                 _logger.warning("Discord progress event pump failed", exc_info=True)
-                return
+            finally:
+                _logger.info(
+                    "Discord progress pump finished thread=%s turn=%s "
+                    "raw_events=%d run_events_dispatched=%d",
+                    managed_thread_id,
+                    managed_turn_id,
+                    raw_events_received,
+                    run_events_dispatched,
+                )
 
         stream_task = asyncio.create_task(_pump_runtime_events())
 
@@ -1204,9 +1216,20 @@ async def _finalize_discord_thread_execution(
         )
     finally:
         if stream_task is not None:
-            stream_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await stream_task
+            drain_cancel: Optional[BaseException] = None
+            try:
+                await asyncio.wait_for(stream_task, timeout=0.5)
+            except asyncio.TimeoutError:
+                stream_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await stream_task
+            except asyncio.CancelledError as exc:
+                drain_cancel = exc
+                stream_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await stream_task
+            if drain_cancel is not None:
+                raise drain_cancel
 
     recovered_outcome = recover_post_completion_outcome(outcome, event_state)
     if recovered_outcome is not outcome:
@@ -1549,43 +1572,8 @@ async def _run_discord_orchestrated_turn_for_message(
         execution_prompt,
         input_items,
     )
-    started_execution = await begin_runtime_thread_execution(
-        orchestration_service,
-        MessageRequest(
-            target_id=thread.thread_target_id,
-            target_kind="thread",
-            message_text=prompt_text,
-            busy_policy="queue",
-            model=model_override,
-            reasoning=reasoning_effort,
-            approval_mode=approval_mode,
-            input_items=execution_input_items,
-            metadata={
-                "runtime_prompt": execution_prompt,
-                "execution_error_message": public_execution_error,
-            },
-        ),
-        client_request_id=f"discord:{channel_id}:{uuid.uuid4().hex[:12]}",
-        sandbox_policy=sandbox_policy,
-    )
-    if (
-        str(getattr(started_execution.execution, "status", "") or "").strip()
-        == "queued"
-    ):
-        _ensure_discord_thread_queue_worker(
-            service,
-            orchestration_service=orchestration_service,
-            managed_thread_id=thread.thread_target_id,
-            channel_id=channel_id,
-            public_execution_error=public_execution_error,
-            timeout_error=timeout_error,
-            interrupted_error=interrupted_error,
-        )
-        return DiscordMessageTurnResult(
-            final_message="Queued (waiting for available worker...)"
-        )
-
     max_progress_len = max(int(service._config.max_message_length), 32)
+    managed_thread_id = thread.thread_target_id
     tracker = TurnProgressTracker(
         started_at=time.monotonic(),
         agent=agent,
@@ -1594,7 +1582,6 @@ async def _run_discord_orchestrated_turn_for_message(
         max_actions=max_actions,
         max_output_chars=max_progress_len,
     )
-    managed_thread_id = thread.thread_target_id
     progress_message_id: Optional[str] = None
     progress_rendered: Optional[str] = None
     progress_last_updated = 0.0
@@ -1658,6 +1645,14 @@ async def _run_discord_orchestrated_turn_for_message(
             await asyncio.sleep(heartbeat_interval_seconds)
             await _edit_progress()
 
+    async def _stop_progress_heartbeat() -> None:
+        nonlocal progress_heartbeat_task
+        if progress_heartbeat_task is not None:
+            progress_heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await progress_heartbeat_task
+            progress_heartbeat_task = None
+
     try:
         if reusable_progress_message_id:
             progress_message_id = reusable_progress_message_id
@@ -1694,6 +1689,67 @@ async def _run_discord_orchestrated_turn_for_message(
         )
         progress_message_id = None
 
+    try:
+        started_execution = await begin_runtime_thread_execution(
+            orchestration_service,
+            MessageRequest(
+                target_id=thread.thread_target_id,
+                target_kind="thread",
+                message_text=prompt_text,
+                busy_policy="queue",
+                model=model_override,
+                reasoning=reasoning_effort,
+                approval_mode=approval_mode,
+                input_items=execution_input_items,
+                metadata={
+                    "runtime_prompt": execution_prompt,
+                    "execution_error_message": public_execution_error,
+                },
+            ),
+            client_request_id=f"discord:{channel_id}:{uuid.uuid4().hex[:12]}",
+            sandbox_policy=sandbox_policy,
+        )
+    except Exception:
+        await _stop_progress_heartbeat()
+        if progress_message_id:
+            await service._delete_channel_message_safe(
+                channel_id,
+                progress_message_id,
+                record_id=(
+                    f"discord:runtime-begin-failed:{managed_thread_id}:"
+                    f"{uuid.uuid4().hex[:8]}"
+                ),
+            )
+        raise
+
+    if (
+        str(getattr(started_execution.execution, "status", "") or "").strip()
+        == "queued"
+    ):
+        await _stop_progress_heartbeat()
+        tracker.set_label("queued")
+        try:
+            if progress_message_id:
+                await _edit_progress(force=True)
+        except Exception:
+            _logger.debug(
+                "Discord queued-state progress edit failed for channel=%s",
+                channel_id,
+                exc_info=True,
+            )
+        _ensure_discord_thread_queue_worker(
+            service,
+            orchestration_service=orchestration_service,
+            managed_thread_id=managed_thread_id,
+            channel_id=channel_id,
+            public_execution_error=public_execution_error,
+            timeout_error=timeout_error,
+            interrupted_error=interrupted_error,
+        )
+        return DiscordMessageTurnResult(
+            final_message="Queued (waiting for available worker...)"
+        )
+
     service._register_discord_turn_approval_context(
         started_execution=started_execution,
         channel_id=channel_id,
@@ -1719,10 +1775,7 @@ async def _run_discord_orchestrated_turn_for_message(
         service._clear_discord_turn_approval_context(
             started_execution=started_execution
         )
-        if progress_heartbeat_task is not None:
-            progress_heartbeat_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await progress_heartbeat_task
+        await _stop_progress_heartbeat()
 
     _ensure_discord_thread_queue_worker(
         service,

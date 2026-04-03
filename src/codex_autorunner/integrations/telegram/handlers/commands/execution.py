@@ -684,6 +684,8 @@ async def _finalize_telegram_managed_thread_execution(
     ):
 
         async def _pump_runtime_events() -> None:
+            raw_events_received = 0
+            run_events_dispatched = 0
             try:
                 async for raw_event in harness_progress_event_stream(
                     started.harness,
@@ -691,6 +693,7 @@ async def _finalize_telegram_managed_thread_execution(
                     stream_backend_thread_id,
                     stream_backend_turn_id,
                 ):
+                    raw_events_received += 1
                     run_events = await normalize_runtime_thread_raw_event(
                         raw_event,
                         event_state,
@@ -698,6 +701,7 @@ async def _finalize_telegram_managed_thread_execution(
                     if on_progress_event is None:
                         continue
                     for run_event in run_events:
+                        run_events_dispatched += 1
                         try:
                             await on_progress_event(run_event)
                         except Exception:
@@ -711,7 +715,15 @@ async def _finalize_telegram_managed_thread_execution(
                 handlers._logger.warning(
                     "Telegram progress event pump failed", exc_info=True
                 )
-                return
+            finally:
+                handlers._logger.info(
+                    "Telegram progress pump finished thread=%s turn=%s "
+                    "raw_events=%d run_events_dispatched=%d",
+                    managed_thread_id,
+                    managed_turn_id,
+                    raw_events_received,
+                    run_events_dispatched,
+                )
 
         stream_task = asyncio.create_task(_pump_runtime_events())
 
@@ -732,9 +744,20 @@ async def _finalize_telegram_managed_thread_execution(
         )
     finally:
         if stream_task is not None:
-            stream_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await stream_task
+            drain_cancel: Optional[BaseException] = None
+            try:
+                await asyncio.wait_for(stream_task, timeout=0.5)
+            except asyncio.TimeoutError:
+                stream_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await stream_task
+            except asyncio.CancelledError as exc:
+                drain_cancel = exc
+                stream_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await stream_task
+            if drain_cancel is not None:
+                raise drain_cancel
 
     recovered_outcome = recover_post_completion_outcome(outcome, event_state)
     if recovered_outcome is not outcome:

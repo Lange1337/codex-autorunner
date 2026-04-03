@@ -65,6 +65,9 @@ class _PendingTurnConfig:
     pre_connected_event_queue: Optional[asyncio.Queue[Any]] = None
     pre_connected_stream_task: Optional[asyncio.Task[None]] = None
     pre_connected_queue_exhausted: bool = False
+    progress_events_published: int = 0
+    progress_events_skipped_session: int = 0
+    progress_events_idle: int = 0
 
 
 async def _pre_connect_event_stream(
@@ -1008,8 +1011,23 @@ class OpenCodeHarness(AgentHarness):
                 sample_keys,
             )
             return
-        async for event in pending.event_buffer.tail():
-            yield event
+        events_yielded = 0
+        try:
+            async for event in pending.event_buffer.tail():
+                events_yielded += 1
+                yield event
+        finally:
+            log_event(
+                _logger,
+                logging.INFO,
+                "opencode.harness.stream_events.done",
+                conversation_id=conversation_id,
+                turn_id=turn_id or "",
+                events_yielded=events_yielded,
+                progress_buffer_published=pending.progress_events_published,
+                progress_buffer_skipped_session=pending.progress_events_skipped_session,
+                progress_buffer_idle=pending.progress_events_idle,
+            )
 
     async def wait_for_turn(
         self,
@@ -1085,11 +1103,13 @@ class OpenCodeHarness(AgentHarness):
                         and isinstance(status_type, str)
                         and status_type.lower() == "idle"
                     )
-                    if (
-                        event_session_id == conversation_id or not event_session_id
-                    ) and not is_idle:
+                    if is_idle:
+                        pending.progress_events_idle += 1
+                    elif event_session_id == conversation_id or not event_session_id:
+                        pending.progress_events_published += 1
                         await _publish_progress_event(wrapped)
-                    elif not is_idle:
+                    else:
+                        pending.progress_events_skipped_session += 1
                         log_event(
                             _logger,
                             logging.INFO,
@@ -1097,11 +1117,7 @@ class OpenCodeHarness(AgentHarness):
                             method=event.event,
                             conversation_id=conversation_id,
                             event_session_id=event_session_id,
-                            reason=(
-                                "missing_session_id"
-                                if not event_session_id
-                                else "session_mismatch"
-                            ),
+                            reason="session_mismatch",
                             shape_hint=_progress_event_shape_hint(parsed),
                         )
 
