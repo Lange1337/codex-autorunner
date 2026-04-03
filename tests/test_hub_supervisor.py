@@ -1281,6 +1281,95 @@ def test_hub_api_cleanup_all_repo_threads_archives_unbound_threads_and_reports_d
     )
 
 
+def test_hub_supervisor_cleanup_all_dry_run_does_not_archive_threads(
+    tmp_path: Path,
+):
+    hub_root = tmp_path / "hub"
+    cfg = json.loads(json.dumps(DEFAULT_HUB_CONFIG))
+    write_test_config(hub_root / CONFIG_FILENAME, cfg)
+    supervisor = HubSupervisor(
+        load_hub_config(hub_root),
+        backend_factory_builder=build_agent_backend_factory,
+        app_server_supervisor_factory_builder=build_app_server_supervisor_factory,
+        backend_orchestrator_builder=build_backend_orchestrator,
+    )
+    base = supervisor.create_repo("base")
+    _init_git_repo(base.path)
+    store = PmaThreadStore(hub_root)
+    thread = store.create_thread(
+        "codex", base.path, repo_id=base.id, name="scratch-preview"
+    )
+    dry = supervisor.cleanup_all(dry_run=True)
+    assert dry["dry_run"] is True
+    assert dry["threads"]["archived_count"] == 1
+    assert store.get_thread(thread["managed_thread_id"])["lifecycle_status"] == "active"
+    live = supervisor.cleanup_all(dry_run=False)
+    assert live["dry_run"] is False
+    assert live["threads"]["archived_count"] == 1
+    assert (
+        store.get_thread(thread["managed_thread_id"])["lifecycle_status"] == "archived"
+    )
+
+
+def test_hub_api_cleanup_all_preview_and_job(tmp_path: Path, monkeypatch):
+    hub_root = tmp_path / "hub"
+    cfg = json.loads(json.dumps(DEFAULT_HUB_CONFIG))
+    write_test_config(hub_root / CONFIG_FILENAME, cfg)
+    supervisor = HubSupervisor(
+        load_hub_config(hub_root),
+        backend_factory_builder=build_agent_backend_factory,
+        app_server_supervisor_factory_builder=build_app_server_supervisor_factory,
+        backend_orchestrator_builder=build_backend_orchestrator,
+    )
+    base = supervisor.create_repo("base")
+    _init_git_repo(base.path)
+
+    app = create_hub_app(hub_root)
+    client = TestClient(app)
+
+    preview = client.get("/hub/cleanup-all/preview")
+    assert preview.status_code == 200
+    body = preview.json()
+    assert body["status"] == "ok"
+    assert body["dry_run"] is True
+    assert body["threads"]["archived_count"] == 0
+    assert body["worktrees"]["archived_count"] == 0
+    assert body["flow_runs"]["archived_count"] == 0
+    assert body["message"] == "Nothing to clean up"
+
+    submissions: list[dict[str, object]] = []
+
+    async def _fake_submit(kind: str, func, *, request_id: Optional[str] = None):
+        result = await func()
+        submissions.append({"kind": kind, "request_id": request_id, "result": result})
+
+        class _Job:
+            def to_dict(self) -> dict[str, object]:
+                return {
+                    "job_id": f"job-{len(submissions)}",
+                    "kind": kind,
+                    "status": "succeeded",
+                    "created_at": "2026-03-08T00:00:00Z",
+                    "started_at": "2026-03-08T00:00:00Z",
+                    "finished_at": "2026-03-08T00:00:01Z",
+                    "result": result if isinstance(result, dict) else None,
+                    "error": None,
+                }
+
+        return _Job()
+
+    monkeypatch.setattr(app.state.job_manager, "submit", _fake_submit)
+
+    job_resp = client.post("/hub/jobs/cleanup-all")
+    assert job_resp.status_code == 200
+    assert job_resp.json()["kind"] == "hub.cleanup_all"
+    assert submissions[0]["kind"] == "hub.cleanup_all"
+    job_result = submissions[0]["result"]
+    assert isinstance(job_result, dict)
+    assert job_result.get("dry_run") is False
+    assert job_result.get("status") == "ok"
+
+
 @pytest.mark.slow
 def test_hub_pin_parent_repo_rejects_worktree(tmp_path: Path):
     hub_root = tmp_path / "hub"

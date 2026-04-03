@@ -1417,7 +1417,7 @@ main {
 }
 
 /* Matches button:disabled look but keeps clicks (handler shows a toast). */
-button#hub-cleanup-all-threads.hub-cleanup-all--empty {
+button#hub-cleanup-all.hub-cleanup-all--empty {
   opacity: 0.4;
   cursor: not-allowed;
 }

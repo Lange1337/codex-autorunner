@@ -11,7 +11,7 @@ const dom = new JSDOM(
             <button id="hub-repo-panel-summary" aria-controls="hub-repo-list" aria-expanded="true"></button>
             <span id="hub-repo-panel-state"></span>
             <div class="hub-repo-controls">
-              <button id="hub-cleanup-all-threads" type="button"></button>
+              <button id="hub-cleanup-all" type="button"></button>
             </div>
           </div>
         </div>
@@ -199,8 +199,8 @@ test("base repo cards show archive action and cleanup-all summary", () => {
   assert.match(text, /Archive/);
   assert.doesNotMatch(text, /Cleanup threads/);
   const cleanupAllText =
-    document.getElementById("hub-cleanup-all-threads")?.textContent || "";
-  assert.match(cleanupAllText, /Cleanup all \(2\)/);
+    document.getElementById("hub-cleanup-all")?.textContent || "";
+  assert.equal(cleanupAllText.trim(), "Cleanup all");
 });
 
 test("repo cards hide duplicate chat-bound pma thread labels", () => {

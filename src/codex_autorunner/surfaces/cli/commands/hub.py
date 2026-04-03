@@ -1078,6 +1078,32 @@ def register_hub_commands(
                 f"- {snap.id}: {snap.status.value}, initialized={snap.initialized}, exists={snap.exists_on_disk}, recommended={hint}"
             )
 
+    @hub_app.command("cleanup")
+    def hub_cleanup(
+        dry_run: bool = typer.Option(
+            False, "--dry-run", help="Preview only, don't archive anything"
+        ),
+        path: Optional[Path] = typer.Option(
+            None, "--path", "--hub", help="Hub root path"
+        ),
+        output_json: bool = typer.Option(
+            True, "--json/--no-json", help="Emit JSON output (default: true)"
+        ),
+        pretty: bool = typer.Option(False, "--pretty", help="Pretty-print JSON output"),
+    ):
+        """Clean slate: archive unbound threads, eligible worktrees, and completed flow runs."""
+        config = require_hub_config(path)
+        supervisor = build_supervisor(config)
+        try:
+            result = supervisor.cleanup_all(dry_run=dry_run)
+        except Exception as exc:
+            raise_exit(str(exc), cause=exc)
+        if output_json:
+            indent = 2 if pretty else None
+            typer.echo(json.dumps(result, indent=indent, default=str))
+        else:
+            typer.echo(str(result.get("message", "Done")))
+
     @hub_app.command("snapshot")
     def hub_snapshot(
         path: Optional[Path] = typer.Option(None, "--path", help="Hub root path"),

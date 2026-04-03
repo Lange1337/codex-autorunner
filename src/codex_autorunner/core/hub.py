@@ -37,7 +37,14 @@ from .archive import (
 )
 from .archive_retention import resolve_worktree_archive_retention_policy
 from .chat_bindings import repo_has_active_non_pma_chat_binding
-from .config import HubConfig, RepoConfig, derive_repo_config, load_hub_config
+from .config import (
+    ConfigError,
+    HubConfig,
+    RepoConfig,
+    derive_repo_config,
+    load_hub_config,
+    load_repo_config,
+)
 from .destinations import (
     DockerDestination,
     default_car_docker_container_name,
@@ -45,6 +52,7 @@ from .destinations import (
     resolve_effective_agent_workspace_destination,
     resolve_effective_repo_destination,
 )
+from .flows import FlowRunStatus, FlowStore, archive_flow_run_artifacts
 from .force_attestation import enforce_force_attestation
 from .git_utils import (
     GitError,
@@ -2142,6 +2150,166 @@ class HubSupervisor:
             "dirty_repo_ids": dirty_repo_ids,
             "dirty_repo_count": len(dirty_repo_ids),
             "results": results,
+            "message": message,
+        }
+
+    def cleanup_all(self, *, dry_run: bool = False) -> Dict[str, object]:
+        manifest = load_manifest(self.hub_config.manifest_path, self.hub_config.root)
+        unbound_threads_by_repo = self._collect_unbound_repo_threads(manifest=manifest)
+
+        threads_by_repo: list[dict[str, object]] = []
+        total_thread_count = 0
+        for repo_id, thread_ids in sorted(unbound_threads_by_repo.items()):
+            count = len(thread_ids)
+            if count == 0:
+                continue
+            total_thread_count += count
+            threads_by_repo.append({"repo_id": repo_id, "count": count})
+
+        if not dry_run:
+            for repo_id in self._base_repo_paths(manifest).keys():
+                self._archive_unbound_repo_threads(
+                    repo_id=repo_id,
+                    unbound_threads_by_repo=unbound_threads_by_repo,
+                )
+
+        worktree_items: list[dict[str, str]] = []
+        worktree_errors: list[dict[str, str]] = []
+        for entry in manifest.repos:
+            if entry.kind != "worktree":
+                continue
+            if not entry.worktree_of:
+                continue
+            try:
+                if self._has_active_chat_binding(entry.id):
+                    continue
+            except Exception as exc:
+                logger.warning(
+                    "cleanup_all: chat binding check failed for %s",
+                    entry.id,
+                    exc_info=exc,
+                )
+                continue
+            worktree_path = (self.hub_config.root / entry.path).resolve()
+            if not worktree_path.exists():
+                continue
+            if git_available(worktree_path):
+                try:
+                    if not git_is_clean(worktree_path):
+                        continue
+                except Exception:
+                    continue
+            branch_name = entry.branch or git_branch(worktree_path) or "unknown"
+            if dry_run:
+                worktree_items.append({"id": entry.id, "branch": branch_name})
+                continue
+            try:
+                self.cleanup_worktree(
+                    worktree_repo_id=entry.id,
+                    archive=True,
+                )
+                worktree_items.append({"id": entry.id, "branch": branch_name})
+            except Exception as exc:
+                logger.warning(
+                    "cleanup_all: worktree cleanup failed for %s",
+                    entry.id,
+                    exc_info=exc,
+                )
+                worktree_errors.append({"id": entry.id, "error": str(exc)})
+
+        flow_by_repo: list[dict[str, object]] = []
+        total_flow_count = 0
+        for entry in manifest.repos:
+            repo_root = (self.hub_config.root / entry.path).resolve()
+            db_path = repo_root / ".codex-autorunner" / "flows.db"
+            if not db_path.exists():
+                continue
+            try:
+                repo_config = load_repo_config(repo_root)
+                durable = bool(getattr(repo_config, "durable_writes", False))
+            except ConfigError:
+                durable = False
+            store = FlowStore(db_path, durable=durable)
+            records: list[Any] = []
+            try:
+                store.initialize()
+                records = list(store.list_flow_runs(flow_type="ticket_flow"))
+            except Exception as exc:
+                logger.warning(
+                    "cleanup_all: flow store failed for %s",
+                    entry.id,
+                    exc_info=exc,
+                )
+                continue
+            finally:
+                store.close()
+            completed = [r for r in records if r.status == FlowRunStatus.COMPLETED]
+            if not completed:
+                continue
+            if dry_run:
+                n = len(completed)
+                flow_by_repo.append({"repo_id": entry.id, "count": n})
+                total_flow_count += n
+                continue
+            archived_here = 0
+            for record in completed:
+                try:
+                    archive_flow_run_artifacts(
+                        repo_root,
+                        run_id=record.id,
+                        force=False,
+                        delete_run=True,
+                    )
+                    archived_here += 1
+                except Exception as exc:
+                    logger.warning(
+                        "cleanup_all: archive flow run failed repo=%s run=%s",
+                        entry.id,
+                        record.id,
+                        exc_info=exc,
+                    )
+            if archived_here:
+                flow_by_repo.append({"repo_id": entry.id, "count": archived_here})
+            total_flow_count += archived_here
+
+        if not dry_run and (
+            total_thread_count or len(worktree_items) or total_flow_count
+        ):
+            self._invalidate_list_cache()
+
+        if dry_run:
+            if total_thread_count or len(worktree_items) or total_flow_count:
+                message = (
+                    f"Would archive {total_thread_count} threads, "
+                    f"{len(worktree_items)} worktrees, {total_flow_count} flow runs"
+                )
+            else:
+                message = "Nothing to clean up"
+        else:
+            if total_thread_count or len(worktree_items) or total_flow_count:
+                message = (
+                    f"Archived {total_thread_count} threads, "
+                    f"{len(worktree_items)} worktrees, {total_flow_count} flow runs"
+                )
+            else:
+                message = "Nothing to clean up"
+
+        return {
+            "status": "ok",
+            "dry_run": dry_run,
+            "threads": {
+                "archived_count": total_thread_count,
+                "by_repo": threads_by_repo,
+            },
+            "worktrees": {
+                "archived_count": len(worktree_items),
+                "items": worktree_items,
+                "errors": worktree_errors,
+            },
+            "flow_runs": {
+                "archived_count": total_flow_count,
+                "by_repo": flow_by_repo,
+            },
             "message": message,
         }
 

@@ -1086,6 +1086,33 @@ def build_hub_repo_routes(
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @router.get("/hub/cleanup-all/preview")
+    async def cleanup_all_preview():
+        try:
+            result = await asyncio.to_thread(
+                context.supervisor.cleanup_all,
+                dry_run=True,
+            )
+            return result
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @router.post("/hub/jobs/cleanup-all", response_model=HubJobResponse)
+    async def cleanup_all_job():
+        from ....core.request_context import get_request_id
+
+        async def _run_cleanup_all():
+            result = await asyncio.to_thread(context.supervisor.cleanup_all)
+            enricher.invalidate_runtime_caches()
+            return result
+
+        job = await context.job_manager.submit(
+            "hub.cleanup_all",
+            _run_cleanup_all,
+            request_id=get_request_id(),
+        )
+        return job.to_dict()
+
     @router.post("/hub/repos/{repo_id}/run")
     async def run_repo(repo_id: str, payload: Optional[RunControlRequest] = None):
         once = payload.once if payload else False
