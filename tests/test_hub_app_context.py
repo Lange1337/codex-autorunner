@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import sys
 import threading
@@ -13,6 +14,7 @@ from codex_autorunner.core.app_server_command import GLOBAL_APP_SERVER_COMMAND_E
 from codex_autorunner.core.config import CONFIG_FILENAME
 from codex_autorunner.core.hub_diagnostics import (
     hub_clean_shutdown_path,
+    hub_endpoint_path,
     hub_pid_path,
 )
 from codex_autorunner.integrations.app_server.event_buffer import AppServerEventBuffer
@@ -108,6 +110,48 @@ def test_hub_lifespan_records_pid_and_clean_shutdown(hub_env, monkeypatch) -> No
 
     assert clean_shutdown_path.exists()
     assert clean_shutdown_path.read_text(encoding="utf-8").strip()
+
+
+def test_hub_lifespan_writes_and_cleans_endpoint_file(hub_env, monkeypatch) -> None:
+    _stub_opencode_supervisor(monkeypatch)
+    app = create_hub_app(
+        hub_env.hub_root,
+        base_path="/car",
+        endpoint_host="127.0.0.1",
+        endpoint_port=4517,
+    )
+    endpoint_path = hub_endpoint_path(hub_env.hub_root)
+
+    with TestClient(app):
+        assert endpoint_path.exists()
+        assert endpoint_path.read_text(encoding="utf-8").strip()
+
+    assert endpoint_path.exists() is False
+
+
+def test_hub_lifespan_clears_stale_endpoint_without_bind_metadata(
+    hub_env, monkeypatch
+) -> None:
+    _stub_opencode_supervisor(monkeypatch)
+    endpoint_path = hub_endpoint_path(hub_env.hub_root)
+    endpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    endpoint_path.write_text(
+        json.dumps(
+            {
+                "url": "http://127.0.0.1:4517/car",
+                "host": "127.0.0.1",
+                "port": 4517,
+                "base_path": "/car",
+            }
+        ),
+        encoding="utf-8",
+    )
+    app = create_hub_app(hub_env.hub_root)
+
+    with TestClient(app):
+        assert endpoint_path.exists() is False
+
+    assert endpoint_path.exists() is False
 
 
 @pytest.mark.asyncio
