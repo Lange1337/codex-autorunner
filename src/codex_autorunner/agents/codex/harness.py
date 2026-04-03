@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Optional, cast
+from typing import Any, AsyncIterator, Optional
 
 from ...integrations.app_server.client import (
     CodexAppServerResponseError,
@@ -298,22 +298,36 @@ class CodexHarness(AgentHarness):
         client = await self._supervisor.get_client(workspace_root)
         await client.turn_interrupt(turn_id, thread_id=conversation_id)
 
-    def stream_events(
+    async def stream_events(
         self, workspace_root: Path, conversation_id: str, turn_id: str
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[dict[str, Any]]:
         _ = workspace_root
-        stream = cast(
-            Optional[Callable[[str, str], AsyncIterator[str]]],
-            getattr(self._events, "stream", None),
+        stream_entries = getattr(self._events, "stream_entries", None)
+        if not callable(stream_entries):
+            logger.warning(
+                "stream_events: stream_entries not callable on event buffer; "
+                "conversation_id=%r turn_id=%r",
+                conversation_id,
+                turn_id,
+            )
+            return
+        async for entry in stream_entries(conversation_id, turn_id):
+            if entry is not None:
+                yield entry
+
+    async def list_progress_events(
+        self,
+        conversation_id: str,
+        turn_id: str,
+        *,
+        after_id: int = 0,
+        limit: Optional[int] = None,
+        **kwargs: Any,
+    ) -> list[dict[str, Any]]:
+        _ = kwargs
+        return await self._events.list_events(
+            conversation_id, turn_id, after_id=after_id, limit=limit
         )
-        if callable(stream):
-            return stream(conversation_id, turn_id)
-
-        async def _empty_stream() -> AsyncIterator[str]:
-            if False:
-                yield ""
-
-        return _empty_stream()
 
     async def wait_for_turn(
         self,

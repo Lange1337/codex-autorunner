@@ -14,7 +14,7 @@ import httpx
 from ...core.logging_utils import log_event
 from ...core.orchestration.interfaces import FreshConversationRequiredError
 from ...core.orchestration.stream_text_merge import merge_assistant_stream_text
-from ...core.sse import format_sse, parse_sse_lines
+from ...core.orchestration.turn_event_buffer import TurnEventBuffer
 from ...integrations.chat.agents import DEFAULT_CHAT_AGENT_MODELS
 from ..base import AgentHarness
 from ..types import (
@@ -61,10 +61,7 @@ class _PendingTurnConfig:
     prompt: Optional[str] = None
     reserved_workspace_root: Optional[Path] = None
     command_task: Optional[asyncio.Task[Any]] = None
-    progress_event_subscribers: list[asyncio.Queue[Optional[dict[str, Any]]]] = field(
-        default_factory=list
-    )
-    progress_event_history: list[dict[str, Any]] = field(default_factory=list)
+    event_buffer: TurnEventBuffer = field(default_factory=TurnEventBuffer)
     pre_connected_event_queue: Optional[asyncio.Queue[Any]] = None
     pre_connected_stream_task: Optional[asyncio.Task[None]] = None
     pre_connected_queue_exhausted: bool = False
@@ -602,50 +599,38 @@ class OpenCodeHarness(AgentHarness):
     )
 
     def allows_parallel_event_stream(self) -> bool:
-        # wait_for_turn() consumes the OpenCode event stream to collect output.
-        return False
+        return True
 
-    def progress_event_stream(
-        self, workspace_root: Path, conversation_id: str, turn_id: str
-    ) -> AsyncIterator[Any]:
-        pending = self._pending_turns.get((conversation_id, turn_id or ""))
-        if pending is None:
-            _ = workspace_root, conversation_id, turn_id
-
-            async def _empty() -> AsyncIterator[Any]:
-                if False:
-                    yield None
-
-            return _empty()
-
-        queue: asyncio.Queue[Optional[dict[str, Any]]] = asyncio.Queue()
-        for item in pending.progress_event_history:
-            queue.put_nowait(item)
-        pending.progress_event_subscribers.append(queue)
-
-        async def _stream() -> AsyncIterator[Any]:
-            try:
-                while True:
-                    item = await queue.get()
-                    if item is None:
-                        break
-                    yield item
-            finally:
-                try:
-                    pending.progress_event_subscribers.remove(queue)
-                except ValueError:
-                    pass
-
-        return _stream()
-
-    def list_progress_events(
-        self, conversation_id: str, turn_id: str
+    async def list_progress_events(
+        self, conversation_id: str, turn_id: str, **kwargs: Any
     ) -> list[dict[str, Any]]:
         """Return buffered progress events for a pending turn (snapshot-friendly)."""
+        _ = kwargs
         pending = self._pending_turns.get((conversation_id, turn_id or ""))
         if pending is None:
+            for key, candidate in self._pending_turns.items():
+                if key[0] == conversation_id:
+                    _logger.warning(
+                        "list_progress_events: turn_id mismatch for conversation_id=%r; "
+                        "requested=%r actual=%r — using fallback",
+                        conversation_id,
+                        turn_id,
+                        key[1],
+                    )
+                    pending = candidate
+                    break
+        if pending is None:
+            sample_keys = list(self._pending_turns.keys())[:5]
+            _logger.warning(
+                "list_progress_events: no pending turn for conversation_id=%r turn_id=%r; "
+                "known_keys_count=%d sample_keys=%r",
+                conversation_id,
+                turn_id,
+                len(self._pending_turns),
+                sample_keys,
+            )
             return []
-        return list(pending.progress_event_history)
+        return pending.event_buffer.snapshot()
 
     def __init__(self, supervisor: OpenCodeHarnessSupervisorProtocol) -> None:
         self._supervisor = supervisor
@@ -956,9 +941,11 @@ class OpenCodeHarness(AgentHarness):
                 "Failed to abort OpenCode session %s: %s", conversation_id, exc
             )
 
-    async def stream_events(
+    async def _stream_opencode_sse_wrapped_payloads(
         self, workspace_root: Path, conversation_id: str, turn_id: str
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Live SSE for wait_for_turn when no in-memory pending turn exists."""
+        _ = turn_id
         client = await self._supervisor.get_client(workspace_root)
         async for event in client.stream_events(
             directory=str(workspace_root),
@@ -991,7 +978,38 @@ class OpenCodeHarness(AgentHarness):
             if session_id and session_id != conversation_id:
                 continue
             wrapped = {"message": {"method": event.event, "params": parsed}}
-            yield format_sse("app-server", wrapped)
+            yield wrapped
+
+    async def stream_events(
+        self, workspace_root: Path, conversation_id: str, turn_id: str
+    ) -> AsyncIterator[dict[str, Any]]:
+        _ = workspace_root
+        pending = self._pending_turns.get((conversation_id, turn_id or ""))
+        if pending is None:
+            for key, candidate in self._pending_turns.items():
+                if key[0] == conversation_id:
+                    _logger.warning(
+                        "stream_events: turn_id mismatch for conversation_id=%r; "
+                        "requested=%r actual=%r — using fallback",
+                        conversation_id,
+                        turn_id,
+                        key[1],
+                    )
+                    pending = candidate
+                    break
+        if pending is None:
+            sample_keys = list(self._pending_turns.keys())[:5]
+            _logger.warning(
+                "stream_events: no pending turn for conversation_id=%r turn_id=%r; "
+                "known_keys_count=%d sample_keys=%r",
+                conversation_id,
+                turn_id,
+                len(self._pending_turns),
+                sample_keys,
+            )
+            return
+        async for event in pending.event_buffer.tail():
+            yield event
 
     async def wait_for_turn(
         self,
@@ -1010,28 +1028,14 @@ class OpenCodeHarness(AgentHarness):
                 payloads: list[dict[str, Any]] = []
                 stream_error: Optional[Exception] = None
 
-                async def _iter_lines(raw_event_text: str) -> AsyncIterator[str]:
-                    for line in raw_event_text.splitlines():
-                        yield line
-                    yield ""
-
                 try:
-                    async for raw_event in self.stream_events(
+                    async for payload in self._stream_opencode_sse_wrapped_payloads(
                         workspace_root,
                         conversation_id,
                         turn_id or "",
                     ):
-                        async for sse_event in parse_sse_lines(
-                            _iter_lines(str(raw_event))
-                        ):
-                            try:
-                                payload = (
-                                    json.loads(sse_event.data) if sse_event.data else {}
-                                )
-                            except json.JSONDecodeError:
-                                payload = {}
-                            if isinstance(payload, dict):
-                                payloads.append(payload)
+                        if isinstance(payload, dict):
+                            payloads.append(payload)
                 except Exception as exc:
                     stream_error = exc
 
@@ -1049,20 +1053,15 @@ class OpenCodeHarness(AgentHarness):
 
             raw_events: list[dict[str, Any]] = []
 
-            def _publish_progress_event(raw_event: dict[str, Any]) -> None:
+            async def _publish_progress_event(raw_event: dict[str, Any]) -> None:
                 if not raw_event:
                     return
-                pending.progress_event_history.append(raw_event)
-                if len(pending.progress_event_history) > 64:
-                    del pending.progress_event_history[:-64]
-                for queue in list(pending.progress_event_subscribers):
-                    queue.put_nowait(raw_event)
+                await pending.event_buffer.append(raw_event)
 
-            def _close_progress_streams() -> None:
-                for queue in list(pending.progress_event_subscribers):
-                    queue.put_nowait(None)
+            async def _close_progress_streams() -> None:
+                await pending.event_buffer.close()
 
-            def _process_stream_event(event: Any) -> None:
+            async def _process_stream_event(event: Any) -> None:
                 payload = event.data
                 try:
                     parsed = json.loads(payload) if payload else {}
@@ -1089,11 +1088,11 @@ class OpenCodeHarness(AgentHarness):
                     if (
                         event_session_id == conversation_id or not event_session_id
                     ) and not is_idle:
-                        _publish_progress_event(wrapped)
+                        await _publish_progress_event(wrapped)
                     elif not is_idle:
                         log_event(
                             _logger,
-                            logging.DEBUG,
+                            logging.INFO,
                             "opencode.progress_event.skipped",
                             method=event.event,
                             conversation_id=conversation_id,
@@ -1118,17 +1117,17 @@ class OpenCodeHarness(AgentHarness):
                             if event is None:
                                 pending.pre_connected_queue_exhausted = True
                                 break
-                            _process_stream_event(event)
+                            await _process_stream_event(event)
                             yield event
                     if pre_queue is None or pending.pre_connected_queue_exhausted:
                         async for event in client.stream_events(
                             directory=str(workspace_root),
                             session_id=conversation_id,
                         ):
-                            _process_stream_event(event)
+                            await _process_stream_event(event)
                             yield event
                 finally:
-                    _close_progress_streams()
+                    await _close_progress_streams()
 
             async def _fetch_session() -> Any:
                 statuses = await client.session_status(directory=str(workspace_root))

@@ -13,7 +13,6 @@ from fastapi.responses import StreamingResponse
 from .....agents.base import (
     harness_allows_parallel_event_stream,
     harness_progress_event_stream,
-    harness_supports_progress_event_stream,
 )
 from .....agents.codex.harness import CodexHarness
 from .....agents.opencode.harness import OpenCodeHarness
@@ -725,9 +724,7 @@ async def _execute_harness_turn(
 
     streamed_raw_events: list[Any] = []
     stream_task: Optional[asyncio.Task[None]] = None
-    if harness_supports_progress_event_stream(
-        harness
-    ) and harness_allows_parallel_event_stream(harness):
+    if harness_allows_parallel_event_stream(harness):
 
         async def _collect_events() -> None:
             async for raw_event in harness_progress_event_stream(
@@ -1855,9 +1852,6 @@ def build_chat_runtime_router(
             async for raw_event in harness.stream_events(
                 request.app.state.config.root, thread_id, turn_id
             ):
-                if isinstance(raw_event, str):
-                    yield raw_event
-                    continue
                 payload = (
                     raw_event if isinstance(raw_event, dict) else {"value": raw_event}
                 )

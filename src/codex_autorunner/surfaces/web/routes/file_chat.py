@@ -585,8 +585,20 @@ def build_file_chat_routes() -> APIRouter:
 
             harness = OpenCodeHarness(supervisor)
             repo_root = _resolve_repo_root(request)
+
+            async def _stream_opencode() -> AsyncIterator[str]:
+                async for raw_event in harness.stream_events(
+                    repo_root, thread_id, turn_id
+                ):
+                    payload = (
+                        raw_event
+                        if isinstance(raw_event, dict)
+                        else {"value": raw_event}
+                    )
+                    yield format_sse("app-server", payload)
+
             return StreamingResponse(
-                harness.stream_events(repo_root, thread_id, turn_id),
+                _stream_opencode(),
                 media_type="text/event-stream",
                 headers=SSE_HEADERS,
             )

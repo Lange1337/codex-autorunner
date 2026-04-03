@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal, Optional
 
+from ..sse import format_sse
 from .models import ExecutionRecord, MessageRequest, ThreadTarget
 from .service import HarnessBackedOrchestrationService
 
@@ -142,7 +143,10 @@ async def stream_runtime_thread_events(
         backend_thread_id,
         backend_turn_id,
     ):
-        yield event
+        if isinstance(event, dict):
+            yield format_sse("app-server", event)
+        else:
+            yield format_sse("app-server", {"value": event})
 
 
 async def await_runtime_thread_outcome(

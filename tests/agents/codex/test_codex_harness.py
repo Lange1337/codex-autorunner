@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 from codex_autorunner.agents.codex.harness import CodexHarness
+from codex_autorunner.agents.codex.harness import logger as codex_harness_logger
 from codex_autorunner.agents.registry import get_registered_agents
 from codex_autorunner.integrations.app_server.client import (
     CodexAppServerResponseError,
@@ -27,6 +30,47 @@ class _Supervisor:
 
     async def get_client(self, _workspace_root: Path) -> object:
         return self._client
+
+
+class _EventsBuffer:
+    def __init__(self) -> None:
+        self.calls: list[tuple[Any, ...]] = []
+
+    async def list_events(
+        self,
+        thread_id: str,
+        turn_id: str,
+        *,
+        after_id: int = 0,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        self.calls.append((thread_id, turn_id, after_id, limit))
+        return [{"id": 1}]
+
+
+@pytest.mark.asyncio
+async def test_codex_harness_list_progress_events_delegates_to_events_buffer() -> None:
+    events = _EventsBuffer()
+    harness = CodexHarness(
+        supervisor=_Supervisor(object()),
+        events=events,  # type: ignore[arg-type]
+    )
+    got = await harness.list_progress_events("thread-a", "turn-b")
+    assert got == [{"id": 1}]
+    assert events.calls == [("thread-a", "turn-b", 0, None)]
+
+
+@pytest.mark.asyncio
+async def test_codex_harness_stream_events_warns_when_stream_entries_missing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    harness = CodexHarness(supervisor=_Supervisor(object()), events=object())  # type: ignore[arg-type]
+    with caplog.at_level(logging.WARNING, logger=codex_harness_logger.name):
+        events = [
+            e async for e in harness.stream_events(Path("."), "thread-a", "turn-b")
+        ]
+    assert events == []
+    assert any("stream_entries not callable" in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.asyncio

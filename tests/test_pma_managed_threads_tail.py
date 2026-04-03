@@ -314,7 +314,19 @@ def test_managed_thread_tail_snapshot_marks_opencode_stream_available(
     _enable_pma(hub_env.hub_root)
 
     class _OpenCodeHarnessEmptyStream:
-        def progress_event_stream(
+        def supports(self, capability: str) -> bool:
+            return capability == "event_streaming"
+
+        def allows_parallel_event_stream(self) -> bool:
+            return True
+
+        async def list_progress_events(
+            self, conversation_id: str, turn_id: str, **kwargs: Any
+        ) -> list[dict[str, Any]]:
+            _ = conversation_id, turn_id, kwargs
+            return []
+
+        def stream_events(
             self,
             workspace_root: Path,
             conversation_id: str,
@@ -436,7 +448,13 @@ def test_managed_thread_tail_events_reuses_active_harness_state(
         def __init__(self, events: list[dict[str, Any]]) -> None:
             self._events = list(events)
 
-        def progress_event_stream(
+        def supports(self, capability: str) -> bool:
+            return capability == "event_streaming"
+
+        def allows_parallel_event_stream(self) -> bool:
+            return True
+
+        def stream_events(
             self,
             workspace_root: Path,
             conversation_id: str,
@@ -504,7 +522,13 @@ def test_managed_thread_tail_snapshot_includes_opencode_list_progress_events(
         def __init__(self, events: list[dict[str, Any]]) -> None:
             self._events = list(events)
 
-        def progress_event_stream(
+        def supports(self, capability: str) -> bool:
+            return capability == "event_streaming"
+
+        def allows_parallel_event_stream(self) -> bool:
+            return True
+
+        def stream_events(
             self,
             workspace_root: Path,
             conversation_id: str,
@@ -518,10 +542,10 @@ def test_managed_thread_tail_snapshot_includes_opencode_list_progress_events(
 
             return _stream()
 
-        def list_progress_events(
-            self, conversation_id: str, turn_id: str
+        async def list_progress_events(
+            self, conversation_id: str, turn_id: str, **kwargs: Any
         ) -> list[dict[str, Any]]:
-            _ = conversation_id, turn_id
+            _ = conversation_id, turn_id, kwargs
             return list(self._events)
 
     harness = _OpenCodeHarnessWithListProgress(buffered_raw)
@@ -558,7 +582,19 @@ def test_managed_thread_tail_snapshot_stream_available_when_backend_binding_appe
     _enable_pma(hub_env.hub_root)
 
     class _OpenCodeHarnessEmptyStream:
-        def progress_event_stream(
+        def supports(self, capability: str) -> bool:
+            return capability == "event_streaming"
+
+        def allows_parallel_event_stream(self) -> bool:
+            return True
+
+        async def list_progress_events(
+            self, conversation_id: str, turn_id: str, **kwargs: Any
+        ) -> list[dict[str, Any]]:
+            _ = conversation_id, turn_id, kwargs
+            return []
+
+        def stream_events(
             self,
             workspace_root: Path,
             conversation_id: str,
@@ -865,6 +901,11 @@ def test_managed_thread_status_surfaces_zeroclaw_phase_and_last_tool(hub_env) ->
                 },
             ]
 
+        async def list_turn_events_by_turn_id(
+            self, turn_id: str
+        ) -> list[dict[str, Any]]:
+            return await self.list_turn_events(Path("."), "zeroclaw-session-1", turn_id)
+
     app.state.zeroclaw_supervisor = FakeZeroClawSupervisor()
 
     with TestClient(app) as client:
@@ -912,6 +953,11 @@ def test_managed_thread_status_degrades_when_zeroclaw_turn_buffer_is_missing(
         ) -> list[dict[str, str]]:
             _ = workspace_root, session_id, turn_id
             raise RuntimeError("missing in-memory turn buffer")
+
+        async def list_turn_events_by_turn_id(
+            self, turn_id: str
+        ) -> list[dict[str, Any]]:
+            return await self.list_turn_events(Path("."), "zeroclaw-session-1", turn_id)
 
     app.state.zeroclaw_supervisor = FakeZeroClawSupervisor()
 

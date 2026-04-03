@@ -633,6 +633,7 @@ async def test_orchestrated_turn_interrupt_send_acknowledges_when_progress_messa
             self._config = _config(tmp_path)
             self._store = _Store()
             self._rest = _FakeRest()
+            self._logger = logging.getLogger(__name__)
 
         async def _send_channel_message(
             self, channel_id: str, payload: dict[str, Any]
@@ -1025,7 +1026,6 @@ class _StreamingFakeHarness:
         wait_for_stream: bool = False,
         stream_exception: Optional[Exception] = None,
         allow_parallel_event_stream: bool = True,
-        allow_progress_event_stream: bool = True,
     ) -> None:
         self._events = events
         self._status = status
@@ -1034,7 +1034,6 @@ class _StreamingFakeHarness:
         self._wait_for_stream = wait_for_stream
         self._stream_exception = stream_exception
         self._allow_parallel_event_stream = allow_parallel_event_stream
-        self._allow_progress_event_stream = allow_progress_event_stream
         self._stream_done = asyncio.Event()
 
     async def ensure_ready(self, workspace_root: Path) -> None:
@@ -1045,19 +1044,6 @@ class _StreamingFakeHarness:
 
     def allows_parallel_event_stream(self) -> bool:
         return self._allow_parallel_event_stream
-
-    def progress_event_stream(
-        self, workspace_root: Path, conversation_id: str, turn_id: str
-    ):
-        if not self._allow_progress_event_stream:
-
-            async def _unsupported():
-                if False:
-                    yield None
-                raise RuntimeError("progress event streaming disabled")
-
-            return _unsupported()
-        return self.stream_events(workspace_root, conversation_id, turn_id)
 
     async def new_conversation(
         self, workspace_root: Path, title: Optional[str] = None
@@ -1155,7 +1141,6 @@ def _patch_streaming_harness(
     wait_for_stream: bool = False,
     stream_exception: Optional[Exception] = None,
     allow_parallel_event_stream: bool = True,
-    allow_progress_event_stream: bool = True,
 ) -> _StreamingFakeHarness:
     harness = _StreamingFakeHarness(
         events,
@@ -1165,7 +1150,6 @@ def _patch_streaming_harness(
         wait_for_stream=wait_for_stream,
         stream_exception=stream_exception,
         allow_parallel_event_stream=allow_parallel_event_stream,
-        allow_progress_event_stream=allow_progress_event_stream,
     )
     monkeypatch.setattr(
         discord_message_turns_module,
@@ -3556,7 +3540,7 @@ async def test_message_create_streaming_turn_surfaces_fast_transient_thinking_an
 
 
 @pytest.mark.anyio
-async def test_message_create_streaming_turn_uses_safe_progress_stream_when_parallel_streaming_is_disabled(
+async def test_message_create_streaming_turn_skips_live_progress_when_parallel_streaming_is_disabled(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3591,9 +3575,8 @@ async def test_message_create_streaming_turn_uses_safe_progress_stream_when_para
             ),
         ],
         assistant_text="done from streaming turn",
-        wait_for_stream=True,
+        wait_for_stream=False,
         allow_parallel_event_stream=False,
-        allow_progress_event_stream=True,
     )
 
     try:

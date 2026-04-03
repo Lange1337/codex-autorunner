@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -16,6 +17,7 @@ class _StubSupervisor:
         self.started: list[tuple[Path, str, str, str | None]] = []
         self.waited: list[tuple[Path, str, str, float | None]] = []
         self.streamed: list[tuple[Path, str, str]] = []
+        self.list_by_turn_calls: list[str] = []
 
     async def create_session(
         self, workspace_root: Path, *, title: str | None = None
@@ -63,7 +65,22 @@ class _StubSupervisor:
         turn_id: str,
     ):
         self.streamed.append((workspace_root, session_id, turn_id))
-        yield 'event: zeroclaw\ndata: {"message":{"method":"message.delta","params":{"text":"hi"}}}\n\n'
+        yield {
+            "message": {"method": "message.delta", "params": {"text": "hi"}},
+        }
+
+    async def list_turn_events_by_turn_id(self, turn_id: str) -> list[dict[str, Any]]:
+        self.list_by_turn_calls.append(turn_id)
+        return [{"raw_event": "{}", "published_at": "1"}]
+
+
+@pytest.mark.asyncio
+async def test_zeroclaw_harness_list_progress_events_delegates_by_turn_id() -> None:
+    supervisor = _StubSupervisor()
+    harness = ZeroClawHarness(supervisor)
+    got = await harness.list_progress_events("zc-session-1", "zc-turn-9")
+    assert got == [{"raw_event": "{}", "published_at": "1"}]
+    assert supervisor.list_by_turn_calls == ["zc-turn-9"]
 
 
 @pytest.mark.asyncio
@@ -136,4 +153,4 @@ async def test_zeroclaw_harness_lists_conversations_and_streams_events() -> None
         "zc-session-2",
     ]
     assert len(events) == 1
-    assert "message.delta" in events[0]
+    assert events[0]["message"]["method"] == "message.delta"

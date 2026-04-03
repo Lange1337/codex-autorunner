@@ -103,13 +103,19 @@ class ZeroClawHarness(AgentHarness):
 
     async def stream_events(
         self, workspace_root: Path, conversation_id: str, turn_id: str
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[dict[str, Any]]:
         async for event in self._supervisor.stream_turn_events(
             workspace_root,
             conversation_id,
             turn_id,
         ):
             yield event
+
+    async def list_progress_events(
+        self, conversation_id: str, turn_id: str, **kwargs: Any
+    ) -> list[dict[str, Any]]:
+        _ = conversation_id, kwargs
+        return await self._supervisor.list_turn_events_by_turn_id(turn_id)
 
 
 __all__ = ["ZEROCLAW_CAPABILITIES", "ZeroClawHarness"]
