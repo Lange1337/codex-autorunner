@@ -12895,11 +12895,18 @@ class DiscordBotService:
                 )
                 interaction_text = "Compaction generated a summary, but starting a fresh thread failed."
                 return
+            compact_pending_session_key = self._build_message_session_key(
+                channel_id=channel_id,
+                workspace_root=workspace_root,
+                pma_enabled=pma_enabled,
+                agent=agent,
+                agent_profile=agent_profile,
+            )
             try:
                 await self._store.set_pending_compact_seed(
                     channel_id=channel_id,
                     seed_text=build_compact_seed_prompt(response_text),
-                    session_key=next_thread_id,
+                    session_key=compact_pending_session_key,
                 )
             except Exception as exc:
                 log_event(

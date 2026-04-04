@@ -1298,26 +1298,35 @@ async def _run_telegram_managed_thread_turn(
         input_items,
     )
     pending_seed = None
-    if not pma_enabled:
-        active_target_id = (
-            str(thread.backend_thread_id or "").strip() or current_backend_thread_id
-        )
+    compact_active_candidates: list[str] = []
+    backend_from_thread = str(thread.backend_thread_id or "").strip()
+    if backend_from_thread:
+        compact_active_candidates.append(backend_from_thread)
+    if current_backend_thread_id:
+        compact_active_candidates.append(current_backend_thread_id)
+    if pma_enabled and isinstance(getattr(record, "active_thread_id", None), str):
+        rid = str(record.active_thread_id).strip()
+        if rid:
+            compact_active_candidates.append(rid)
+    for candidate_id in dict.fromkeys(compact_active_candidates):
         pending_seed = match_pending_compact_seed(
             record.pending_compact_seed,
             pending_target_id=record.pending_compact_seed_thread_id,
-            active_target_id=active_target_id,
+            active_target_id=candidate_id,
         )
         if pending_seed:
-            if execution_input_items is None:
-                execution_input_items = [
-                    {"type": "text", "text": pending_seed},
-                    {"type": "text", "text": execution_prompt},
-                ]
-            else:
-                execution_input_items = [
-                    {"type": "text", "text": pending_seed},
-                    *execution_input_items,
-                ]
+            break
+    if pending_seed:
+        if execution_input_items is None:
+            execution_input_items = [
+                {"type": "text", "text": pending_seed},
+                {"type": "text", "text": execution_prompt},
+            ]
+        else:
+            execution_input_items = [
+                {"type": "text", "text": pending_seed},
+                *execution_input_items,
+            ]
     try:
         started_execution = await begin_runtime_thread_execution(
             orchestration_service,
@@ -1367,7 +1376,7 @@ async def _run_telegram_managed_thread_turn(
             str(getattr(started_execution.thread, "backend_thread_id", "") or "")
             or None,
         )
-    if pending_seed and not pma_enabled:
+    if pending_seed:
         await handlers._router.update_topic(
             message.chat_id,
             message.thread_id,

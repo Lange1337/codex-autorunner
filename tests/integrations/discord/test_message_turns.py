@@ -1800,8 +1800,13 @@ async def test_car_session_compact_finishes_interaction_when_finalize_fails(
         binding = await store.get_binding(channel_id="channel-1")
         assert binding is not None
         assert "summary text" in binding["pending_compact_seed"]
-        assert binding["pending_compact_session_key"]
-        assert binding["pending_compact_session_key"] != current_thread.thread_target_id
+        expected_compact_key = service._build_message_session_key(
+            channel_id="channel-1",
+            workspace_root=workspace.resolve(),
+            pma_enabled=False,
+            agent="codex",
+        )
+        assert binding["pending_compact_session_key"] == expected_compact_key
     finally:
         await store.close()
 
@@ -8431,8 +8436,13 @@ async def test_car_session_compact_reuses_preview_without_part_numbering(
         assert binding is not None
         assert "Context from previous conversation:" in binding["pending_compact_seed"]
         assert summary in binding["pending_compact_seed"]
-        assert binding["pending_compact_session_key"]
-        assert binding["pending_compact_session_key"] != current_thread.thread_target_id
+        expected_compact_key = service._build_message_session_key(
+            channel_id="channel-1",
+            workspace_root=workspace.resolve(),
+            pma_enabled=False,
+            agent="codex",
+        )
+        assert binding["pending_compact_session_key"] == expected_compact_key
         archived_thread = orchestration_service.get_thread_target(
             current_thread.thread_target_id
         )
@@ -8602,8 +8612,13 @@ async def test_car_session_compact_places_continue_button_on_last_chunk_without_
         assert binding is not None
         assert "Context from previous conversation:" in binding["pending_compact_seed"]
         assert summary in binding["pending_compact_seed"]
-        assert binding["pending_compact_session_key"]
-        assert binding["pending_compact_session_key"] != current_thread.thread_target_id
+        expected_compact_key = service._build_message_session_key(
+            channel_id="channel-1",
+            workspace_root=workspace.resolve(),
+            pma_enabled=False,
+            agent="codex",
+        )
+        assert binding["pending_compact_session_key"] == expected_compact_key
         archived_thread = orchestration_service.get_thread_target(
             current_thread.thread_target_id
         )
