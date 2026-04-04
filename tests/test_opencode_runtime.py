@@ -1160,9 +1160,12 @@ async def test_collect_output_uses_stall_timeout_after_first_relevant_event(
     async def _event_then_hang():
         if not state["sent_first_event"]:
             state["sent_first_event"] = True
+            # Busy session.status is not a progress signal (see
+            # opencode_event_is_progress_signal); use a content event so stall
+            # timeout applies after the stream goes quiet.
             yield SSEEvent(
-                event="session.status",
-                data='{"sessionID":"s1","status":{"type":"busy"}}',
+                event="message.updated",
+                data='{"sessionID":"s1","info":{"id":"m1","role":"assistant"}}',
             )
         while True:
             await asyncio.sleep(3600)

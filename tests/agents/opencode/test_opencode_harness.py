@@ -633,6 +633,120 @@ async def test_opencode_harness_polls_messages_for_rich_progress_when_sse_is_sil
 
 
 @pytest.mark.asyncio
+async def test_opencode_harness_polls_messages_when_preconnected_stream_only_has_keepalives_and_busy(
+    monkeypatch,
+) -> None:
+    workspace = Path("/tmp/workspace").resolve()
+    client = _StubClient(
+        [
+            SSEEvent(event="server.connected", data='{"type":"server.connected"}'),
+            SSEEvent(
+                event="session.status",
+                data='{"sessionID":"session-1","properties":{"status":{"type":"busy"}}}',
+            ),
+        ]
+    )
+    release_prompt = asyncio.Event()
+
+    async def _prompt_async(session_id: str, **kwargs: object) -> dict[str, object]:
+        _ = kwargs
+        await release_prompt.wait()
+        return {
+            "info": {"id": "backend-turn-1"},
+            "sessionID": session_id,
+            "parts": [{"type": "text", "text": "Agent reply"}],
+        }
+
+    message_snapshots = [
+        {
+            "data": [
+                {
+                    "info": {"id": "assistant-1", "role": "assistant"},
+                    "parts": [
+                        {
+                            "id": "reason-1",
+                            "type": "reasoning",
+                            "messageID": "assistant-1",
+                            "sessionID": "session-1",
+                            "text": "Checking stream fallbacks",
+                        },
+                        {
+                            "id": "tool-1",
+                            "type": "tool",
+                            "messageID": "assistant-1",
+                            "sessionID": "session-1",
+                            "tool": "shell",
+                            "input": "rg stream_events",
+                            "state": {"status": "running"},
+                        },
+                    ],
+                }
+            ]
+        }
+    ]
+    list_message_calls = 0
+
+    async def _list_messages(session_id: str, **_kwargs: Any) -> Any:
+        nonlocal list_message_calls
+        assert session_id == "session-1"
+        list_message_calls += 1
+        return message_snapshots[0]
+
+    client.prompt_async = _prompt_async  # type: ignore[method-assign]
+    client.list_messages = _list_messages  # type: ignore[method-assign]
+    harness = OpenCodeHarness(_StubSupervisor(client))
+    monkeypatch.setattr(harness_module, "_SILENT_TURN_PROGRESS_POLL_SECONDS", 0.01)
+
+    turn = await harness.start_turn(
+        workspace,
+        "session-1",
+        prompt="hello",
+        model=None,
+        reasoning=None,
+        approval_mode=None,
+        sandbox_policy=None,
+    )
+
+    event_iter = harness.stream_events(workspace, "session-1", turn.turn_id)
+    collected: list[dict[str, Any]] = []
+    for _ in range(10):
+        event = await asyncio.wait_for(event_iter.__anext__(), timeout=1.0)
+        collected.append(event)
+        part_types = {
+            item.get("message", {})
+            .get("params", {})
+            .get("properties", {})
+            .get("part", {})
+            .get("type")
+            for item in collected
+            if item.get("message", {}).get("method") == "message.part.updated"
+        }
+        if {"reasoning", "tool"}.issubset(part_types):
+            break
+    await event_iter.aclose()
+
+    assert list_message_calls >= 1
+    message_part_events = [
+        item
+        for item in collected
+        if item.get("message", {}).get("method") == "message.part.updated"
+    ]
+    assert any(
+        item["message"]["params"]["properties"]["part"]["type"] == "reasoning"
+        for item in message_part_events
+    )
+    assert any(
+        item["message"]["params"]["properties"]["part"]["type"] == "tool"
+        for item in message_part_events
+    )
+
+    release_prompt.set()
+    result = await harness.wait_for_turn(workspace, "session-1", turn.turn_id)
+    assert result.status == "ok"
+    assert result.assistant_text == "Agent reply"
+
+
+@pytest.mark.asyncio
 async def test_opencode_harness_releases_reserved_turn_when_start_turn_setup_fails() -> (
     None
 ):

@@ -1,3 +1,10 @@
+"""HTTP client for the OpenCode server (``opencode serve``).
+
+SSE bodies may nest the real event under a ``payload`` object with the semantic
+``type`` on the wrapper; :func:`_normalize_sse_event` flattens that shape. Codex
+and Hermes integrations do not use this client or normalization path.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -41,6 +48,12 @@ class OpenCodeProtocolError(Exception):
 
 
 def _normalize_sse_event(event: SSEEvent) -> SSEEvent:
+    """Unwrap nested OpenCode SSE JSON so ``event`` and ``data`` match a flat frame.
+
+    When the server sends ``{"type": "...", "payload": {...}, "sessionID": ...}``,
+    merge outer ``type``, session fields, ``session``, and ``properties`` into
+    ``payload`` and re-serialize so downstream code matches unwrapped events.
+    """
     event_type = event.event
     raw_data = event.data or ""
     payload_obj: Optional[dict[str, Any]] = None
@@ -620,36 +633,28 @@ class OpenCodeClient:
             directory: Workspace directory for session filtering
             ready_event: Event to signal when stream is ready
             paths: Custom list of endpoint paths to try (overrides defaults)
-            session_id: Session ID to use session-scoped endpoint first
+            session_id: Session ID for caller-side correlation/filtering. The
+                actual OpenCode stream stays on the documented /event or
+                /global/event endpoints.
 
         Yields:
             Normalized SSEEvent objects from the server.
 
         The endpoint negotiation strategy is:
         1. If paths provided, use those
-        2. If session_id provided, try /session/{session_id}/event first
-        3. Fall back to global endpoints (/global/event, /event) based on API shape
+        2. Use the documented stream endpoints (/event, /global/event)
+        3. Fall back between them based on API shape / deployment
         """
         params = self._dir_params(directory)
 
         if paths is not None:
             event_paths = list(paths)
         else:
-            base_paths: list[str]
             profile = await self.detect_api_shape()
-            if profile.supports_global_endpoints:
-                base_paths = (
-                    ["/event", "/global/event"]
-                    if directory
-                    else ["/global/event", "/event"]
-                )
-            else:
-                base_paths = ["/event"]
-
-            if session_id:
-                event_paths = [f"/session/{session_id}/event"] + base_paths
-            else:
-                event_paths = base_paths
+            event_paths = self._default_event_paths(
+                directory=directory,
+                profile=profile,
+            )
 
         last_error: Optional[BaseException] = None
         for path in event_paths:
@@ -676,6 +681,18 @@ class OpenCodeClient:
             ready_event.set()
         if last_error is not None:
             raise last_error
+
+    @staticmethod
+    def _default_event_paths(
+        *,
+        directory: Optional[str],
+        profile: OpenCodeApiProfile,
+    ) -> list[str]:
+        if profile.supports_global_endpoints:
+            if directory:
+                return ["/event", "/global/event"]
+            return ["/global/event", "/event"]
+        return ["/event"]
 
     async def fetch_openapi_spec(self) -> dict[str, Any]:
         """Fetch OpenAPI spec from /doc endpoint for capability negotiation."""

@@ -1,3 +1,11 @@
+"""OpenCode harness: turns, progress buffers, SSE → CAR event envelope.
+
+Surfaces consume ``{"message": {"method", "params"}}`` shaped events. When SSE is
+sparse, :class:`OpenCodeHarness` polls ``list_messages`` and synthesizes
+``message.part.updated`` for reasoning/tool/patch/usage deltas. Codex/Hermes get
+turn events from their supervisors instead and do not use this polling path.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -15,6 +23,7 @@ from ...core.logging_utils import log_event
 from ...core.orchestration.interfaces import FreshConversationRequiredError
 from ...core.orchestration.stream_text_merge import merge_assistant_stream_text
 from ...core.orchestration.turn_event_buffer import TurnEventBuffer
+from ...core.sse import SSEEvent
 from ...integrations.chat.agents import DEFAULT_CHAT_AGENT_MODELS
 from ..base import AgentHarness
 from ..types import (
@@ -45,6 +54,7 @@ from .runtime import (
     extract_session_id,
     extract_turn_id,
     map_approval_policy_to_permission,
+    opencode_event_is_progress_signal,
     opencode_stream_timeouts,
     parse_message_response,
     recover_last_assistant_message,
@@ -104,7 +114,10 @@ async def _pre_connect_event_stream(
                 session_id=conversation_id,
                 ready_event=ready_event,
             ):
-                if event_seen is not None:
+                if event_seen is not None and _preconnected_event_counts_as_progress(
+                    event,
+                    conversation_id=conversation_id,
+                ):
                     event_seen.set()
                 await event_queue.put(event)
         except Exception:
@@ -118,6 +131,17 @@ async def _pre_connect_event_stream(
     except asyncio.TimeoutError:
         _logger.debug("SSE pre-connect timed out after 2s, continuing anyway")
     return event_queue, task
+
+
+def _preconnected_event_counts_as_progress(
+    event: SSEEvent,
+    *,
+    conversation_id: str,
+) -> bool:
+    return opencode_event_is_progress_signal(
+        event,
+        session_id=conversation_id,
+    )
 
 
 def _path_is_within(root: Path, candidate: Path) -> bool:
@@ -735,6 +759,8 @@ def _iter_provider_models(models_raw: Any) -> list[tuple[str, dict[str, Any]]]:
 
 
 class OpenCodeHarness(AgentHarness):
+    """Map OpenCode HTTP/SSE (and message snapshots) onto CAR harness APIs."""
+
     agent_id: AgentId = AgentId("opencode")
     display_name = "OpenCode"
     capabilities = frozenset(
@@ -1435,6 +1461,8 @@ class OpenCodeHarness(AgentHarness):
                     if is_idle:
                         pending.progress_events_idle += 1
                     elif event_session_id == conversation_id or not event_session_id:
+                        # Session-less item/* deltas are valid OpenCode progress; skipping
+                        # them drops reasoning/tool visibility (see harness tests).
                         pending.progress_events_published += 1
                         await _publish_progress_event(wrapped)
                     else:

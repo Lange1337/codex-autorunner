@@ -1,3 +1,10 @@
+"""OpenCode turn execution: consume SSE, enforce stall/first-event timeouts, assemble output.
+
+Which events count as forward progress (and thus reset stall timers) is OpenCode-
+specific — see :func:`opencode_event_is_progress_signal` and busy vs idle
+``session.status`` handling. Codex/Hermes paths use different event sources.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -711,6 +718,45 @@ def _status_is_idle(status_type: Optional[str]) -> bool:
     return status_type.strip().lower() in _OPENCODE_IDLE_STATUS_VALUES
 
 
+def opencode_event_is_progress_signal(
+    event: SSEEvent,
+    *,
+    session_id: str,
+    progress_session_ids: Optional[set[str]] = None,
+) -> bool:
+    """Whether *event* should count as stream progress for stall / first-event logic.
+
+    Ignores transport noise (``server.connected``, ``server.heartbeat``). For
+    ``session.status``, only idle-like statuses count; busy heartbeats must not
+    reset timers. Session scope: primary *session_id*, or any id in
+    *progress_session_ids* when the turn spans multiple server sessions.
+
+    Used only on the OpenCode SSE path; Codex/Hermes harnesses do not call this.
+    """
+    event_type = (event.event or "").strip().lower()
+    if event_type in {"server.connected", "server.heartbeat"}:
+        return False
+
+    raw = event.data or ""
+    try:
+        payload = json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        payload = {}
+
+    event_session_id = extract_session_id(payload)
+    if event_session_id:
+        if progress_session_ids is None:
+            if event_session_id != session_id:
+                return False
+        elif event_session_id not in progress_session_ids:
+            return False
+
+    if event_type == "session.status":
+        return _status_is_idle(_extract_status_type(payload))
+
+    return True
+
+
 async def opencode_missing_env(
     client: Any,
     workspace_root: str,
@@ -1373,14 +1419,11 @@ async def collect_opencode_output_from_events(
             except json.JSONDecodeError:
                 payload = {}
             event_session_id = extract_session_id(payload)
-            is_relevant = False
-            if event_session_id:
-                if progress_session_ids is None:
-                    is_relevant = event_session_id == session_id
-                else:
-                    is_relevant = event_session_id in progress_session_ids
-            else:
-                is_relevant = True
+            is_relevant = opencode_event_is_progress_signal(
+                event,
+                session_id=session_id,
+                progress_session_ids=progress_session_ids,
+            )
             if not is_relevant:
                 if not received_any_event and first_event_timeout_seconds is not None:
                     if now - stream_started_at >= first_event_timeout_seconds:

@@ -262,33 +262,10 @@ async def test_stream_events_no_fallback_without_global_support() -> None:
 
 
 @pytest.mark.anyio
-async def test_stream_events_with_session_id_prepends_session_path() -> None:
-    """Characterization: session_id parameter adds session-scoped path first."""
+async def test_stream_events_with_session_id_uses_documented_paths_only() -> None:
+    """Regression: session_id should not invent an undocumented session SSE route."""
     event_data = 'data: {"type":"test","sessionID":"s1"}\n\n'
     responses = {
-        "/session/s1/event": _FakeStreamResponse(200, lines=[event_data]),
-    }
-    fake_client = _FakeAsyncClient(responses)
-
-    client = OpenCodeClient(base_url="http://test")
-    client._client = fake_client  # type: ignore
-    client._api_profile = OpenCodeApiProfile(supports_global_endpoints=True)
-
-    events = []
-    async for event in client.stream_events(directory=None, session_id="s1"):
-        events.append(event)
-
-    assert len(events) == 1
-    assert events[0].event == "test"
-    assert fake_client.stream_calls[0][1] == "/session/s1/event"
-
-
-@pytest.mark.anyio
-async def test_stream_events_with_session_id_falls_back() -> None:
-    """Characterization: session-scoped path falls back to global on 404."""
-    event_data = 'data: {"type":"test","sessionID":"s1"}\n\n'
-    responses = {
-        "/session/s1/event": _FakeStreamResponse(404),
         "/global/event": _FakeStreamResponse(200, lines=[event_data]),
     }
     fake_client = _FakeAsyncClient(responses)
@@ -302,8 +279,29 @@ async def test_stream_events_with_session_id_falls_back() -> None:
         events.append(event)
 
     assert len(events) == 1
-    assert fake_client.stream_calls[0][1] == "/session/s1/event"
-    assert fake_client.stream_calls[1][1] == "/global/event"
+    assert events[0].event == "test"
+    assert [call[1] for call in fake_client.stream_calls] == ["/global/event"]
+
+
+@pytest.mark.anyio
+async def test_stream_events_with_session_id_keeps_directory_path_order() -> None:
+    """Regression: session_id should not change the documented /event ordering."""
+    event_data = 'data: {"type":"test","sessionID":"s1"}\n\n'
+    responses = {
+        "/event": _FakeStreamResponse(200, lines=[event_data]),
+    }
+    fake_client = _FakeAsyncClient(responses)
+
+    client = OpenCodeClient(base_url="http://test")
+    client._client = fake_client  # type: ignore
+    client._api_profile = OpenCodeApiProfile(supports_global_endpoints=True)
+
+    events = []
+    async for event in client.stream_events(directory="/workspace", session_id="s1"):
+        events.append(event)
+
+    assert len(events) == 1
+    assert [call[1] for call in fake_client.stream_calls] == ["/event"]
 
 
 @pytest.mark.anyio
