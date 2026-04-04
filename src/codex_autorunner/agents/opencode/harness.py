@@ -42,6 +42,9 @@ from .event_fields import (
     extract_message_role as _extract_message_role,
 )
 from .event_fields import (
+    extract_part_id as _extract_part_id,
+)
+from .event_fields import (
     extract_part_message_id as _extract_part_message_id,
 )
 from .event_fields import (
@@ -253,6 +256,55 @@ def _extract_parent_session_id(payload: Any) -> Optional[str]:
             if isinstance(value, str) and value:
                 return value
     return None
+
+
+def _descendant_text_progress_key(method: str, payload: dict[str, Any]) -> str:
+    item = payload.get("item")
+    if isinstance(item, dict):
+        item_id = item.get("id") or item.get("itemId")
+        if isinstance(item_id, str) and item_id:
+            return f"item:{item_id}"
+    item_id = payload.get("itemId")
+    if isinstance(item_id, str) and item_id:
+        return f"item:{item_id}"
+    message_id = _extract_part_message_id(payload) or _extract_message_id(payload)
+    if isinstance(message_id, str) and message_id:
+        return f"message:{message_id}"
+    part_id = _extract_part_id(payload)
+    if isinstance(part_id, str) and part_id:
+        return f"part:{part_id}"
+    return f"stream:{method}"
+
+
+def _synthetic_descendant_reasoning_event(
+    *,
+    session_id: str,
+    logical_id: str,
+    text: str,
+) -> dict[str, Any]:
+    synthetic_message_id = f"descendant-progress:{session_id}:{logical_id}:message"
+    synthetic_part_id = f"descendant-progress:{session_id}:{logical_id}:part"
+    return _wrap_runtime_raw_event(
+        "message.part.updated",
+        {
+            "sessionID": session_id,
+            "messageID": synthetic_message_id,
+            "properties": {
+                "messageID": synthetic_message_id,
+                "info": {
+                    "id": synthetic_message_id,
+                    "role": "assistant",
+                },
+                "part": {
+                    "id": synthetic_part_id,
+                    "type": "reasoning",
+                    "messageID": synthetic_message_id,
+                    "sessionID": session_id,
+                    "text": text,
+                },
+            },
+        },
+    )
 
 
 def _wrap_runtime_raw_event(method: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -1461,6 +1513,8 @@ class OpenCodeHarness(AgentHarness):
                 conversation_id: None,
             }
             non_descendant_session_ids: set[str] = set()
+            descendant_text_buffers: dict[str, str] = {}
+            descendant_part_types: dict[str, str] = {}
 
             async def _session_belongs_to_turn(session_id: Optional[str]) -> bool:
                 if not isinstance(session_id, str) or not session_id:
@@ -1544,6 +1598,100 @@ class OpenCodeHarness(AgentHarness):
                         source="session_lookup",
                     )
 
+            def _descendant_progress_events(
+                method: str,
+                payload: dict[str, Any],
+                *,
+                session_id: str,
+            ) -> list[dict[str, Any]]:
+                if method in {"message.part.updated", "message.part.delta"}:
+                    part_type = _extract_part_type(
+                        payload, part_types=descendant_part_types
+                    )
+                    if part_type in {None, "", "text"}:
+                        text = _extract_delta_text(payload) or _extract_completed_text(
+                            payload
+                        )
+                        if not text:
+                            return []
+                        progress_key = f"{session_id}:{_descendant_text_progress_key(method, payload)}"
+                        accumulated_text = merge_assistant_stream_text(
+                            descendant_text_buffers.get(progress_key, ""),
+                            text,
+                        )
+                        descendant_text_buffers[progress_key] = accumulated_text
+                        return [
+                            _synthetic_descendant_reasoning_event(
+                                session_id=session_id,
+                                logical_id=progress_key,
+                                text=accumulated_text,
+                            )
+                        ]
+                    return [_wrap_runtime_raw_event(method, payload)]
+
+                if method in {
+                    "message.delta",
+                    "message.updated",
+                    "message.completed",
+                    "item/agentMessage/delta",
+                }:
+                    text = _extract_delta_text(payload) or _extract_completed_text(
+                        payload
+                    )
+                    if not text:
+                        return []
+                    progress_key = (
+                        f"{session_id}:{_descendant_text_progress_key(method, payload)}"
+                    )
+                    accumulated_text = merge_assistant_stream_text(
+                        descendant_text_buffers.get(progress_key, ""),
+                        text,
+                    )
+                    descendant_text_buffers[progress_key] = accumulated_text
+                    return [
+                        _synthetic_descendant_reasoning_event(
+                            session_id=session_id,
+                            logical_id=progress_key,
+                            text=accumulated_text,
+                        )
+                    ]
+
+                if method == "item/completed":
+                    item = payload.get("item")
+                    if isinstance(item, dict) and item.get("type") == "agentMessage":
+                        text = _extract_completed_text(payload)
+                        if not text:
+                            return []
+                        progress_key = f"{session_id}:{_descendant_text_progress_key(method, payload)}"
+                        accumulated_text = merge_assistant_stream_text(
+                            descendant_text_buffers.get(progress_key, ""),
+                            text,
+                        )
+                        descendant_text_buffers[progress_key] = accumulated_text
+                        return [
+                            _synthetic_descendant_reasoning_event(
+                                session_id=session_id,
+                                logical_id=progress_key,
+                                text=accumulated_text,
+                            )
+                        ]
+                    return [_wrap_runtime_raw_event(method, payload)]
+
+                if (
+                    method
+                    in {
+                        "item/reasoning/summaryTextDelta",
+                        "item/reasoning/summaryPartAdded",
+                        "item/reasoning/textDelta",
+                        "item/toolCall/start",
+                        "item/toolCall/end",
+                    }
+                    or "outputdelta" in method.lower()
+                ):
+                    return [_wrap_runtime_raw_event(method, payload)]
+
+                return []
+
             async def _publish_progress_event(raw_event: dict[str, Any]) -> None:
                 if not raw_event:
                     return
@@ -1561,7 +1709,6 @@ class OpenCodeHarness(AgentHarness):
                 if isinstance(parsed, dict):
                     await _maybe_track_descendant_session(parsed)
                     wrapped = {"message": {"method": event.event, "params": parsed}}
-                    raw_events.append(wrapped)
                     event_session_id = extract_session_id(parsed)
                     status_type = None
                     if event.event == "session.status":
@@ -1579,13 +1726,15 @@ class OpenCodeHarness(AgentHarness):
                     )
                     if is_idle:
                         pending.progress_events_idle += 1
-                    elif (
-                        event_session_id in watched_session_ids or not event_session_id
-                    ):
-                        # Session-less item/* deltas are valid OpenCode progress; skipping
-                        # them drops reasoning/tool visibility (see harness tests).
-                        pending.progress_events_published += 1
-                        await _publish_progress_event(wrapped)
+                    visible_events: list[dict[str, Any]] = []
+                    if not event_session_id or event_session_id == conversation_id:
+                        visible_events = [wrapped]
+                    elif event_session_id in watched_session_ids:
+                        visible_events = _descendant_progress_events(
+                            event.event,
+                            parsed,
+                            session_id=event_session_id,
+                        )
                     else:
                         pending.progress_events_skipped_session += 1
                         log_event(
@@ -1598,6 +1747,13 @@ class OpenCodeHarness(AgentHarness):
                             reason="session_mismatch",
                             shape_hint=_progress_event_shape_hint(parsed),
                         )
+                        return
+
+                    for visible_event in visible_events:
+                        raw_events.append(visible_event)
+                        if not is_idle:
+                            pending.progress_events_published += 1
+                            await _publish_progress_event(visible_event)
 
             async def _event_stream() -> AsyncIterator[Any]:
                 pre_queue = pending.pre_connected_event_queue

@@ -71,7 +71,7 @@ class _StubClient:
             raise self.prompt_error
         return {}
 
-    async def get_session(self, session_id: str) -> dict[str, str]:
+    async def get_session(self, session_id: str) -> dict[str, Any]:
         self.get_session_calls.append(session_id)
         if self.get_session_error is not None:
             raise self.get_session_error
@@ -1644,92 +1644,6 @@ async def test_opencode_harness_noninteractive_turn_rejects_questions() -> None:
 
 
 @pytest.mark.asyncio
-async def test_opencode_harness_managed_turn_auto_approves_child_session_permission() -> (
-    None
-):
-    workspace = Path("/tmp/workspace").resolve()
-    client = _StubClient(
-        [
-            SSEEvent(
-                event="permission.asked",
-                data=(
-                    '{"sessionID":"child-1","properties":{"id":"perm-1",'
-                    '"permission":"external_directory","patterns":["/tmp/tests_diff.txt"],'
-                    '"metadata":{"filepath":"/tmp/tests_diff.txt"}}}'
-                ),
-            ),
-            SSEEvent(
-                event="session.status",
-                data='{"sessionID":"session-1","properties":{"status":{"type":"idle"}}}',
-            ),
-        ]
-    )
-    client.session_responses["child-1"] = {
-        "id": "child-1",
-        "parentID": "session-1",
-    }
-    harness = OpenCodeHarness(_StubSupervisor(client))
-
-    turn = await harness.start_turn(
-        workspace,
-        "session-1",
-        prompt="hello",
-        model=None,
-        reasoning=None,
-        approval_mode="never",
-        sandbox_policy="dangerFullAccess",
-    )
-    result = await harness.wait_for_turn(workspace, "session-1", turn.turn_id)
-
-    assert result.status == "ok"
-    assert client.permission_replies == [("perm-1", "once")]
-    assert client.get_session_calls == ["child-1"]
-
-
-@pytest.mark.asyncio
-async def test_opencode_harness_managed_turn_tracks_child_session_from_parent_event() -> (
-    None
-):
-    workspace = Path("/tmp/workspace").resolve()
-    client = _StubClient(
-        [
-            SSEEvent(
-                event="session.created",
-                data='{"sessionID":"child-1","info":{"id":"child-1","parentID":"session-1"}}',
-            ),
-            SSEEvent(
-                event="permission.asked",
-                data=(
-                    '{"sessionID":"child-1","properties":{"id":"perm-1",'
-                    '"permission":"external_directory","patterns":["/tmp/tests_diff.txt"],'
-                    '"metadata":{"filepath":"/tmp/tests_diff.txt"}}}'
-                ),
-            ),
-            SSEEvent(
-                event="session.status",
-                data='{"sessionID":"session-1","properties":{"status":{"type":"idle"}}}',
-            ),
-        ]
-    )
-    harness = OpenCodeHarness(_StubSupervisor(client))
-
-    turn = await harness.start_turn(
-        workspace,
-        "session-1",
-        prompt="hello",
-        model=None,
-        reasoning=None,
-        approval_mode="never",
-        sandbox_policy="dangerFullAccess",
-    )
-    result = await harness.wait_for_turn(workspace, "session-1", turn.turn_id)
-
-    assert result.status == "ok"
-    assert client.permission_replies == [("perm-1", "once")]
-    assert client.get_session_calls == []
-
-
-@pytest.mark.asyncio
 async def test_opencode_harness_stream_events_yields_sessionless_events() -> None:
     """stream_events() should yield events that lack a sessionID instead of
     dropping them."""
@@ -1844,3 +1758,221 @@ async def test_opencode_harness_wait_for_turn_recovers_final_text_from_session_m
     assert result.status == "ok"
     assert result.assistant_text == "hello world"
     assert client.list_messages_calls == ["session-1"]
+
+
+@pytest.mark.asyncio
+async def test_opencode_harness_managed_turn_auto_approves_child_session_permission() -> (
+    None
+):
+    workspace = Path("/tmp/workspace").resolve()
+    client = _StubClient(
+        [
+            SSEEvent(
+                event="permission.asked",
+                data=(
+                    '{"sessionID":"child-1","properties":{"id":"perm-1",'
+                    '"permission":"external_directory","patterns":["/tmp/tests_diff.txt"],'
+                    '"metadata":{"filepath":"/tmp/tests_diff.txt"}}}'
+                ),
+            ),
+            SSEEvent(
+                event="session.status",
+                data='{"sessionID":"session-1","properties":{"status":{"type":"idle"}}}',
+            ),
+        ]
+    )
+    client.session_responses["child-1"] = {
+        "id": "child-1",
+        "parentID": "session-1",
+    }
+    harness = OpenCodeHarness(_StubSupervisor(client))
+
+    turn = await harness.start_turn(
+        workspace,
+        "session-1",
+        prompt="hello",
+        model=None,
+        reasoning=None,
+        approval_mode="never",
+        sandbox_policy="dangerFullAccess",
+    )
+    result = await harness.wait_for_turn(workspace, "session-1", turn.turn_id)
+
+    assert result.status == "ok"
+    assert client.permission_replies == [("perm-1", "once")]
+    assert client.get_session_calls == ["child-1"]
+
+
+@pytest.mark.asyncio
+async def test_opencode_harness_rewrites_child_text_parts_into_accumulated_thinking() -> (
+    None
+):
+    workspace = Path("/tmp/workspace").resolve()
+    client = _StubClient(
+        [
+            SSEEvent(
+                event="session.created",
+                data='{"sessionID":"child-1","info":{"id":"child-1","parentID":"session-1"}}',
+            ),
+            SSEEvent(
+                event="message.part.updated",
+                data=(
+                    '{"sessionID":"child-1","properties":{"messageID":"assistant-child-1",'
+                    '"info":{"id":"assistant-child-1","role":"assistant"},'
+                    '"delta":{"text":"Current version is v1.9.10."},'
+                    '"part":{"id":"child-part-1","messageID":"assistant-child-1",'
+                    '"type":"text","text":"Current version is v1.9.10."}}}'
+                ),
+            ),
+            SSEEvent(
+                event="message.part.updated",
+                data=(
+                    '{"sessionID":"child-1","properties":{"messageID":"assistant-child-1",'
+                    '"info":{"id":"assistant-child-1","role":"assistant"},'
+                    '"delta":{"text":" A patch release would be v1.9.11."},'
+                    '"part":{"id":"child-part-1","messageID":"assistant-child-1",'
+                    '"type":"text","text":"Current version is v1.9.10. A patch release would be v1.9.11."}}}'
+                ),
+            ),
+            SSEEvent(
+                event="message.completed",
+                data=(
+                    '{"sessionID":"session-1","info":{"id":"assistant-parent-1",'
+                    '"role":"assistant"},"parts":[{"type":"text",'
+                    '"text":"Patch release v1.9.11 is tagged and pushed to origin/main."}]}'
+                ),
+            ),
+            SSEEvent(
+                event="session.status",
+                data='{"sessionID":"session-1","properties":{"status":{"type":"idle"}}}',
+            ),
+        ]
+    )
+    harness = OpenCodeHarness(_StubSupervisor(client))
+
+    turn = await harness.start_turn(
+        workspace,
+        "session-1",
+        prompt="Do a patch release from origin main",
+        model=None,
+        reasoning=None,
+        approval_mode="never",
+        sandbox_policy="dangerFullAccess",
+    )
+    result = await harness.wait_for_turn(workspace, "session-1", turn.turn_id)
+
+    assert result.status == "ok"
+    assert (
+        result.assistant_text
+        == "Patch release v1.9.11 is tagged and pushed to origin/main."
+    )
+
+    normalized_state = RuntimeThreadRunEventState()
+    normalized_events = []
+    for raw_event in result.raw_events:
+        normalized_events.extend(
+            await normalize_runtime_thread_raw_event(raw_event, normalized_state)
+        )
+
+    thinking_messages = [
+        getattr(event, "message", "")
+        for event in normalized_events
+        if getattr(event, "kind", None) == "thinking"
+    ]
+    assert thinking_messages == [
+        "Current version is v1.9.10.",
+        "Current version is v1.9.10. A patch release would be v1.9.11.",
+    ]
+
+    assistant_messages = [
+        getattr(event, "content", "")
+        for event in normalized_events
+        if getattr(event, "delta_type", None)
+        in {"assistant_message", "assistant_stream"}
+    ]
+    assert assistant_messages == [
+        "Patch release v1.9.11 is tagged and pushed to origin/main."
+    ]
+
+
+@pytest.mark.asyncio
+async def test_opencode_harness_rewrites_child_agent_messages_without_polluting_final_output() -> (
+    None
+):
+    workspace = Path("/tmp/workspace").resolve()
+    client = _StubClient(
+        [
+            SSEEvent(
+                event="session.created",
+                data='{"sessionID":"child-1","info":{"id":"child-1","parentID":"session-1"}}',
+            ),
+            SSEEvent(
+                event="item/agentMessage/delta",
+                data='{"sessionID":"child-1","itemId":"child-msg-1","delta":"Now let me bump the version"}',
+            ),
+            SSEEvent(
+                event="item/completed",
+                data=(
+                    '{"sessionID":"child-1","item":{"type":"agentMessage","id":"child-msg-1",'
+                    '"text":"Now let me bump the version and create the release commit."}}'
+                ),
+            ),
+            SSEEvent(
+                event="message.completed",
+                data=(
+                    '{"sessionID":"session-1","info":{"id":"assistant-parent-1",'
+                    '"role":"assistant"},"parts":[{"type":"text",'
+                    '"text":"Done. Patch release v1.9.11 is tagged and pushed to origin/main."}]}'
+                ),
+            ),
+            SSEEvent(
+                event="session.status",
+                data='{"sessionID":"session-1","properties":{"status":{"type":"idle"}}}',
+            ),
+        ]
+    )
+    harness = OpenCodeHarness(_StubSupervisor(client))
+
+    turn = await harness.start_turn(
+        workspace,
+        "session-1",
+        prompt="Do a patch release from origin main",
+        model=None,
+        reasoning=None,
+        approval_mode="never",
+        sandbox_policy="dangerFullAccess",
+    )
+    result = await harness.wait_for_turn(workspace, "session-1", turn.turn_id)
+
+    assert result.status == "ok"
+    assert (
+        result.assistant_text
+        == "Done. Patch release v1.9.11 is tagged and pushed to origin/main."
+    )
+
+    normalized_state = RuntimeThreadRunEventState()
+    normalized_events = []
+    for raw_event in result.raw_events:
+        normalized_events.extend(
+            await normalize_runtime_thread_raw_event(raw_event, normalized_state)
+        )
+
+    thinking_messages = [
+        getattr(event, "message", "")
+        for event in normalized_events
+        if getattr(event, "kind", None) == "thinking"
+    ]
+    assert thinking_messages == [
+        "Now let me bump the version",
+        "Now let me bump the version and create the release commit.",
+    ]
+
+    assistant_messages = [
+        getattr(event, "content", "")
+        for event in normalized_events
+        if getattr(event, "delta_type", None)
+        in {"assistant_message", "assistant_stream"}
+    ]
+    assert assistant_messages == [
+        "Done. Patch release v1.9.11 is tagged and pushed to origin/main."
+    ]
