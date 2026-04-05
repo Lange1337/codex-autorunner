@@ -875,6 +875,7 @@ async def collect_opencode_output_from_events(
     pending_no_id: list[str] = []
     no_id_role: Optional[str] = None
     fallback_message: Optional[tuple[Optional[str], Optional[str], str]] = None
+    last_completed_assistant_text: Optional[str] = None
     last_usage_signature: Optional[
         tuple[
             Optional[str],
@@ -1814,6 +1815,9 @@ async def collect_opencode_output_from_events(
                 and _extract_message_phase(payload) != "commentary"
             ):
                 last_primary_completion_at = time.monotonic()
+                last_completed_assistant_text = (
+                    message_result.text if message_result.text else None
+                )
                 post_completion_deadline = last_primary_completion_at + max(
                     _OPENCODE_POST_COMPLETION_GRACE_SECONDS, 0.0
                 )
@@ -1877,8 +1881,9 @@ async def collect_opencode_output_from_events(
             if recovered.error and not error:
                 error = recovered.error
 
+    final_text = last_completed_assistant_text or "".join(text_parts)
     return OpenCodeTurnOutput(
-        text="".join(text_parts).strip(),
+        text=final_text.strip(),
         error=error,
         usage=latest_usage_snapshot,
     )
