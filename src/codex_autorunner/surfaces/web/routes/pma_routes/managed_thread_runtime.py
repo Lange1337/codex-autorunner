@@ -97,6 +97,7 @@ MANAGED_THREAD_INTERRUPT_FAILED_DETAIL = (
 PMA_TIMEOUT_SECONDS = 7200
 PMA_MAX_TEXT = PMA_DEFAULT_MAX_TEXT_CHARS
 BOUND_CHAT_SURFACE_KINDS = frozenset({"discord", "telegram"})
+BOUND_CHAT_CLIENT_TURN_PREFIXES = ("discord:", "telegram:")
 
 
 def _build_managed_thread_orchestration_service(
@@ -921,8 +922,37 @@ async def restart_managed_thread_queue_workers(app: Any) -> None:
         ensure_managed_thread_queue_worker(app, managed_thread_id)
 
 
+def _has_bound_chat_surface(
+    binding_store: OrchestrationBindingStore, managed_thread_id: str
+) -> bool:
+    return any(
+        binding.surface_kind in BOUND_CHAT_SURFACE_KINDS
+        for binding in binding_store.list_bindings(
+            thread_target_id=managed_thread_id,
+            include_disabled=False,
+            limit=1000,
+        )
+    )
+
+
+def _is_chat_origin_running_execution(
+    thread_store: PmaThreadStore, managed_thread_id: str
+) -> bool:
+    running_turn = thread_store.get_running_turn(managed_thread_id)
+    client_turn_id = normalize_optional_text(
+        running_turn.get("client_turn_id") if running_turn is not None else None
+    )
+    if not client_turn_id:
+        return False
+    client_turn_id = client_turn_id.lower()
+    return any(
+        client_turn_id.startswith(prefix) for prefix in BOUND_CHAT_CLIENT_TURN_PREFIXES
+    )
+
+
 async def recover_orphaned_managed_thread_executions(app: Any) -> None:
     thread_store = PmaThreadStore(app.state.config.root)
+    binding_store = OrchestrationBindingStore(app.state.config.root)
     service = _build_managed_thread_orchestration_service_for_app(
         app,
         thread_store=thread_store,
@@ -935,6 +965,10 @@ async def recover_orphaned_managed_thread_executions(app: Any) -> None:
             thread = service.get_thread_target(managed_thread_id)
             execution = service.get_running_execution(managed_thread_id)
             if thread is None or execution is None:
+                continue
+            if _has_bound_chat_surface(
+                binding_store, managed_thread_id
+            ) and _is_chat_origin_running_execution(thread_store, managed_thread_id):
                 continue
             has_turn = getattr(app_server_events, "has_turn", None)
             if (
