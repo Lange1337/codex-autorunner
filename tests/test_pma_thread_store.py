@@ -381,6 +381,148 @@ def test_claim_next_queued_turn_recovers_stale_running_execution(
     assert stale_after["finished_at"]
 
 
+def test_create_turn_recovers_old_running_execution_when_status_turn_matches(
+    tmp_path: Path,
+) -> None:
+    store = PmaThreadStore(
+        tmp_path / "hub",
+        stale_running_threshold_seconds=60,
+    )
+    thread = store.create_thread("codex", tmp_path / "workspace")
+
+    stale_running_turn = store.create_turn(thread["managed_thread_id"], prompt="first")
+    thread_before = store.get_thread(thread["managed_thread_id"])
+    assert thread_before is not None
+    assert thread_before["status_turn_id"] == stale_running_turn["managed_turn_id"]
+
+    with store._write_conn() as conn:
+        with conn:
+            conn.execute(
+                """
+                UPDATE orch_thread_executions
+                   SET started_at = '2000-01-01T00:00:00Z',
+                       created_at = '2000-01-01T00:00:00Z'
+                 WHERE execution_id = ?
+                """,
+                (stale_running_turn["managed_turn_id"],),
+            )
+
+    recovered_running_turn = store.create_turn(
+        thread["managed_thread_id"],
+        prompt="fresh execution",
+    )
+    assert recovered_running_turn["status"] == "running"
+
+    stale_after = store.get_turn(
+        thread["managed_thread_id"], stale_running_turn["managed_turn_id"]
+    )
+    assert stale_after is not None
+    assert stale_after["status"] == "interrupted"
+    assert stale_after["error"] == "stale_running_execution_recovered"
+    assert stale_after["finished_at"]
+
+
+def test_claim_next_queued_turn_recovers_old_running_execution_when_status_turn_matches(
+    tmp_path: Path,
+) -> None:
+    store = PmaThreadStore(
+        tmp_path / "hub",
+        stale_running_threshold_seconds=60,
+    )
+    thread = store.create_thread("codex", tmp_path / "workspace")
+
+    stale_running_turn = store.create_turn(thread["managed_thread_id"], prompt="first")
+    queued_turn = store.create_turn(
+        thread["managed_thread_id"],
+        prompt="second queued",
+        busy_policy="queue",
+        queue_payload={"request": {"message_text": "second queued"}},
+    )
+    assert queued_turn["status"] == "queued"
+
+    with store._write_conn() as conn:
+        with conn:
+            conn.execute(
+                """
+                UPDATE orch_thread_executions
+                   SET started_at = '2000-01-01T00:00:00Z',
+                       created_at = '2000-01-01T00:00:00Z'
+                 WHERE execution_id = ?
+                """,
+                (stale_running_turn["managed_turn_id"],),
+            )
+
+    claimed = store.claim_next_queued_turn(thread["managed_thread_id"])
+    assert claimed is not None
+    execution, payload = claimed
+    assert execution["managed_turn_id"] == queued_turn["managed_turn_id"]
+    assert execution["status"] == "running"
+    assert payload["request"]["message_text"] == "second queued"
+
+    stale_after = store.get_turn(
+        thread["managed_thread_id"], stale_running_turn["managed_turn_id"]
+    )
+    assert stale_after is not None
+    assert stale_after["status"] == "interrupted"
+    assert stale_after["error"] == "stale_running_execution_recovered"
+    assert stale_after["finished_at"]
+
+
+def test_create_turn_keeps_old_running_execution_with_recent_activity(
+    tmp_path: Path,
+) -> None:
+    store = PmaThreadStore(
+        tmp_path / "hub",
+        stale_running_threshold_seconds=60,
+    )
+    thread = store.create_thread("codex", tmp_path / "workspace")
+
+    active_turn = store.create_turn(thread["managed_thread_id"], prompt="first")
+
+    with store._write_conn() as conn:
+        with conn:
+            conn.execute(
+                """
+                UPDATE orch_thread_executions
+                   SET started_at = '2000-01-01T00:00:00Z',
+                       created_at = '2000-01-01T00:00:00Z'
+                 WHERE execution_id = ?
+                """,
+                (active_turn["managed_turn_id"],),
+            )
+            conn.execute(
+                """
+                INSERT INTO orch_event_projections (
+                    event_id,
+                    event_family,
+                    event_type,
+                    execution_id,
+                    timestamp,
+                    status,
+                    payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"test-activity:{active_turn['managed_turn_id']}",
+                    "turn.timeline",
+                    "output_delta",
+                    active_turn["managed_turn_id"],
+                    "2999-01-01T00:00:00Z",
+                    "recorded",
+                    "{}",
+                ),
+            )
+
+    with pytest.raises(ManagedThreadAlreadyHasRunningTurnError):
+        store.create_turn(thread["managed_thread_id"], prompt="second")
+
+    turn_after = store.get_turn(
+        thread["managed_thread_id"], active_turn["managed_turn_id"]
+    )
+    assert turn_after is not None
+    assert turn_after["status"] == "running"
+
+
 def test_recovery_does_not_interrupt_legit_queued_turn_promoted_after_newer_terminal(
     tmp_path: Path,
 ) -> None:
