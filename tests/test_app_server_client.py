@@ -886,6 +886,50 @@ async def test_wait_for_turn_reconciles_completion_gap_without_idle_stall(
 
 
 @pytest.mark.anyio
+async def test_wait_for_turn_fails_when_completion_gap_recovery_exhausted(
+    tmp_path: Path,
+) -> None:
+    client = CodexAppServerClient(
+        fixture_command("basic"),
+        cwd=tmp_path,
+        turn_stall_timeout_seconds=10.0,
+        turn_stall_poll_interval_seconds=0.02,
+        turn_stall_recovery_min_interval_seconds=0.0,
+        turn_stall_max_recovery_attempts=2,
+        turn_completion_gap_timeout_seconds=0.01,
+    )
+    try:
+        state = client._ensure_turn_state("turn-1", "thread-1")
+        state.status = "running"
+        state.item_completed_count = 1
+        state.completion_gap_started_at = time.monotonic() - 1.0
+        resume_calls = 0
+
+        async def _resume(thread_id: str, **kwargs: object) -> dict[str, object]:
+            nonlocal resume_calls
+            _ = kwargs
+            resume_calls += 1
+            return {
+                "thread": {
+                    "id": thread_id,
+                    "turns": [{"id": "turn-1", "status": "running"}],
+                }
+            }
+
+        client.thread_resume = _resume  # type: ignore[method-assign]
+
+        result = await client.wait_for_turn("turn-1", thread_id="thread-1", timeout=1.0)
+        assert result.status == "failed"
+        assert any(
+            "completion-gap recovery exhausted" in error for error in result.errors
+        )
+        assert resume_calls == 2
+        assert state.future.done()
+    finally:
+        await client.close()
+
+
+@pytest.mark.anyio
 async def test_live_progress_refreshes_completion_gap_window(
     tmp_path: Path,
 ) -> None:

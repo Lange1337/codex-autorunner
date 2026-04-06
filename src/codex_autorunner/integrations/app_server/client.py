@@ -668,6 +668,14 @@ class CodexAppServerClient:
                 item_completed_count=state.item_completed_count,
                 exc=exc,
             )
+            self._maybe_fail_completion_gap_turn(
+                state,
+                turn_id=turn_id,
+                thread_id=thread_id,
+                completion_gap_seconds=completion_gap_seconds,
+                reason="thread_resume_failed",
+                recovery_status=state.status,
+            )
             return
 
         snapshot = extract_resume_snapshot(resume_result, turn_id)
@@ -680,6 +688,14 @@ class CodexAppServerClient:
                 thread_id=thread_id,
                 completion_gap_seconds=round(completion_gap_seconds, 2),
                 item_completed_count=state.item_completed_count,
+            )
+            self._maybe_fail_completion_gap_turn(
+                state,
+                turn_id=turn_id,
+                thread_id=thread_id,
+                completion_gap_seconds=completion_gap_seconds,
+                reason="resume_snapshot_missing",
+                recovery_status=state.status,
             )
             return
 
@@ -707,6 +723,14 @@ class CodexAppServerClient:
             status=state.status,
             item_completed_count=state.item_completed_count,
             recovery_attempts=state.completion_gap_recovery_attempts,
+        )
+        self._maybe_fail_completion_gap_turn(
+            state,
+            turn_id=turn_id,
+            thread_id=thread_id,
+            completion_gap_seconds=completion_gap_seconds,
+            reason="resume_non_terminal",
+            recovery_status=state.status,
         )
 
     async def _recover_stalled_turn(
@@ -867,6 +891,68 @@ class CodexAppServerClient:
             status=recovery_status or state.status,
             recovery_attempts=state.recovery_attempts,
             max_recovery_attempts=max_attempts,
+        )
+        self._set_turn_result_if_pending(state)
+
+    def _maybe_fail_completion_gap_turn(
+        self,
+        state: _TurnState,
+        *,
+        turn_id: str,
+        thread_id: str,
+        completion_gap_seconds: float,
+        reason: str,
+        recovery_status: Optional[str],
+    ) -> None:
+        if state.future.done():
+            return
+        max_attempts = self._turn_stall_max_recovery_attempts
+        if (
+            max_attempts is None
+            or state.completion_gap_recovery_attempts < max_attempts
+        ):
+            return
+
+        error = (
+            "Turn completion-gap recovery exhausted: "
+            f"attempts={state.completion_gap_recovery_attempts}, "
+            f"max_attempts={max_attempts}, "
+            f"reason={reason}, "
+            f"last_method={state.last_method or 'unknown'}, "
+            f"status={recovery_status or state.status or 'unknown'}, "
+            f"item_completed_count={state.item_completed_count}."
+        )
+        state.status = "failed"
+        state.errors.append(error)
+        state.raw_events.append(
+            {
+                "method": "turn/completionGapRecoveryExhausted",
+                "params": {
+                    "turnId": turn_id,
+                    "threadId": thread_id,
+                    "reason": reason,
+                    "recoveryAttempts": state.completion_gap_recovery_attempts,
+                    "maxRecoveryAttempts": max_attempts,
+                    "lastMethod": state.last_method,
+                    "status": recovery_status or state.status,
+                    "completionGapSeconds": round(completion_gap_seconds, 2),
+                    "itemCompletedCount": state.item_completed_count,
+                },
+            }
+        )
+        log_event(
+            self._logger,
+            logging.ERROR,
+            "app_server.turn_completion_gap_recovery.exhausted",
+            turn_id=turn_id,
+            thread_id=thread_id,
+            completion_gap_seconds=round(completion_gap_seconds, 2),
+            recovery_attempts=state.completion_gap_recovery_attempts,
+            max_recovery_attempts=max_attempts,
+            reason=reason,
+            last_method=state.last_method,
+            status=recovery_status or state.status,
+            item_completed_count=state.item_completed_count,
         )
         self._set_turn_result_if_pending(state)
 
