@@ -165,14 +165,10 @@ async def test_hub_lifespan_restores_exception_hooks_on_startup_failure(
     loop = asyncio.get_running_loop()
     original_asyncio_exception_handler = loop.get_exception_handler()
 
-    async def _boom_start_repo_lifespans(self) -> None:
+    def _boom_record_hub_startup(*args, **kwargs):
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(
-        web_app_module.HubMountManager,
-        "start_repo_lifespans",
-        _boom_start_repo_lifespans,
-    )
+    monkeypatch.setattr(web_app_module, "record_hub_startup", _boom_record_hub_startup)
     app = create_hub_app(hub_env.hub_root)
 
     with pytest.raises(RuntimeError, match="boom"):

@@ -1509,6 +1509,10 @@ def test_hub_home_served_and_repo_mounted(tmp_path: Path):
     assert resp.status_code == 200
     assert b'id="hub-shell"' in resp.content
 
+    # Hub repo lifespans start in a background task; scan mounts repos and starts
+    # lifespans so the repo runtime creates state without racing GET / alone.
+    scan = client.post("/hub/repos/scan")
+    assert scan.status_code == 200
     assert (repo_dir / ".codex-autorunner" / "state.sqlite3").exists()
     assert not (repo_dir / ".codex-autorunner" / "config.yml").exists()
 
