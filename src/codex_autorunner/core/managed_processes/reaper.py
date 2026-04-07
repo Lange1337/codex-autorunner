@@ -11,6 +11,12 @@ from typing import Final, Mapping
 from ..force_attestation import enforce_force_attestation
 from ..locks import process_command_matches
 from ..process_termination import terminate_record
+from ..text_utils import (
+    _parse_iso_timestamp,
+)
+from ..text_utils import (
+    _pid_is_running as _shared_pid_is_running,
+)
 from .registry import ProcessRecord, delete_process_record, list_process_records
 
 logger = logging.getLogger("codex_autorunner.managed_processes.reaper")
@@ -20,20 +26,6 @@ REAPER_KILL_SECONDS: Final = 0.2
 
 DEFAULT_MAX_RECORD_AGE_SECONDS = 6 * 60 * 60
 _OWNER_PROCESS_CMD_HINTS: Final = ("codex_autorunner", "codex-autorunner", "car ")
-
-
-def _pid_is_running(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    if _pid_is_zombie(pid):
-        return False
-    return True
 
 
 def _pid_is_zombie(pid: int) -> bool:
@@ -52,21 +44,15 @@ def _pid_is_zombie(pid: int) -> bool:
     return state != "" and state.split()[0].startswith("Z")
 
 
-def _parse_iso_timestamp(value: str) -> datetime:
-    text = value.strip().replace("Z", "+00:00")
-    dt = datetime.fromisoformat(text)
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt
+def _pid_is_running(pid: int) -> bool:
+    return _shared_pid_is_running(pid) and not _pid_is_zombie(pid)
 
 
 def _is_older_than(record: ProcessRecord, max_age_seconds: int) -> bool:
     if max_age_seconds <= 0:
         return True
-    try:
-        started = _parse_iso_timestamp(record.started_at)
-    except Exception:
-        # Malformed timestamps are treated as stale.
+    started = _parse_iso_timestamp(record.started_at)
+    if started is None:
         return True
     threshold = datetime.now(timezone.utc) - timedelta(seconds=max_age_seconds)
     return started < threshold

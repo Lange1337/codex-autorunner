@@ -7,6 +7,7 @@ from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 from .mutation_policy import PolicyDecision
 from .mutation_policy import evaluate as evaluate_mutation_policy
 from .publish_journal import PublishJournalStore, PublishOperation
+from .text_utils import _normalize_optional_text
 
 DEFAULT_PUBLISH_RETRY_DELAYS_SECONDS = (0.0, 30.0, 300.0)
 _LOGGER = logging.getLogger(__name__)
@@ -90,14 +91,6 @@ def _resolve_error_text(exc: Exception) -> str:
     if details:
         return f"{exc.__class__.__name__}: {details}"
     return exc.__class__.__name__
-
-
-def _normalize_optional_text(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    text = value if isinstance(value, str) else str(value)
-    text = text.strip()
-    return text or None
 
 
 def _normalize_mapping(value: Any) -> Mapping[str, Any]:
@@ -225,7 +218,9 @@ def drain_pending_publish_operations(
             continue
         try:
             response = executor_registry.dispatch(current_operation)
-        except Exception as exc:
+        except (
+            Exception
+        ) as exc:  # intentional: dispatch invokes user-provided executor that may raise any exception
             failed = journal.mark_failed(
                 current_operation.operation_id,
                 error_text=_resolve_error_text(exc),
@@ -244,7 +239,9 @@ def drain_pending_publish_operations(
                 current_operation.operation_id,
                 response=response,
             )
-        except Exception as exc:
+        except (
+            Exception
+        ) as exc:  # intentional: preserve publish side-effect result even if journal update fails
             error_text = (
                 "Publish side effects completed but journal completion failed: "
                 f"{_resolve_error_text(exc)}"
@@ -255,7 +252,9 @@ def drain_pending_publish_operations(
                     error_text=error_text,
                     next_attempt_at=None,
                 )
-            except Exception:  # pragma: no cover - defensive logging
+            except (
+                Exception
+            ):  # intentional: defensive fallback when journal bookkeeping fails
                 _LOGGER.warning(
                     "Publish bookkeeping failed for %s after side effects completed",
                     current_operation.operation_id,

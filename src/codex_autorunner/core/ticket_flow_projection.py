@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -11,14 +10,11 @@ from .config import load_repo_config
 from .flows.models import FlowRunRecord, FlowRunStatus
 from .flows.store import FlowStore
 from .freshness import build_freshness_payload
+from .text_utils import _iso_now
 
 _START_NEW_FLOW_TOKEN = " flow ticket_flow start "
 _COMPLETED_FLOW_STATUSES = {"completed", "done"}
 _ATTENTION_STATES = {"blocked", "dead", "paused"}
-
-
-def _iso_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 def _normalize_optional_str(value: Any) -> Optional[str]:
@@ -90,7 +86,7 @@ def _collect_ticket_frontmatter_state(repo_root: Path) -> dict[str, Any]:
     ticket_dir = repo_root / ".codex-autorunner" / "tickets"
     try:
         ticket_paths = list_ticket_paths(ticket_dir)
-    except Exception:
+    except (OSError, ValueError):
         ticket_paths = []
 
     total_count = len(ticket_paths)
@@ -106,7 +102,7 @@ def _collect_ticket_frontmatter_state(repo_root: Path) -> dict[str, Any]:
                 frontmatter.get("done"), bool
             ):
                 done_flag = frontmatter["done"]
-        except Exception:
+        except (OSError, ValueError):
             done_flag = False
 
         if done_flag:
@@ -188,7 +184,9 @@ def _resolve_last_event_meta(
                 _normalize_optional_int(seq),
                 _normalize_optional_str(event_at),
             )
-    except Exception:
+    except (
+        Exception
+    ):  # intentional: defensive fallback wrapping config loading, sqlite, and store operations
         return None, None, None
 
 

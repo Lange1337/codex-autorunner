@@ -33,7 +33,7 @@ def require_flow_store(
     try:
         store.initialize()
         return store
-    except Exception as exc:
+    except sqlite3.Error as exc:
         log.warning("Flows database unavailable at %s: %s", db_path, exc)
         return None
 
@@ -57,14 +57,18 @@ def safe_list_flow_runs(
                 for rec in records
             ]
         return records
-    except Exception as exc:
+    except (
+        Exception
+    ) as exc:  # intentional: safe_list must never raise; returns [] on any failure
         log.debug("FlowStore list runs failed: %s", exc)
         return []
     finally:
         try:
             store.close()
-        except Exception:
-            pass
+        except sqlite3.Error:
+            _logger.debug(
+                "Failed to close flow store after listing runs", exc_info=True
+            )
 
 
 def get_flow_record(
@@ -85,8 +89,10 @@ def get_flow_record(
     finally:
         try:
             store.close()
-        except Exception:
-            pass
+        except sqlite3.Error:
+            _logger.debug(
+                "Failed to close flow store after getting flow record", exc_info=True
+            )
     if not record:
         raise HTTPException(status_code=404, detail=f"Flow run {run_id} not found")
     return record
@@ -147,10 +153,10 @@ def sync_active_run_current_ticket_paths_after_reorder(
         if not changed:
             return
         store.update_flow_run_status(active.id, active.status, state=next_state)
-    except Exception as exc:
+    except (sqlite3.Error, RuntimeError) as exc:
         log.warning("Failed to sync current_ticket after reorder: %s", exc)
     finally:
         try:
             store.close()
-        except Exception as e:
+        except (sqlite3.Error, RuntimeError) as e:
             log.debug("Store close failed: %s", e)

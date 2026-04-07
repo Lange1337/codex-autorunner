@@ -8,7 +8,9 @@ from fastapi.responses import JSONResponse
 
 from ....core import update as update_core
 from ....core.config import HubConfig
+from ....core.constants import DEFAULT_UPDATE_REPO_REF, DEFAULT_UPDATE_REPO_URL
 from ....core.self_describe import collect_describe_data
+from ....core.text_utils import _pid_is_running
 from ....core.update import (
     UpdateInProgressError,
     _format_update_confirmation_warning,
@@ -33,7 +35,7 @@ from ..schemas import (
 from ..static_assets import missing_static_assets
 from ..static_refresh import refresh_static_assets
 
-_pid_is_running = update_core._pid_is_running
+_pid_is_running = _pid_is_running
 _system_update_worker = update_core._system_update_worker
 _update_lock_active = update_core._update_lock_active
 _update_lock_path = update_core._update_lock_path
@@ -133,8 +135,8 @@ def build_system_routes() -> APIRouter:
         except AttributeError:
             config = None
 
-        repo_url = "https://github.com/Git-on-my-level/codex-autorunner.git"
-        repo_ref = "main"
+        repo_url = DEFAULT_UPDATE_REPO_URL
+        repo_ref = DEFAULT_UPDATE_REPO_REF
         if config and isinstance(config, HubConfig):
             configured_url = getattr(config, "update_repo_url", None)
             if configured_url:
@@ -147,7 +149,9 @@ def build_system_routes() -> APIRouter:
             return await asyncio.to_thread(
                 _system_update_check, repo_url=repo_url, repo_ref=repo_ref
             )
-        except Exception as e:
+        except (
+            Exception
+        ) as e:  # intentional: git check runs in thread, unknown failure surface
             logger = getattr(getattr(request.app, "state", None), "logger", None)
             if logger:
                 logger.error("Update check error: %s", e, exc_info=True)
@@ -167,8 +171,8 @@ def build_system_routes() -> APIRouter:
             config = None
 
         # Determine URL
-        repo_url = "https://github.com/Git-on-my-level/codex-autorunner.git"
-        repo_ref = "main"
+        repo_url = DEFAULT_UPDATE_REPO_URL
+        repo_ref = DEFAULT_UPDATE_REPO_REF
         skip_checks = False
         update_backend = "auto"
         update_services: Optional[dict[str, str]] = None
@@ -273,7 +277,7 @@ def build_system_routes() -> APIRouter:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except Exception as e:
+        except Exception as e:  # intentional: last-resort handler for update endpoint
             logger = getattr(getattr(request.app, "state", None), "logger", None)
             if logger:
                 logger.error("Update error: %s", e, exc_info=True)
@@ -331,7 +335,9 @@ def build_system_routes() -> APIRouter:
         try:
             repo_root = find_repo_root(request.app.state.engine.repo_root)
             return await asyncio.to_thread(collect_describe_data, repo_root)
-        except Exception as exc:
+        except (
+            Exception
+        ) as exc:  # intentional: diagnostic endpoint, surface any failure as 500
             logger = getattr(getattr(request.app, "state", None), "logger", None)
             if logger:
                 logger.error("Describe endpoint error: %s", exc, exc_info=True)

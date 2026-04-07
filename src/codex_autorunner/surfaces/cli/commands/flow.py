@@ -3,6 +3,7 @@
 import asyncio
 import atexit
 import json
+import logging
 import os
 import signal
 import threading
@@ -38,6 +39,8 @@ from ....core.utils import resolve_executable
 from ....tickets import AgentPool
 from ....tickets.files import list_ticket_paths, read_ticket, ticket_is_done
 from ....tickets.frontmatter import generate_ticket_id
+
+logger = logging.getLogger(__name__)
 
 
 def _build_force_attestation(
@@ -477,8 +480,8 @@ def register_flow_commands(
         if health.status in {"dead", "mismatch", "invalid"}:
             try:
                 clear_worker_metadata(health.artifact_path.parent)
-            except Exception:
-                pass
+            except OSError:
+                logger.debug("Failed to clear worker metadata", exc_info=True)
         if not health.pid:
             return
         try:
@@ -492,11 +495,15 @@ def register_flow_commands(
         except PermissionError:
             # Keep stop idempotent when process ownership changed unexpectedly.
             pass
-        except Exception:
+        except OSError:
             try:
                 os.kill(health.pid, signal.SIGTERM)
-            except Exception:
-                pass
+            except OSError:
+                logger.debug(
+                    "Fallback SIGTERM to worker pid %d failed",
+                    health.pid,
+                    exc_info=True,
+                )
 
     def _ticket_flow_controller(
         engine: RuntimeContext,
@@ -555,7 +562,7 @@ def register_flow_commands(
                 typer.echo(
                     f"Managed process cleanup: killed {cleanup.killed}, signaled {cleanup.signaled}, removed {cleanup.removed} records, skipped {cleanup.skipped}"
                 )
-        except Exception as exc:
+        except (OSError, RuntimeError) as exc:
             typer.echo(f"Managed process cleanup failed: {exc}", err=True)
         normalized_run_id = _normalize_flow_run_id(run_id)
         if normalized_run_id is None:
@@ -580,8 +587,8 @@ def register_flow_commands(
                     shutdown_intent=shutdown_intent,
                     artifacts_root=_artifacts_root,
                 )
-            except Exception:
-                pass
+            except OSError:
+                logger.debug("Failed to write worker exit info", exc_info=True)
 
         def _signal_handler(signum: int, _frame) -> None:
             exit_code_holder[0] = -signum
@@ -621,7 +628,7 @@ def register_flow_commands(
                     worker_run_id,
                     artifacts_root=artifacts_root,
                 )
-            except Exception as exc:
+            except (OSError, RuntimeError) as exc:
                 typer.echo(f"Failed to register worker metadata: {exc}", err=True)
 
             agent_pool: Optional[AgentPool] = None
@@ -705,7 +712,9 @@ def register_flow_commands(
                         typer.echo(f"Flow run {worker_run_id} cancelled by signal")
                 if not shutdown_wait_task.done():
                     shutdown_wait_task.cancel()
-            except Exception as exc:
+            except (
+                Exception
+            ) as exc:  # intentional: top-level worker crash handler; re-raises after logging
                 exit_code_holder[0] = 1
                 last_event = None
                 try:
@@ -718,7 +727,9 @@ def register_flow_commands(
                             method = msg.get("method")
                             if isinstance(method, str) and method.strip():
                                 last_event = method.strip()
-                except Exception:
+                except (
+                    Exception
+                ):  # intentional: best-effort diagnostic during crash handling
                     last_event = None
                 write_worker_crash_info(
                     engine.repo_root,
@@ -736,7 +747,9 @@ def register_flow_commands(
                 if agent_pool is not None:
                     try:
                         await agent_pool.close_all()
-                    except Exception:
+                    except (
+                        Exception
+                    ):  # intentional: best-effort cleanup; must not mask the original error
                         typer.echo("Failed to close agent pool cleanly", err=True)
                 _write_exit_info()
 

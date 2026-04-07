@@ -8,22 +8,12 @@ from typing import Any, Optional
 from ..manifest import ManifestError, load_manifest
 from .pma_thread_store import PmaThreadStore
 from .pr_bindings import PrBinding, PrBindingStore
+from .text_utils import _mapping, _normalize_text
 
 _BRANCH_METADATA_KEYS = ("head_branch", "branch", "git_branch")
 _THREAD_TARGET_ID_KEYS = ("thread_target_id", "managed_thread_id")
 _CONTEXT_MAPPING_KEYS = ("manual_context", "scm", "scm_context", "context")
 _RECENT_TERMINAL_THREAD_LOOKBACK = timedelta(hours=24)
-
-
-def _normalize_text(value: Any) -> Optional[str]:
-    if not isinstance(value, str):
-        return None
-    text = value.strip()
-    return text or None
-
-
-def _mapping(value: Any) -> Mapping[str, Any]:
-    return value if isinstance(value, Mapping) else {}
 
 
 def _parse_timestamp(value: Any) -> Optional[datetime]:

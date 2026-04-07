@@ -144,6 +144,9 @@ async def test_start_process_writes_registry_record(
         def __init__(self, *_args, **_kwargs) -> None:
             pass
 
+        async def close(self) -> None:
+            pass
+
         async def fetch_openapi_spec(self) -> dict[str, object]:
             return {"paths": {"/global/health": {}}}
 
@@ -485,6 +488,9 @@ async def test_attach_to_base_url_reuses_client_health_endpoint(
             captured["max_text_chars"] = max_text_chars
             captured["logger"] = logger
 
+        async def close(self) -> None:
+            pass
+
         async def health(self) -> dict[str, object]:
             return {"version": "1.2.3"}
 
@@ -513,6 +519,9 @@ async def test_attach_to_base_url_handles_auth_failure(
 
     class _FakeClient:
         def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        async def close(self) -> None:
             pass
 
         async def health(self) -> dict[str, object]:
@@ -672,6 +681,9 @@ async def test_attach_to_base_url_handles_endpoint_mismatch(
 
     class _FakeClient:
         def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        async def close(self) -> None:
             pass
 
         async def health(self) -> dict[str, object]:

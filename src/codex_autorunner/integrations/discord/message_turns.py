@@ -312,7 +312,7 @@ async def _acknowledge_discord_progress_reuse(
                 "components": [],
             },
         )
-    except Exception:
+    except (RuntimeError, ConnectionError, OSError):
         return False
     return True
 
@@ -325,7 +325,7 @@ def _get_thread_runtime_binding(
         return None
     try:
         return getter(thread_target_id)
-    except Exception:
+    except (AttributeError, KeyError, TypeError, RuntimeError):
         return None
 
 
@@ -740,7 +740,7 @@ async def handle_message_event(
                     hub_root=service._config.root,
                     prompt_state_key=session_key,
                 )
-            except Exception as exc:
+            except (OSError, ValueError, KeyError, TypeError) as exc:
                 log_event_fn(
                     service._logger,
                     logging.WARNING,
@@ -808,7 +808,16 @@ async def handle_message_event(
                 DiscordMessageTurnResult,
                 await service._run_agent_turn_for_message(**run_turn_kwargs),
             )
-        except Exception as exc:
+        except (
+            RuntimeError,
+            ConnectionError,
+            OSError,
+            ValueError,
+            TypeError,
+            KeyError,
+            TimeoutError,
+            AttributeError,
+        ) as exc:
             log_event_fn(
                 service._logger,
                 logging.WARNING,
@@ -1272,14 +1281,20 @@ async def _finalize_discord_thread_execution(
                         run_events_dispatched += 1
                         try:
                             await on_progress_event(run_event)
-                        except Exception:
+                        except (
+                            RuntimeError,
+                            ConnectionError,
+                            OSError,
+                            ValueError,
+                            TypeError,
+                        ):
                             _logger.debug(
                                 "Discord progress event handler failed for %s",
                                 type(run_event).__name__,
                                 exc_info=True,
                             )
                             continue
-            except Exception:
+            except (RuntimeError, ConnectionError, OSError, ValueError, TypeError):
                 _logger.warning("Discord progress event pump failed", exc_info=True)
             finally:
                 _logger.info(
@@ -1317,7 +1332,7 @@ async def _finalize_discord_thread_execution(
                 timeout_seconds=DISCORD_PMA_TIMEOUT_SECONDS,
                 execution_error_message=public_execution_error,
             )
-    except Exception:
+    except (RuntimeError, ConnectionError, OSError, ValueError, TypeError):
         outcome = RuntimeThreadOutcome(
             status="error",
             assistant_text="",
@@ -1357,7 +1372,7 @@ async def _finalize_discord_thread_execution(
         timeline_events.append(terminal_event)
         try:
             await on_progress_event(terminal_event)
-        except Exception:
+        except (RuntimeError, ConnectionError, OSError):
             _logger.debug("Discord terminal progress event failed", exc_info=True)
     else:
         timeline_events.append(terminal_run_event_from_outcome(outcome, event_state))
@@ -1439,7 +1454,7 @@ async def _finalize_discord_thread_execution(
                 assistant_text=resolved_assistant_text,
             )
             transcript_turn_id = managed_turn_id
-        except Exception as exc:
+        except OSError as exc:
             service._logger.warning(
                 "Failed to persist Discord transcript (thread=%s turn=%s): %s",
                 managed_thread_id,
@@ -1780,7 +1795,7 @@ async def _run_discord_orchestrated_turn_for_message(
                 message_id=progress_message_id,
                 payload=payload,
             )
-        except Exception:
+        except (RuntimeError, ConnectionError, OSError):
             _logger.debug(
                 "Discord progress edit failed for message=%s",
                 progress_message_id,
@@ -1832,7 +1847,7 @@ async def _run_discord_orchestrated_turn_for_message(
                 progress_rendered = initial_content
                 progress_last_updated = time.monotonic()
                 progress_heartbeat_task = asyncio.create_task(_progress_heartbeat())
-    except Exception:
+    except (RuntimeError, ConnectionError, OSError):
         service._logger.warning(
             "Discord progress placeholder send failed for channel=%s",
             channel_id,
@@ -1860,7 +1875,7 @@ async def _run_discord_orchestrated_turn_for_message(
             client_request_id=f"discord:{channel_id}:{uuid.uuid4().hex[:12]}",
             sandbox_policy=sandbox_policy,
         )
-    except Exception:
+    except (RuntimeError, ConnectionError, OSError, ValueError, TypeError):
         await _stop_progress_heartbeat()
         if progress_message_id:
             await service._delete_channel_message_safe(
@@ -1882,7 +1897,7 @@ async def _run_discord_orchestrated_turn_for_message(
         try:
             if progress_message_id:
                 await _edit_progress(force=True)
-        except Exception:
+        except (RuntimeError, ConnectionError, OSError):
             _logger.debug(
                 "Discord queued-state progress edit failed for channel=%s",
                 channel_id,
@@ -2026,8 +2041,10 @@ async def _send_discord_turn_section(
                 caption=attachment_caption,
             )
             return
-        except Exception:
-            pass
+        except (ConnectionError, OSError, TimeoutError):
+            _logger.debug(
+                "attachment upload failed, falling back to chunks", exc_info=True
+            )
     if not chunks:
         chunks = ["(No response text returned.)"]
     for idx, chunk in enumerate(chunks, 1):

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -17,7 +16,10 @@ from .managed_thread_status import (
     build_managed_thread_status_snapshot,
     transition_managed_thread_status,
 )
-from .orchestration.legacy_backfill_gate import ensure_legacy_orchestration_backfill
+from .orchestration.legacy_backfill_gate import (
+    backfill_legacy_thread_state,
+    ensure_legacy_orchestration_backfill,
+)
 from .orchestration.models import normalize_resource_owner_fields
 from .orchestration.runtime_bindings import (
     RuntimeThreadBinding,
@@ -26,7 +28,8 @@ from .orchestration.runtime_bindings import (
     set_runtime_thread_binding,
 )
 from .orchestration.sqlite import open_orchestration_sqlite
-from .sqlite_utils import open_sqlite
+from .pma_thread_mirror import legacy_mirror_enabled, sync_legacy_mirror
+from .text_utils import _json_dumps, _json_loads_object
 from .time_utils import now_iso
 
 PMA_THREADS_DB_FILENAME = "threads.sqlite3"
@@ -94,20 +97,6 @@ def _normalize_request_kind(value: Any) -> str:
     if normalized == "review":
         return "review"
     return "message"
-
-
-def _json_dumps(value: dict[str, Any]) -> str:
-    return json.dumps(value, separators=(",", ":"), sort_keys=True, ensure_ascii=True)
-
-
-def _json_loads_object(raw: Any) -> dict[str, Any]:
-    if not isinstance(raw, str) or not raw.strip():
-        return {}
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
 
 
 def _sanitize_thread_metadata(metadata: Optional[dict[str, Any]]) -> dict[str, Any]:
@@ -403,6 +392,19 @@ class PmaThreadStore:
     def hub_root(self) -> Path:
         return self._hub_root
 
+    def _run_legacy_mirror(self, conn: Any) -> None:
+        if not legacy_mirror_enabled():
+            return
+        sync_legacy_mirror(
+            hub_root=self._hub_root,
+            legacy_db_path=self._path,
+            durable=self._durable,
+            orchestration_conn=conn,
+            thread_row_to_record=self._thread_row_to_record,
+            execution_row_to_record=self._execution_row_to_record,
+            ensure_legacy_schema=_ensure_schema,
+        )
+
     def _initialize(self) -> None:
         with pma_threads_db_lock(self._path):
             ensure_legacy_orchestration_backfill(
@@ -413,7 +415,8 @@ class PmaThreadStore:
                 self._hub_root,
                 durable=self._durable,
             ) as conn:
-                self._sync_legacy_mirror(conn)
+                backfill_legacy_thread_state(self._hub_root, conn)
+                self._run_legacy_mirror(conn)
 
     @contextmanager
     def _read_conn(self) -> Iterator[Any]:
@@ -439,7 +442,7 @@ class PmaThreadStore:
                 durable=self._durable,
             ) as conn:
                 yield conn
-                self._sync_legacy_mirror(conn)
+                self._run_legacy_mirror(conn)
 
     def _thread_row_to_record(self, row: Any) -> dict[str, Any]:
         metadata = (
@@ -1772,156 +1775,6 @@ class PmaThreadStore:
                     ),
                 )
         return next_id
-
-    def _sync_legacy_mirror(self, conn: Any) -> None:
-        with open_sqlite(self._path, durable=self._durable) as legacy_conn:
-            _ensure_schema(legacy_conn)
-            thread_rows = conn.execute(
-                """
-                SELECT *
-                  FROM orch_thread_targets
-                 ORDER BY created_at ASC, thread_target_id ASC
-                """
-            ).fetchall()
-            execution_rows = conn.execute(
-                """
-                SELECT *
-                  FROM orch_thread_executions
-                 ORDER BY started_at ASC, execution_id ASC
-                """
-            ).fetchall()
-            action_rows = conn.execute(
-                """
-                SELECT *
-                  FROM orch_thread_actions
-                 ORDER BY CAST(action_id AS INTEGER) ASC, action_id ASC
-                """
-            ).fetchall()
-            with legacy_conn:
-                legacy_conn.execute("DELETE FROM pma_managed_actions")
-                legacy_conn.execute("DELETE FROM pma_managed_turns")
-                legacy_conn.execute("DELETE FROM pma_managed_threads")
-                for row in thread_rows:
-                    legacy = self._thread_row_to_record(row)
-                    runtime_binding = get_runtime_thread_binding(
-                        self._hub_root, legacy["managed_thread_id"]
-                    )
-                    legacy_conn.execute(
-                        """
-                        INSERT INTO pma_managed_threads (
-                            managed_thread_id,
-                            agent,
-                            repo_id,
-                            resource_kind,
-                            resource_id,
-                            workspace_root,
-                            name,
-                            backend_thread_id,
-                            status,
-                            normalized_status,
-                            status_reason_code,
-                            status_updated_at,
-                            status_terminal,
-                            status_turn_id,
-                            last_turn_id,
-                            last_message_preview,
-                            compact_seed,
-                            metadata_json,
-                            created_at,
-                            updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            legacy["managed_thread_id"],
-                            legacy["agent"],
-                            legacy["repo_id"],
-                            legacy["resource_kind"],
-                            legacy["resource_id"],
-                            legacy["workspace_root"],
-                            legacy["name"],
-                            (
-                                runtime_binding.backend_thread_id
-                                if runtime_binding is not None
-                                else None
-                            ),
-                            legacy["status"],
-                            legacy["normalized_status"],
-                            legacy["status_reason_code"],
-                            legacy["status_updated_at"],
-                            1 if legacy["status_terminal"] else 0,
-                            legacy["status_turn_id"],
-                            legacy["last_turn_id"],
-                            legacy["last_message_preview"],
-                            legacy["compact_seed"],
-                            _json_dumps(
-                                legacy["metadata"]
-                                if isinstance(legacy.get("metadata"), dict)
-                                else {}
-                            ),
-                            legacy["created_at"],
-                            legacy["updated_at"],
-                        ),
-                    )
-                for row in execution_rows:
-                    legacy = self._execution_row_to_record(row)
-                    legacy_conn.execute(
-                        """
-                        INSERT INTO pma_managed_turns (
-                            managed_turn_id,
-                            managed_thread_id,
-                            client_turn_id,
-                            backend_turn_id,
-                            prompt,
-                            status,
-                            assistant_text,
-                            transcript_turn_id,
-                            model,
-                            reasoning,
-                            error,
-                            started_at,
-                            finished_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            legacy["managed_turn_id"],
-                            legacy["managed_thread_id"],
-                            legacy["client_turn_id"],
-                            legacy["backend_turn_id"],
-                            legacy["prompt"],
-                            legacy["status"],
-                            legacy["assistant_text"],
-                            legacy["transcript_turn_id"],
-                            legacy["model"],
-                            legacy["reasoning"],
-                            legacy["error"],
-                            legacy["started_at"],
-                            legacy["finished_at"],
-                        ),
-                    )
-                for row in action_rows:
-                    action_id = str(row["action_id"] or "").strip()
-                    try:
-                        legacy_action_id = int(action_id)
-                    except ValueError:
-                        continue
-                    legacy_conn.execute(
-                        """
-                        INSERT INTO pma_managed_actions (
-                            action_id,
-                            managed_thread_id,
-                            action_type,
-                            payload_json,
-                            created_at
-                        ) VALUES (?, ?, ?, ?, ?)
-                        """,
-                        (
-                            legacy_action_id,
-                            row["thread_target_id"],
-                            row["action_type"],
-                            row["payload_json"],
-                            row["created_at"],
-                        ),
-                    )
 
 
 __all__ = [

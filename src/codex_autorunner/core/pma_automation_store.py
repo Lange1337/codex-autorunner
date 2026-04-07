@@ -32,6 +32,7 @@ from .pma_automation_types import (
     _parse_iso,
     default_pma_automation_state,
 )
+from .text_utils import lock_path_for
 
 logger = logging.getLogger(__name__)
 
@@ -364,7 +365,7 @@ class PmaAutomationStore:
         return self._path
 
     def _lock_path(self) -> Path:
-        return self._persistence._lock_path()
+        return lock_path_for(self._persistence.path)
 
     def load(self) -> dict[str, Any]:
         with file_lock(self._lock_path()):
@@ -442,8 +443,7 @@ class PmaAutomationStore:
         dropped_wakeups = len(wakeups) - len(filtered_wakeups)
         if dropped_timers or dropped_wakeups:
             logger.warning(
-                "Dropping orphaned automation rows before save "
-                "(timers=%s, wakeups=%s)",
+                "Dropping orphaned automation rows before save (timers=%s, wakeups=%s)",
                 dropped_timers,
                 dropped_wakeups,
             )
@@ -786,7 +786,7 @@ class PmaAutomationStore:
                 continue
             try:
                 out.append(PmaLifecycleSubscription.from_dict(entry))
-            except Exception:
+            except (TypeError, ValueError, KeyError):
                 continue
         return out
 
@@ -802,7 +802,7 @@ class PmaAutomationStore:
                 continue
             try:
                 out.append(PmaAutomationTimer.from_dict(entry))
-            except Exception:
+            except (TypeError, ValueError, KeyError):
                 continue
         return out
 
@@ -818,7 +818,7 @@ class PmaAutomationStore:
                 continue
             try:
                 out.append(PmaAutomationWakeup.from_dict(entry))
-            except Exception:
+            except (TypeError, ValueError, KeyError):
                 continue
         return out
 
@@ -840,7 +840,7 @@ class PmaAutomationStore:
             return None
         try:
             parsed = int(value)
-        except Exception:
+        except (ValueError, TypeError):
             return None
         if parsed < 0:
             return None
@@ -911,11 +911,6 @@ class PmaAutomationStore:
         )
         return {"subscription": created.to_dict(), "deduped": deduped}
 
-    def add_subscription(
-        self, payload: Optional[dict[str, Any]] = None, **kwargs: Any
-    ) -> dict[str, Any]:
-        return self.create_subscription(payload=payload, **kwargs)
-
     def cancel_subscription(self, subscription_id: str) -> bool:
         target_id = _normalize_text(subscription_id)
         if target_id is None:
@@ -935,12 +930,6 @@ class PmaAutomationStore:
             if changed:
                 self._save_structured_unlocked(state, subscriptions, timers, wakeups)
             return changed
-
-    def delete_subscription(self, subscription_id: str, **_: Any) -> bool:
-        return self.cancel_subscription(subscription_id)
-
-    def remove_subscription(self, subscription_id: str, **_: Any) -> bool:
-        return self.cancel_subscription(subscription_id)
 
     def purge_subscription(
         self, subscription_id: str, *, require_inactive: bool = True
@@ -1160,11 +1149,6 @@ class PmaAutomationStore:
         )
         return {"timer": created.to_dict(), "deduped": deduped}
 
-    def add_timer(
-        self, payload: Optional[dict[str, Any]] = None, **kwargs: Any
-    ) -> dict[str, Any]:
-        return self.create_timer(payload=payload, **kwargs)
-
     def cancel_timer(self, timer_id: str) -> bool:
         target_id = _normalize_text(timer_id)
         if target_id is None:
@@ -1184,12 +1168,6 @@ class PmaAutomationStore:
             if changed:
                 self._save_structured_unlocked(state, subscriptions, timers, wakeups)
             return changed
-
-    def delete_timer(self, timer_id: str, **_: Any) -> bool:
-        return self.cancel_timer(timer_id)
-
-    def remove_timer(self, timer_id: str, **_: Any) -> bool:
-        return self.cancel_timer(timer_id)
 
     def purge_timer(self, timer_id: str, *, require_inactive: bool = True) -> bool:
         target_id = _normalize_text(timer_id)
@@ -1581,26 +1559,6 @@ class PmaAutomationStore:
             "timestamp": timestamp,
         }
 
-    def record_transition(
-        self, payload: Optional[dict[str, Any]] = None, **kwargs: Any
-    ) -> dict[str, Any]:
-        return self.notify_transition(payload=payload, **kwargs)
-
-    def handle_transition(
-        self, payload: Optional[dict[str, Any]] = None, **kwargs: Any
-    ) -> dict[str, Any]:
-        return self.notify_transition(payload=payload, **kwargs)
-
-    def on_transition(
-        self, payload: Optional[dict[str, Any]] = None, **kwargs: Any
-    ) -> dict[str, Any]:
-        return self.notify_transition(payload=payload, **kwargs)
-
-    def process_transition(
-        self, payload: Optional[dict[str, Any]] = None, **kwargs: Any
-    ) -> dict[str, Any]:
-        return self.notify_transition(payload=payload, **kwargs)
-
     def mark_wakeup_dispatched(
         self, wakeup_id: str, *, dispatched_at: Optional[str] = None
     ) -> bool:
@@ -1624,11 +1582,6 @@ class PmaAutomationStore:
             if changed:
                 self._save_structured_unlocked(state, subscriptions, timers, wakeups)
             return changed
-
-    def mark_event_dispatched(
-        self, wakeup_id: str, *, dispatched_at: Optional[str] = None
-    ) -> bool:
-        return self.mark_wakeup_dispatched(wakeup_id, dispatched_at=dispatched_at)
 
     def purge_wakeup(self, wakeup_id: str, *, require_inactive: bool = True) -> bool:
         target_id = _normalize_text(wakeup_id)

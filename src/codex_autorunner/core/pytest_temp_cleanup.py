@@ -253,21 +253,24 @@ def system_temp_root() -> Path:
 
 
 def _tree_size_bytes(root: Path) -> int:
-    if not root.exists():
-        return 0
-    if root.is_file():
-        try:
-            return root.stat().st_size
-        except OSError:
+    try:
+        if not root.exists():
             return 0
-    total = 0
-    for candidate in root.rglob("*"):
-        try:
-            if candidate.is_file():
-                total += candidate.stat().st_size
-        except OSError:
-            continue
-    return total
+        if root.is_file():
+            try:
+                return root.stat().st_size
+            except OSError:
+                return 0
+        total = 0
+        for candidate in root.rglob("*"):
+            try:
+                if candidate.is_file():
+                    total += candidate.stat().st_size
+            except OSError:
+                continue
+        return total
+    except OSError:
+        return 0
 
 
 def _remove_empty_parent_dirs(start: Path, *, stop_before: str | Path) -> None:

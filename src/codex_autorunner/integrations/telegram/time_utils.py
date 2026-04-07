@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
+from ...core.text_utils import _parse_iso_timestamp
+
 
 def _coerce_datetime(value: Any) -> Optional[datetime]:
     if isinstance(value, bool):
@@ -13,7 +15,7 @@ def _coerce_datetime(value: Any) -> Optional[datetime]:
             seconds /= 1000.0
         try:
             return datetime.fromtimestamp(seconds, tz=timezone.utc)
-        except Exception:
+        except (ValueError, OSError, OverflowError):
             return None
     if isinstance(value, str):
         dt = _parse_iso_timestamp(value)
@@ -21,21 +23,9 @@ def _coerce_datetime(value: Any) -> Optional[datetime]:
             return dt
         try:
             return _coerce_datetime(float(value))
-        except Exception:
+        except (ValueError, TypeError):
             return None
     return None
-
-
-def _parse_iso_timestamp(value: Optional[str]) -> Optional[datetime]:
-    if not value:
-        return None
-    try:
-        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except Exception:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
 
 
 def _format_friendly_time(value: datetime) -> str:

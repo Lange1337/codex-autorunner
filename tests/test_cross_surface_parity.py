@@ -217,7 +217,13 @@ def test_cross_surface_parity_report(hub_env) -> None:
     trigger_mode_text = trigger_mode_path.read_text(encoding="utf-8")
     telegram_messages_text = telegram_messages_path.read_text(encoding="utf-8")
 
-    telegram_shell_passthrough = "def _handle_bang_shell(" in runtime_text
+    telegram_shell_passthrough = (
+        "def _handle_bang_shell(" in runtime_text
+        or "def _handle_bang_shell("
+        in Path(
+            "src/codex_autorunner/integrations/telegram/handlers/commands/shared.py"
+        ).read_text(encoding="utf-8")
+    )
     checks.append(
         ParityCheck(
             entrypoint="telegram",
@@ -285,6 +291,9 @@ def test_cross_surface_parity_report(hub_env) -> None:
     discord_dispatch_path = Path(
         "src/codex_autorunner/integrations/discord/car_command_dispatch.py"
     )
+    discord_interaction_dispatch_path = Path(
+        "src/codex_autorunner/integrations/discord/interaction_dispatch.py"
+    )
     discord_commands_text = (
         discord_commands_path.read_text(encoding="utf-8")
         if discord_commands_path.exists()
@@ -298,6 +307,11 @@ def test_cross_surface_parity_report(hub_env) -> None:
     discord_dispatch_text = (
         discord_dispatch_path.read_text(encoding="utf-8")
         if discord_dispatch_path.exists()
+        else ""
+    )
+    discord_interaction_dispatch_text = (
+        discord_interaction_dispatch_path.read_text(encoding="utf-8")
+        if discord_interaction_dispatch_path.exists()
         else ""
     )
 
@@ -341,10 +355,13 @@ def test_cross_surface_parity_report(hub_env) -> None:
         )
     )
 
+    _combined_discord_text = (
+        discord_service_text + "\n" + discord_interaction_dispatch_text
+    )
     discord_shared_command_ingress = (
         "integrations.chat.command_ingress import canonicalize_command_ingress"
-        in discord_service_text
-        and discord_service_text.count("canonicalize_command_ingress(") >= 2
+        in _combined_discord_text
+        and _combined_discord_text.count("canonicalize_command_ingress(") >= 2
     )
     checks.append(
         ParityCheck(

@@ -111,7 +111,7 @@ def _is_probably_corrupt_flow_db_error(exc: Exception, db_path: Path) -> bool:
     if "disk i/o error" in msg:
         try:
             header = db_path.read_bytes()[:16]
-        except Exception:
+        except OSError:
             return False
         return header not in (b"", b"SQLite format 3\x00")
     return False
@@ -127,14 +127,14 @@ def _rotate_corrupt_flow_db(db_path: Path, detail: str) -> Optional[Path]:
         try:
             db_path.replace(backup_path)
             backup_value = str(backup_path)
-        except Exception:
+        except OSError:
             backup_value = ""
 
     for suffix in ("-wal", "-shm"):
         sidecar = db_path.with_name(f"{db_path.name}{suffix}")
         try:
             sidecar.unlink(missing_ok=True)
-        except Exception:
+        except OSError:
             pass
 
     notice = {
@@ -146,7 +146,7 @@ def _rotate_corrupt_flow_db(db_path: Path, detail: str) -> Optional[Path]:
     }
     try:
         atomic_write(notice_path, json.dumps(notice, indent=2) + "\n")
-    except Exception:
+    except OSError:
         _logger.warning("Failed to write flow DB corruption notice at %s", notice_path)
     return backup_path if backup_value else None
 
@@ -163,8 +163,8 @@ def _evict_cached_controller(
         return
     try:
         controller.shutdown()
-    except Exception:
-        pass
+    except (OSError, sqlite3.Error, RuntimeError):  # intentional: defensive cleanup
+        _logger.debug("Failed to shutdown cached flow controller", exc_info=True)
 
 
 def _recover_flow_store_if_possible(
@@ -189,7 +189,11 @@ def _recover_flow_store_if_possible(
             exc,
         )
         return True
-    except Exception as recover_exc:
+    except (
+        sqlite3.Error,
+        OSError,
+        RuntimeError,
+    ) as recover_exc:  # intentional: recovery attempt
         _logger.warning(
             "Flow DB recovery failed at %s after error %s: %s",
             db_path,
@@ -200,8 +204,8 @@ def _recover_flow_store_if_possible(
     finally:
         try:
             store.close()
-        except Exception:
-            pass
+        except (sqlite3.Error, OSError):  # intentional: defensive cleanup
+            _logger.debug("Failed to close flow store during recovery", exc_info=True)
 
 
 def _flow_paths(repo_root: Path) -> tuple[Path, Path]:
@@ -342,7 +346,11 @@ def _get_flow_controller(
         try:
             cached.initialize()
             return cached
-        except Exception as exc:
+        except (
+            sqlite3.Error,
+            OSError,
+            RuntimeError,
+        ) as exc:  # intentional: init with recovery fallback
             if not _recover_flow_store_if_possible(repo_root, flow_type, state, exc):
                 _evict_cached_controller(repo_root, flow_type, state)
                 _logger.warning("Failed to initialize cached flow controller: %s", exc)
@@ -364,12 +372,20 @@ def _get_flow_controller(
     controller = _new_controller()
     try:
         controller.initialize()
-    except Exception as exc:
+    except (
+        sqlite3.Error,
+        OSError,
+        RuntimeError,
+    ) as exc:  # intentional: init with recovery fallback
         if _recover_flow_store_if_possible(repo_root, flow_type, state, exc):
             controller = _new_controller()
             try:
                 controller.initialize()
-            except Exception as retry_exc:
+            except (
+                sqlite3.Error,
+                OSError,
+                RuntimeError,
+            ) as retry_exc:  # intentional: retry after DB recovery
                 _logger.warning(
                     "Failed to initialize flow controller after recovery: %s", retry_exc
                 )
@@ -465,23 +481,25 @@ def _cleanup_worker_handle(run_id: str, state: FlowRoutesState) -> None:
             write_worker_exit_info(
                 find_repo_root(), run_id, returncode=getattr(proc, "returncode", None)
             )
-        except Exception:
-            pass
+        except OSError:
+            _logger.debug(
+                "Failed to write worker exit info for %s", run_id, exc_info=True
+            )
     if proc and proc.poll() is None:
         try:
             proc.terminate()
-        except Exception:
+        except OSError:
             pass
 
     for stream in (stdout, stderr):
         if stream and not stream.closed:
             try:
                 stream.flush()
-            except Exception:
+            except OSError:
                 pass
             try:
                 stream.close()
-            except Exception:
+            except OSError:
                 pass
 
 
@@ -638,7 +656,12 @@ async def _start_flow_via_controller(
             run_id=run_id,
             metadata=request.metadata,
         )
-    except Exception as exc:
+    except (
+        sqlite3.Error,
+        OSError,
+        ValueError,
+        RuntimeError,
+    ) as exc:  # intentional: flow start with recovery fallback
         if _recover_flow_store_if_possible(repo_root, flow_type, state, exc):
             controller = _get_flow_controller(repo_root, flow_type, state)
             retry_run_id = _normalize_run_id(uuid.uuid4())
@@ -699,7 +722,7 @@ def _stop_worker(run_id: str, state: FlowRoutesState, timeout: float = 10.0) -> 
                     health.pid,
                 )
                 subprocess.run(["kill", str(health.pid)], check=False)
-            except Exception as exc:
+            except OSError as exc:
                 _logger.warning(
                     "Failed to stop untracked worker %s: %s", normalized_run_id, exc
                 )
@@ -715,7 +738,7 @@ def _stop_worker(run_id: str, state: FlowRoutesState, timeout: float = 10.0) -> 
                 "Worker for run %s did not exit in time, killing", normalized_run_id
             )
             proc.kill()
-        except Exception as exc:
+        except OSError as exc:
             _logger.warning("Error stopping worker %s: %s", normalized_run_id, exc)
 
     _cleanup_worker_handle(normalized_run_id, state)
@@ -821,7 +844,12 @@ def build_flow_routes() -> APIRouter:
                     active_only=True,
                     build_service=_build_flow_orchestration_service,
                 )
-            except Exception:
+            except (
+                sqlite3.Error,
+                OSError,
+                ValueError,
+                RuntimeError,
+            ):  # intentional: graceful degradation
                 active_records = []
             active = active_records[0] if active_records else None
             if active:
@@ -855,7 +883,13 @@ def build_flow_routes() -> APIRouter:
             record = await _start_flow_via_controller(
                 repo_root, flow_type, request, state, run_id=run_id
             )
-        except Exception as exc:
+        except (
+            sqlite3.Error,
+            OSError,
+            ValueError,
+            RuntimeError,
+            KeyError,
+        ) as exc:  # intentional: flow start with recovery fallback
             if _recover_flow_store_if_possible(repo_root, flow_type, state, exc):
                 run_id = _normalize_run_id(uuid.uuid4())
                 try:
@@ -947,7 +981,9 @@ def build_flow_routes() -> APIRouter:
                 ) from exc
             except RuntimeError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
-            except Exception as exc:  # pragma: no cover - defensive
+            except (
+                Exception
+            ) as exc:  # intentional: top-level error handler  # pragma: no cover
                 _logger.exception("Failed to seed ISSUE.md from GitHub: %s", exc)
                 raise HTTPException(
                     status_code=500, detail="Failed to fetch issue from GitHub"
@@ -1070,7 +1106,7 @@ You are the first ticket in a new ticket_flow run.
                             events = store.get_events_by_type(
                                 run.id, FlowEventType.DIFF_UPDATED
                             )
-                        except Exception:
+                        except sqlite3.Error:
                             continue
                         for ev in events:
                             data = ev.data or {}
@@ -1093,8 +1129,11 @@ You are the first ticket in a new ticket_flow run.
                 finally:
                     try:
                         store.close()
-                    except Exception:
-                        pass
+                    except (sqlite3.Error, OSError):
+                        _logger.debug(
+                            "Failed to close flow store after listing tickets",
+                            exc_info=True,
+                        )
 
         tickets = []
         for path in list_ticket_paths(ticket_dir):
@@ -1106,7 +1145,7 @@ You are the first ticket in a new ticket_flow run.
             try:
                 raw_body = path.read_text(encoding="utf-8")
                 _, parsed_body = parse_markdown_frontmatter(raw_body)
-            except Exception:
+            except (OSError, ValueError):
                 parsed_body = None
             rel_path = safe_relpath(path, repo_root)
             stable_ticket_id = ticket_stable_id(path)
@@ -1148,7 +1187,7 @@ You are the first ticket in a new ticket_flow run.
         try:
             raw_body = ticket_path.read_text(encoding="utf-8")
             parsed_frontmatter, parsed_body = parse_markdown_frontmatter(raw_body)
-        except Exception:
+        except (OSError, ValueError):
             parsed_frontmatter, parsed_body = {}, None
 
         return TicketResponse(
@@ -1345,7 +1384,7 @@ You are the first ticket in a new ticket_flow run.
                 _sync_active_run_current_ticket_paths_after_reorder(
                     repo_root, renamed_paths
                 )
-            except Exception as exc:
+            except (OSError, sqlite3.Error) as exc:
                 raise HTTPException(
                     status_code=400, detail=f"Failed to reorder ticket: {exc}"
                 ) from exc

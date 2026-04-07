@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
-import math
 import secrets
 import time
 from contextlib import suppress
@@ -30,6 +29,7 @@ from .....agents.opencode.runtime import (
     split_model_id,
 )
 from .....agents.registry import get_registered_agents, wrap_requested_agent_context
+from .....core.config_contract import ConfigError
 from .....core.context_awareness import (
     has_file_context_signal,
     maybe_inject_car_awareness,
@@ -73,6 +73,10 @@ from .....integrations.app_server.threads import (
     pma_topic_scoped_key,
 )
 from .....integrations.chat.compaction import match_pending_compact_seed
+from .....integrations.chat.constants import (
+    APP_SERVER_UNAVAILABLE_MESSAGE,
+    TOPIC_NOT_BOUND_MESSAGE,
+)
 from .....integrations.chat.runtime_thread_errors import (
     resolve_runtime_thread_error_detail as _resolve_runtime_thread_result_error_detail,
 )
@@ -84,7 +88,6 @@ from ....app_server.client import (
     CodexAppServerClient,
     CodexAppServerDisconnected,
     CodexAppServerResponseError,
-    _normalize_sandbox_policy,
 )
 from ...adapter import (
     TelegramMessage,
@@ -92,14 +95,11 @@ from ...adapter import (
 from ...config import AppServerUnavailableError
 from ...constants import (
     DEFAULT_INTERRUPT_TIMEOUT_SECONDS,
-    MAX_MENTION_BYTES,
     MAX_TOPIC_THREAD_HISTORY,
     PLACEHOLDER_TEXT,
     QUEUED_PLACEHOLDER_TEXT,
     RESUME_PREVIEW_ASSISTANT_LIMIT,
     RESUME_PREVIEW_USER_LIMIT,
-    SHELL_MESSAGE_BUFFER_CHARS,
-    TELEGRAM_MAX_MESSAGE_LENGTH,
     WHISPER_TRANSCRIPT_DISCLAIMER,
     TurnKey,
 )
@@ -109,14 +109,8 @@ from ...helpers import (
     _compact_preview,
     _compose_agent_response,
     _compose_interrupt_response,
-    _extract_command_result,
     _extract_thread_id,
-    _format_shell_body,
-    _looks_binary,
-    _path_within,
-    _prepare_shell_response,
     _preview_from_text,
-    _render_command_output,
     _set_thread_summary,
     _with_conversation_id,
     format_public_error,
@@ -134,17 +128,7 @@ from .command_utils import (
     _format_httpx_exception,
     _format_opencode_exception,
 )
-from .shared import TelegramCommandSupportMixin
-
-FILES_HINT_TEMPLATE = (
-    "Inbox: {inbox}\n"
-    "Outbox (pending): {outbox}\n"
-    "Topic key: {topic_key}\n"
-    "Topic dir: {topic_dir}\n"
-    "Place files in outbox pending to send after this turn finishes.\n"
-    "Check delivery with /files outbox.\n"
-    "Max file size: {max_bytes} bytes."
-)
+from .shared import FILES_HINT_TEMPLATE, TelegramCommandSupportMixin
 
 _GENERIC_TELEGRAM_ERRORS = {
     "Telegram request failed",
@@ -183,15 +167,6 @@ class _TurnRunFailure:
     placeholder_id: Optional[int]
     transcript_message_id: Optional[int]
     transcript_text: Optional[str]
-
-
-@dataclass
-class _RuntimeStub:
-    current_turn_id: Optional[str] = None
-    current_turn_key: Optional[TurnKey] = None
-    interrupt_requested: bool = False
-    interrupt_message_id: Optional[int] = None
-    interrupt_turn_id: Optional[str] = None
 
 
 def _iter_exception_chain(exc: BaseException) -> list[BaseException]:
@@ -340,7 +315,11 @@ def _get_thread_runtime_binding(
         return None
     try:
         return getter(thread_target_id)
-    except Exception:
+    except (
+        AttributeError,
+        TypeError,
+        RuntimeError,
+    ):  # intentional: defensive guard for dynamic dispatch
         return None
 
 
@@ -779,14 +758,21 @@ async def _finalize_telegram_managed_thread_execution(
                         run_events_dispatched += 1
                         try:
                             await on_progress_event(run_event)
-                        except Exception:
+                        except (
+                            RuntimeError,
+                            ValueError,
+                            TypeError,
+                            ConnectionError,
+                            OSError,
+                            AttributeError,
+                        ):  # intentional: best-effort
                             handlers._logger.debug(
                                 "Telegram progress event handler failed for %s",
                                 type(run_event).__name__,
                                 exc_info=True,
                             )
                             continue
-            except Exception:
+            except Exception:  # intentional: event pump handler
                 handlers._logger.warning(
                     "Telegram progress event pump failed", exc_info=True
                 )
@@ -809,7 +795,13 @@ async def _finalize_telegram_managed_thread_execution(
             timeout_seconds=TELEGRAM_PMA_TIMEOUT_SECONDS,
             execution_error_message=public_execution_error,
         )
-    except Exception:
+    except (
+        RuntimeError,
+        OSError,
+        ValueError,
+        TypeError,
+        ConnectionError,
+    ):  # intentional: user-facing error display
         outcome = RuntimeThreadOutcome(
             status="error",
             assistant_text="",
@@ -849,7 +841,14 @@ async def _finalize_telegram_managed_thread_execution(
         timeline_events.append(terminal_event)
         try:
             await on_progress_event(terminal_event)
-        except Exception:
+        except (
+            RuntimeError,
+            ValueError,
+            TypeError,
+            ConnectionError,
+            OSError,
+            AttributeError,
+        ):  # intentional: best-effort
             handlers._logger.debug(
                 "Telegram terminal progress event failed", exc_info=True
             )
@@ -937,7 +936,7 @@ async def _finalize_telegram_managed_thread_execution(
                 assistant_text=resolved_assistant_text,
             )
             transcript_turn_id = managed_turn_id
-        except Exception as exc:
+        except OSError as exc:
             handlers._logger.warning(
                 "Failed to persist Telegram transcript (thread=%s turn=%s): %s",
                 managed_thread_id,
@@ -1077,7 +1076,7 @@ def _ensure_telegram_managed_thread_queue_worker(
             try:
                 await begin(chat_id, thread_id)
                 began = True
-            except Exception as exc:
+            except (OSError, RuntimeError, ValueError) as exc:
                 log_event(
                     handlers._logger,
                     logging.DEBUG,
@@ -1092,7 +1091,7 @@ def _ensure_telegram_managed_thread_queue_worker(
             if began and callable(end):
                 try:
                     await end(chat_id, thread_id)
-                except Exception as exc:
+                except (OSError, RuntimeError, ValueError) as exc:
                     log_event(
                         handlers._logger,
                         logging.DEBUG,
@@ -1188,6 +1187,31 @@ def _sync_pma_registry_thread_id(
     registry.set_thread_id(pma_key, backend_thread_id)
 
 
+async def _maybe_handlers_send_failure(
+    handlers: Any,
+    message: TelegramMessage,
+    failure_message: str,
+    *,
+    send: bool,
+    placeholder_id: Optional[int] = None,
+    transcript_message_id: Optional[int] = None,
+    transcript_text: Optional[str] = None,
+) -> _TurnRunFailure:
+    if send:
+        await handlers._send_message(
+            message.chat_id,
+            failure_message,
+            thread_id=message.thread_id,
+            reply_to=message.message_id,
+        )
+    return _TurnRunFailure(
+        failure_message,
+        placeholder_id,
+        transcript_message_id,
+        transcript_text,
+    )
+
+
 async def _run_telegram_managed_thread_turn(
     handlers: Any,
     *,
@@ -1250,14 +1274,27 @@ async def _run_telegram_managed_thread_turn(
                 thread_id=message.thread_id,
                 exc=exc,
             )
-            failure_message = "App server unavailable; try again or check logs."
-            if send_failure_response:
-                await handlers._send_message(
-                    message.chat_id,
-                    failure_message,
-                    thread_id=message.thread_id,
-                    reply_to=message.message_id,
-                )
+            failure_message = APP_SERVER_UNAVAILABLE_MESSAGE
+            return await _maybe_handlers_send_failure(
+                handlers,
+                message,
+                failure_message,
+                send=send_failure_response,
+                placeholder_id=prepared_placeholder_id,
+                transcript_message_id=transcript_message_id,
+                transcript_text=transcript_text,
+            )
+
+        if client is None:
+            return await _maybe_handlers_send_failure(
+                handlers,
+                message,
+                TOPIC_NOT_BOUND_MESSAGE,
+                send=send_failure_response,
+                placeholder_id=prepared_placeholder_id,
+                transcript_message_id=transcript_message_id,
+                transcript_text=transcript_text,
+            )
             return _TurnRunFailure(
                 failure_message,
                 prepared_placeholder_id,
@@ -1265,7 +1302,7 @@ async def _run_telegram_managed_thread_turn(
                 transcript_text,
             )
         if client is None:
-            failure_message = "Topic not bound. Use /bind <repo_id> or /bind <path>."
+            failure_message = TOPIC_NOT_BOUND_MESSAGE
             if send_failure_response:
                 await handlers._send_message(
                     message.chat_id,
@@ -1284,7 +1321,13 @@ async def _run_telegram_managed_thread_turn(
                 record.workspace_path,
                 **handlers._thread_start_kwargs(record),
             )
-        except Exception as exc:
+        except (
+            RuntimeError,
+            OSError,
+            ValueError,
+            TypeError,
+            ConnectionError,
+        ) as exc:  # intentional: user-facing error display
             log_event(
                 handlers._logger,
                 logging.WARNING,
@@ -1294,18 +1337,14 @@ async def _run_telegram_managed_thread_turn(
                 exc=exc,
             )
             failure_message = "Failed to start a new thread; check logs for details."
-            if send_failure_response:
-                await handlers._send_message(
-                    message.chat_id,
-                    failure_message,
-                    thread_id=message.thread_id,
-                    reply_to=message.message_id,
-                )
-            return _TurnRunFailure(
+            return await _maybe_handlers_send_failure(
+                handlers,
+                message,
                 failure_message,
-                prepared_placeholder_id,
-                transcript_message_id,
-                transcript_text,
+                send=send_failure_response,
+                placeholder_id=prepared_placeholder_id,
+                transcript_message_id=transcript_message_id,
+                transcript_text=transcript_text,
             )
         if not await handlers._require_thread_workspace(
             message,
@@ -1323,19 +1362,14 @@ async def _run_telegram_managed_thread_turn(
             )
         current_backend_thread_id = _extract_thread_id(thread_result)
         if not current_backend_thread_id:
-            failure_message = "Failed to start a new thread."
-            if send_failure_response:
-                await handlers._send_message(
-                    message.chat_id,
-                    failure_message,
-                    thread_id=message.thread_id,
-                    reply_to=message.message_id,
-                )
-            return _TurnRunFailure(
-                failure_message,
-                prepared_placeholder_id,
-                transcript_message_id,
-                transcript_text,
+            return await _maybe_handlers_send_failure(
+                handlers,
+                message,
+                "Failed to start a new thread.",
+                send=send_failure_response,
+                placeholder_id=prepared_placeholder_id,
+                transcript_message_id=transcript_message_id,
+                transcript_text=transcript_text,
             )
         apply_thread_result = getattr(handlers, "_apply_thread_result", None)
         if callable(apply_thread_result):
@@ -1440,7 +1474,13 @@ async def _run_telegram_managed_thread_turn(
             client_request_id=(f"telegram:{topic_key}:{secrets.token_hex(6)}"),
             sandbox_policy=sandbox_policy,
         )
-    except Exception as exc:
+    except (
+        RuntimeError,
+        OSError,
+        ValueError,
+        TypeError,
+        ConnectionError,
+    ) as exc:  # intentional: user-facing error display
         failure_message = _sanitize_runtime_thread_result_error(
             exc,
             public_error=public_execution_error,
@@ -1824,313 +1864,6 @@ class ExecutionCommands(TelegramCommandSupportMixin):
             sandbox_policy = record.sandbox_policy
         return approval_policy, sandbox_policy
 
-    async def _handle_bang_shell(
-        self, message: TelegramMessage, text: str, _runtime: Any
-    ) -> None:
-        """Handle !shell command."""
-        if not self._config.shell.enabled:
-            await self._send_message(
-                message.chat_id,
-                "Shell commands are disabled. Enable telegram_bot.shell.enabled.",
-                thread_id=message.thread_id,
-                reply_to=message.message_id,
-            )
-            return
-        record = await self._require_bound_record(message)
-        if not record:
-            return
-        command_text = text[1:].strip()
-        if not command_text:
-            await self._send_message(
-                message.chat_id,
-                "Prefix a command with ! to run it locally.\nExample: !ls",
-                thread_id=message.thread_id,
-                reply_to=message.message_id,
-            )
-            return
-        try:
-            client = await self._client_for_workspace(record.workspace_path)
-        except AppServerUnavailableError as exc:
-            log_event(
-                self._logger,
-                logging.WARNING,
-                "telegram.app_server.unavailable",
-                chat_id=message.chat_id,
-                thread_id=message.thread_id,
-                exc=exc,
-            )
-            await self._send_message(
-                message.chat_id,
-                "App server unavailable; try again or check logs.",
-                thread_id=message.thread_id,
-                reply_to=message.message_id,
-            )
-            return
-        if client is None:
-            await self._send_message(
-                message.chat_id,
-                "Topic not bound. Use /bind <repo_id> or /bind <path>.",
-                thread_id=message.thread_id,
-                reply_to=message.message_id,
-            )
-            return
-        placeholder_id = await self._send_placeholder(
-            message.chat_id,
-            thread_id=message.thread_id,
-            reply_to=message.message_id,
-        )
-        _approval_policy, sandbox_policy = self._effective_policies(record)
-        params: dict[str, Any] = {
-            "cwd": record.workspace_path,
-            "command": ["bash", "-lc", command_text],
-            "timeoutMs": self._config.shell.timeout_ms,
-        }
-        if sandbox_policy:
-            params["sandboxPolicy"] = _normalize_sandbox_policy(sandbox_policy)
-        timeout_seconds = max(0.1, self._config.shell.timeout_ms / 1000.0)
-        request_timeout = timeout_seconds + 1.0
-        try:
-            result = await client.request(
-                "command/exec", params, timeout=request_timeout
-            )
-        except asyncio.TimeoutError:
-            log_event(
-                self._logger,
-                logging.WARNING,
-                "telegram.shell.timeout",
-                chat_id=message.chat_id,
-                thread_id=message.thread_id,
-                command=command_text,
-                timeout_seconds=timeout_seconds,
-            )
-            timeout_label = int(math.ceil(timeout_seconds))
-            timeout_message = (
-                f"Shell command timed out after {timeout_label}s: `{command_text}`.\n"
-                "Interactive commands (top/htop/watch/tail -f) do not exit. "
-                "Try a one-shot flag like `top -l 1` (macOS) or "
-                "`top -b -n 1` (Linux)."
-            )
-            await self._deliver_turn_response(
-                chat_id=message.chat_id,
-                thread_id=message.thread_id,
-                reply_to=message.message_id,
-                placeholder_id=placeholder_id,
-                response=_with_conversation_id(
-                    timeout_message,
-                    chat_id=message.chat_id,
-                    thread_id=message.thread_id,
-                ),
-            )
-            return
-        except Exception as exc:
-            log_event(
-                self._logger,
-                logging.WARNING,
-                "telegram.shell.failed",
-                chat_id=message.chat_id,
-                thread_id=message.thread_id,
-                exc=exc,
-            )
-            await self._deliver_turn_response(
-                chat_id=message.chat_id,
-                thread_id=message.thread_id,
-                reply_to=message.message_id,
-                placeholder_id=placeholder_id,
-                response=_with_conversation_id(
-                    "Shell command failed; check logs for details.",
-                    chat_id=message.chat_id,
-                    thread_id=message.thread_id,
-                ),
-            )
-            return
-        stdout, stderr, exit_code = _extract_command_result(result)
-        full_body = _format_shell_body(command_text, stdout, stderr, exit_code)
-        max_output_chars = min(
-            self._config.shell.max_output_chars,
-            TELEGRAM_MAX_MESSAGE_LENGTH - SHELL_MESSAGE_BUFFER_CHARS,
-        )
-        filename = f"shell-output-{secrets.token_hex(4)}.txt"
-        response_text, attachment = _prepare_shell_response(
-            full_body,
-            max_output_chars=max_output_chars,
-            filename=filename,
-        )
-        await self._deliver_turn_response(
-            chat_id=message.chat_id,
-            thread_id=message.thread_id,
-            reply_to=message.message_id,
-            placeholder_id=placeholder_id,
-            response=response_text,
-        )
-        if attachment is not None:
-            await self._send_document(
-                message.chat_id,
-                attachment,
-                filename=filename,
-                thread_id=message.thread_id,
-                reply_to=message.message_id,
-            )
-
-    async def _handle_diff(
-        self, message: TelegramMessage, _args: str, _runtime: Any
-    ) -> None:
-        """Handle /diff command."""
-        record = await self._require_bound_record(message)
-        if not record:
-            return
-        client = await self._client_for_workspace(record.workspace_path)
-        if client is None:
-            await self._send_message(
-                message.chat_id,
-                "Topic not bound. Use /bind <repo_id> or /bind <path>.",
-                thread_id=message.thread_id,
-                reply_to=message.message_id,
-            )
-            return
-        command = (
-            "git rev-parse --is-inside-work-tree >/dev/null 2>&1 || "
-            "{ echo 'Not a git repo'; exit 0; }\n"
-            "git diff --color;\n"
-            "git ls-files --others --exclude-standard | "
-            'while read -r f; do git diff --color --no-index -- /dev/null "$f"; done'
-        )
-        try:
-            result = await client.request(
-                "command/exec",
-                {
-                    "cwd": record.workspace_path,
-                    "command": ["bash", "-lc", command],
-                    "timeoutMs": 10000,
-                },
-            )
-        except Exception as exc:
-            log_event(
-                self._logger,
-                logging.WARNING,
-                "telegram.diff.failed",
-                chat_id=message.chat_id,
-                thread_id=message.thread_id,
-                exc=exc,
-            )
-            await self._send_message(
-                message.chat_id,
-                _with_conversation_id(
-                    "Failed to compute diff; check logs for details.",
-                    chat_id=message.chat_id,
-                    thread_id=message.thread_id,
-                ),
-                thread_id=message.thread_id,
-                reply_to=message.message_id,
-            )
-            return
-        output = _render_command_output(result)
-        if not output.strip():
-            output = "(No diff output.)"
-        await self._send_message(
-            message.chat_id,
-            output,
-            thread_id=message.thread_id,
-            reply_to=message.message_id,
-        )
-
-    async def _handle_mention(
-        self, message: TelegramMessage, args: str, runtime: Any
-    ) -> None:
-        """Handle @mention command."""
-        record = await self._require_bound_record(message)
-        if not record:
-            return
-        argv = self._parse_command_args(args)
-        if not argv:
-            await self._send_message(
-                message.chat_id,
-                "Usage: /mention <path> [request]",
-                thread_id=message.thread_id,
-                reply_to=message.message_id,
-            )
-            return
-        workspace = canonicalize_path(Path(record.workspace_path or ""))
-        path = Path(argv[0]).expanduser()
-        if not path.is_absolute():
-            path = workspace / path
-        try:
-            path = canonicalize_path(path)
-        except Exception:
-            await self._send_message(
-                message.chat_id,
-                "Could not resolve that path.",
-                thread_id=message.thread_id,
-                reply_to=message.message_id,
-            )
-            return
-        if not _path_within(root=workspace, target=path):
-            await self._send_message(
-                message.chat_id,
-                "File must be within the bound workspace.",
-                thread_id=message.thread_id,
-                reply_to=message.message_id,
-            )
-            return
-        if not path.exists() or not path.is_file():
-            await self._send_message(
-                message.chat_id,
-                "File not found.",
-                thread_id=message.thread_id,
-                reply_to=message.message_id,
-            )
-            return
-        try:
-            data = path.read_bytes()
-        except Exception:
-            await self._send_message(
-                message.chat_id,
-                "Failed to read file.",
-                thread_id=message.thread_id,
-                reply_to=message.message_id,
-            )
-            return
-        if len(data) > MAX_MENTION_BYTES:
-            await self._send_message(
-                message.chat_id,
-                f"File too large (max {MAX_MENTION_BYTES} bytes).",
-                thread_id=message.thread_id,
-                reply_to=message.message_id,
-            )
-            return
-        if _looks_binary(data):
-            await self._send_message(
-                message.chat_id,
-                "File appears to be binary; refusing to include it.",
-                thread_id=message.thread_id,
-                reply_to=message.message_id,
-            )
-            return
-        text = data.decode("utf-8", errors="replace")
-        try:
-            display_path = str(path.relative_to(workspace))
-        except ValueError:
-            display_path = str(path)
-        request = " ".join(argv[1:]).strip()
-        if not request:
-            request = "Please review this file."
-        prompt = "\n".join(
-            [
-                "Please use the file below as authoritative context.",
-                "",
-                f'<file path="{display_path}">',
-                text,
-                "</file>",
-                "",
-                f"My request: {request}",
-            ]
-        )
-        await self._handle_normal_message(
-            message,
-            runtime,
-            text_override=prompt,
-            record=record,
-        )
-
     async def _await_turn_slot(
         self,
         turn_semaphore: asyncio.Semaphore,
@@ -2215,7 +1948,7 @@ class ExecutionCommands(TelegramCommandSupportMixin):
                 await client.turn_interrupt(
                     turn_handle.turn_id, thread_id=turn_handle.thread_id
                 )
-            except Exception as exc:
+            except (OSError, RuntimeError, ValueError) as exc:
                 log_event(
                     self._logger,
                     logging.WARNING,
@@ -2253,6 +1986,86 @@ class ExecutionCommands(TelegramCommandSupportMixin):
             with suppress(asyncio.CancelledError):
                 await timeout_task
 
+    async def _maybe_send_failure(
+        self,
+        message: TelegramMessage,
+        failure_message: str,
+        *,
+        send: bool,
+        placeholder_id: Optional[int] = None,
+        delete_placeholder: bool = False,
+        transcript_message_id: Optional[int] = None,
+        transcript_text: Optional[str] = None,
+    ) -> _TurnRunFailure:
+        if send:
+            await self._send_message(
+                message.chat_id,
+                failure_message,
+                thread_id=message.thread_id,
+                reply_to=message.message_id,
+            )
+            if delete_placeholder and placeholder_id is not None:
+                await self._delete_message(message.chat_id, placeholder_id)
+        return _TurnRunFailure(
+            failure_message,
+            placeholder_id,
+            transcript_message_id,
+            transcript_text,
+        )
+
+    def _finalize_turn_progress(
+        self,
+        turn_key: Optional[TurnKey],
+        turn_delivery_state: dict[str, str],
+    ) -> None:
+        if turn_key is None:
+            return
+        render_fn = getattr(self, "_render_turn_progress_summary", None)
+        if callable(render_fn):
+            turn_delivery_state["intermediate_response"] = render_fn(turn_key)
+        else:
+            render_fn = getattr(self, "_render_final_turn_progress", None)
+            if callable(render_fn):
+                turn_delivery_state["intermediate_response"] = render_fn(turn_key)
+        self._turn_contexts.pop(turn_key, None)
+        self._clear_thinking_preview(turn_key)
+        self._clear_turn_progress(turn_key)
+
+    async def _log_queue_wait_and_update_placeholder(
+        self,
+        message: TelegramMessage,
+        key: str,
+        thread_id: Optional[str],
+        turn_semaphore: asyncio.Semaphore,
+        queue_started_at: float,
+        placeholder_id: Optional[int],
+        placeholder_text: str,
+    ) -> None:
+        queue_wait_ms = int((time.monotonic() - queue_started_at) * 1000)
+        log_event(
+            self._logger,
+            logging.INFO,
+            "telegram.turn.queue_wait",
+            topic_key=key,
+            chat_id=message.chat_id,
+            thread_id=message.thread_id,
+            codex_thread_id=thread_id,
+            queue_wait_ms=queue_wait_ms,
+            queued=turn_semaphore.locked(),
+            max_parallel_turns=self._config.concurrency.max_parallel_turns,
+            per_topic_queue=self._config.concurrency.per_topic_queue,
+        )
+        if (
+            turn_semaphore.locked()
+            and placeholder_id is not None
+            and placeholder_text != PLACEHOLDER_TEXT
+        ):
+            await self._edit_message_text(
+                message.chat_id,
+                placeholder_id,
+                PLACEHOLDER_TEXT,
+            )
+
     async def _execute_opencode_turn(
         self,
         message: TelegramMessage,
@@ -2276,41 +2089,35 @@ class ExecutionCommands(TelegramCommandSupportMixin):
         supervisor = getattr(self, "_opencode_supervisor", None)
         turn_delivery_state: dict[str, str] = {}
         if supervisor is None:
-            failure_message = "OpenCode backend unavailable; install opencode or switch to /agent codex."
-            if send_failure_response:
-                await self._send_message(
-                    message.chat_id,
-                    failure_message,
-                    thread_id=message.thread_id,
-                    reply_to=message.message_id,
-                )
-            return _TurnRunFailure(
-                failure_message,
-                placeholder_id,
-                transcript_message_id,
-                transcript_text,
+            return await self._maybe_send_failure(
+                message,
+                "OpenCode backend unavailable; install opencode or switch to /agent codex.",
+                send=send_failure_response,
+                placeholder_id=placeholder_id,
+                transcript_message_id=transcript_message_id,
+                transcript_text=transcript_text,
             )
 
         workspace_root = self._canonical_workspace_root(record.workspace_path)
         if workspace_root is None:
-            failure_message = "Workspace unavailable."
-            if send_failure_response:
-                await self._send_message(
-                    message.chat_id,
-                    failure_message,
-                    thread_id=message.thread_id,
-                    reply_to=message.message_id,
-                )
-            return _TurnRunFailure(
-                failure_message,
-                placeholder_id,
-                transcript_message_id,
-                transcript_text,
+            return await self._maybe_send_failure(
+                message,
+                "Workspace unavailable.",
+                send=send_failure_response,
+                placeholder_id=placeholder_id,
+                transcript_message_id=transcript_message_id,
+                transcript_text=transcript_text,
             )
 
         try:
             opencode_client = await supervisor.get_client(workspace_root)
-        except Exception as exc:
+        except (
+            RuntimeError,
+            OSError,
+            ValueError,
+            TypeError,
+            ConnectionError,
+        ) as exc:  # intentional: user-facing error display
             log_event(
                 self._logger,
                 logging.WARNING,
@@ -2322,18 +2129,13 @@ class ExecutionCommands(TelegramCommandSupportMixin):
                 reason="opencode_client_failed",
             )
             failure_message = "OpenCode backend unavailable."
-            if send_failure_response:
-                await self._send_message(
-                    message.chat_id,
-                    failure_message,
-                    thread_id=message.thread_id,
-                    reply_to=message.message_id,
-                )
-            return _TurnRunFailure(
+            return await self._maybe_send_failure(
+                message,
                 failure_message,
-                placeholder_id,
-                transcript_message_id,
-                transcript_text,
+                send=send_failure_response,
+                placeholder_id=placeholder_id,
+                transcript_message_id=transcript_message_id,
+                transcript_text=transcript_text,
             )
 
         pma_mode = bool(pma_thread_registry and pma_thread_key)
@@ -2344,37 +2146,26 @@ class ExecutionCommands(TelegramCommandSupportMixin):
                         missing_thread_message
                         or "No active thread. Use /new to start one."
                     )
-                    if send_failure_response:
-                        await self._send_message(
-                            message.chat_id,
-                            failure_message,
-                            thread_id=message.thread_id,
-                            reply_to=message.message_id,
-                        )
-                    return _TurnRunFailure(
+                    return await self._maybe_send_failure(
+                        message,
                         failure_message,
-                        placeholder_id,
-                        transcript_message_id,
-                        transcript_text,
+                        send=send_failure_response,
+                        placeholder_id=placeholder_id,
+                        transcript_message_id=transcript_message_id,
+                        transcript_text=transcript_text,
                     )
                 session = await opencode_client.create_session(
                     directory=str(workspace_root)
                 )
                 thread_id = extract_session_id(session, allow_fallback_id=True)
                 if not thread_id:
-                    failure_message = "Failed to start a new OpenCode thread."
-                    if send_failure_response:
-                        await self._send_message(
-                            message.chat_id,
-                            failure_message,
-                            thread_id=message.thread_id,
-                            reply_to=message.message_id,
-                        )
-                    return _TurnRunFailure(
-                        failure_message,
-                        placeholder_id,
-                        transcript_message_id,
-                        transcript_text,
+                    return await self._maybe_send_failure(
+                        message,
+                        "Failed to start a new OpenCode thread.",
+                        send=send_failure_response,
+                        placeholder_id=placeholder_id,
+                        transcript_message_id=transcript_message_id,
+                        transcript_text=transcript_text,
                     )
 
                 def apply(record: "TelegramTopicRecord") -> None:
@@ -2463,30 +2254,15 @@ class ExecutionCommands(TelegramCommandSupportMixin):
             turn_elapsed_seconds = None
 
             try:
-                queue_wait_ms = int((time.monotonic() - queue_started_at) * 1000)
-                log_event(
-                    self._logger,
-                    logging.INFO,
-                    "telegram.turn.queue_wait",
-                    topic_key=key,
-                    chat_id=message.chat_id,
-                    thread_id=message.thread_id,
-                    codex_thread_id=thread_id,
-                    queue_wait_ms=queue_wait_ms,
-                    queued=turn_semaphore.locked(),
-                    max_parallel_turns=self._config.concurrency.max_parallel_turns,
-                    per_topic_queue=self._config.concurrency.per_topic_queue,
+                await self._log_queue_wait_and_update_placeholder(
+                    message,
+                    key,
+                    thread_id,
+                    turn_semaphore,
+                    queue_started_at,
+                    placeholder_id,
+                    placeholder_text,
                 )
-                if (
-                    turn_semaphore.locked()
-                    and placeholder_id is not None
-                    and placeholder_text != PLACEHOLDER_TEXT
-                ):
-                    await self._edit_message_text(
-                        message.chat_id,
-                        placeholder_id,
-                        PLACEHOLDER_TEXT,
-                    )
 
                 opencode_turn_started = False
                 try:
@@ -2508,18 +2284,13 @@ class ExecutionCommands(TelegramCommandSupportMixin):
                             f"{', '.join(missing_env)}. "
                             "Set them or switch models."
                         )
-                        if send_failure_response:
-                            await self._send_message(
-                                message.chat_id,
-                                failure_message,
-                                thread_id=message.thread_id,
-                                reply_to=message.message_id,
-                            )
-                        return _TurnRunFailure(
+                        return await self._maybe_send_failure(
+                            message,
                             failure_message,
-                            placeholder_id,
-                            transcript_message_id,
-                            transcript_text,
+                            send=send_failure_response,
+                            placeholder_id=placeholder_id,
+                            transcript_message_id=transcript_message_id,
+                            transcript_text=transcript_text,
                         )
 
                     turn_started_at = time.monotonic()
@@ -2556,23 +2327,14 @@ class ExecutionCommands(TelegramCommandSupportMixin):
                         runtime.current_turn_id = None
                         runtime.current_turn_key = None
                         runtime.interrupt_requested = False
-                        failure_message = "Turn collision detected; please retry."
-                        if send_failure_response:
-                            await self._send_message(
-                                message.chat_id,
-                                failure_message,
-                                thread_id=message.thread_id,
-                                reply_to=message.message_id,
-                            )
-                            if placeholder_id is not None:
-                                await self._delete_message(
-                                    message.chat_id, placeholder_id
-                                )
-                        return _TurnRunFailure(
-                            failure_message,
-                            placeholder_id,
-                            transcript_message_id,
-                            transcript_text,
+                        return await self._maybe_send_failure(
+                            message,
+                            "Turn collision detected; please retry.",
+                            send=send_failure_response,
+                            placeholder_id=placeholder_id,
+                            delete_placeholder=True,
+                            transcript_message_id=transcript_message_id,
+                            transcript_text=transcript_text,
                         )
 
                     await self._start_turn_progress(
@@ -2634,7 +2396,7 @@ class ExecutionCommands(TelegramCommandSupportMixin):
                             await asyncio.wait_for(
                                 opencode_client.abort(thread_id), timeout=10
                             )
-                        except Exception:
+                        except (asyncio.TimeoutError, ConnectionError, OSError):
                             pass
 
                     def _should_stop() -> bool:
@@ -2985,7 +2747,13 @@ class ExecutionCommands(TelegramCommandSupportMixin):
                             prompt_send_ms=prompt_send_ms,
                             endpoint="/session/{id}/prompt_async",
                         )
-                    except Exception as exc:
+                    except (
+                        RuntimeError,
+                        OSError,
+                        ValueError,
+                        TypeError,
+                        ConnectionError,
+                    ) as exc:  # intentional: cleanup before re-raise
                         if timeout_task is not None:
                             timeout_task.cancel()
                             with suppress(asyncio.CancelledError):
@@ -3069,18 +2837,13 @@ class ExecutionCommands(TelegramCommandSupportMixin):
 
             if output_result.error:
                 failure_message = f"OpenCode error: {output_result.error}"
-                if send_failure_response:
-                    await self._send_message(
-                        message.chat_id,
-                        failure_message,
-                        thread_id=message.thread_id,
-                        reply_to=message.message_id,
-                    )
-                return _TurnRunFailure(
+                return await self._maybe_send_failure(
+                    message,
                     failure_message,
-                    placeholder_id,
-                    transcript_message_id,
-                    transcript_text,
+                    send=send_failure_response,
+                    placeholder_id=placeholder_id,
+                    transcript_message_id=transcript_message_id,
+                    transcript_text=transcript_text,
                 )
 
             if output:
@@ -3115,7 +2878,7 @@ class ExecutionCommands(TelegramCommandSupportMixin):
                     "intermediate_response", ""
                 ),
             )
-        except Exception as exc:
+        except Exception as exc:  # intentional: top-level command handler
             log_extra: dict[str, Any] = {}
             if isinstance(exc, httpx.HTTPStatusError):
                 log_extra["status_code"] = exc.response.status_code
@@ -3135,39 +2898,16 @@ class ExecutionCommands(TelegramCommandSupportMixin):
                 _format_opencode_exception(exc)
                 or "OpenCode turn failed; check logs for details."
             )
-            if send_failure_response:
-                await self._send_message(
-                    message.chat_id,
-                    failure_message,
-                    thread_id=message.thread_id,
-                    reply_to=message.message_id,
-                )
-            return _TurnRunFailure(
+            return await self._maybe_send_failure(
+                message,
                 failure_message,
-                placeholder_id,
-                transcript_message_id,
-                transcript_text,
+                send=send_failure_response,
+                placeholder_id=placeholder_id,
+                transcript_message_id=transcript_message_id,
+                transcript_text=transcript_text,
             )
         finally:
-            if turn_key is not None:
-                render_turn_progress_summary = getattr(
-                    self, "_render_turn_progress_summary", None
-                )
-                if callable(render_turn_progress_summary):
-                    turn_delivery_state["intermediate_response"] = (
-                        render_turn_progress_summary(turn_key)
-                    )
-                else:
-                    render_final_turn_progress = getattr(
-                        self, "_render_final_turn_progress", None
-                    )
-                    if callable(render_final_turn_progress):
-                        turn_delivery_state["intermediate_response"] = (
-                            render_final_turn_progress(turn_key)
-                        )
-                self._turn_contexts.pop(turn_key, None)
-                self._clear_thinking_preview(turn_key)
-                self._clear_turn_progress(turn_key)
+            self._finalize_turn_progress(turn_key, turn_delivery_state)
             if runtime.current_turn_key == (thread_id, turn_id):
                 runtime.current_turn_id = None
                 runtime.current_turn_key = None
@@ -3248,29 +2988,24 @@ class ExecutionCommands(TelegramCommandSupportMixin):
                 thread_id=message.thread_id,
                 exc=exc,
             )
-            failure_message = "App server unavailable; try again or check logs."
-            if send_failure_response:
-                await self._send_message(
-                    message.chat_id,
-                    failure_message,
-                    thread_id=message.thread_id,
-                    reply_to=message.message_id,
-                )
-            return _TurnRunFailure(
-                failure_message, placeholder_id, transcript_message_id, transcript_text
+            failure_message = APP_SERVER_UNAVAILABLE_MESSAGE
+            return await self._maybe_send_failure(
+                message,
+                failure_message,
+                send=send_failure_response,
+                placeholder_id=placeholder_id,
+                transcript_message_id=transcript_message_id,
+                transcript_text=transcript_text,
             )
 
         if client is None:
-            failure_message = "Topic not bound. Use /bind <repo_id> or /bind <path>."
-            if send_failure_response:
-                await self._send_message(
-                    message.chat_id,
-                    failure_message,
-                    thread_id=message.thread_id,
-                    reply_to=message.message_id,
-                )
-            return _TurnRunFailure(
-                failure_message, None, transcript_message_id, transcript_text
+            return await self._maybe_send_failure(
+                message,
+                TOPIC_NOT_BOUND_MESSAGE,
+                send=send_failure_response,
+                placeholder_id=None,
+                transcript_message_id=transcript_message_id,
+                transcript_text=transcript_text,
             )
 
         pma_mode = bool(pma_thread_registry and pma_thread_key)
@@ -3281,34 +3016,23 @@ class ExecutionCommands(TelegramCommandSupportMixin):
                         missing_thread_message
                         or "No active thread. Use /new to start one."
                     )
-                    if send_failure_response:
-                        await self._send_message(
-                            message.chat_id,
-                            failure_message,
-                            thread_id=message.thread_id,
-                            reply_to=message.message_id,
-                        )
-                    return _TurnRunFailure(
+                    return await self._maybe_send_failure(
+                        message,
                         failure_message,
-                        None,
-                        transcript_message_id,
-                        transcript_text,
+                        send=send_failure_response,
+                        placeholder_id=None,
+                        transcript_message_id=transcript_message_id,
+                        transcript_text=transcript_text,
                     )
                 thread_id = await _start_new_thread()
                 if not thread_id:
-                    failure_message = "Failed to start a new thread."
-                    if send_failure_response:
-                        await self._send_message(
-                            message.chat_id,
-                            failure_message,
-                            thread_id=message.thread_id,
-                            reply_to=message.message_id,
-                        )
-                    return _TurnRunFailure(
-                        failure_message,
-                        None,
-                        transcript_message_id,
-                        transcript_text,
+                    return await self._maybe_send_failure(
+                        message,
+                        "Failed to start a new thread.",
+                        send=send_failure_response,
+                        placeholder_id=None,
+                        transcript_message_id=transcript_message_id,
+                        transcript_text=transcript_text,
                     )
             else:
                 if not pma_mode:
@@ -3409,30 +3133,15 @@ class ExecutionCommands(TelegramCommandSupportMixin):
             turn_key: Optional[TurnKey] = None
             turn_started_at: Optional[float] = None
             try:
-                queue_wait_ms = int((time.monotonic() - queue_started_at) * 1000)
-                log_event(
-                    self._logger,
-                    logging.INFO,
-                    "telegram.turn.queue_wait",
-                    topic_key=key,
-                    chat_id=message.chat_id,
-                    thread_id=message.thread_id,
-                    codex_thread_id=thread_id,
-                    queue_wait_ms=queue_wait_ms,
-                    queued=turn_semaphore.locked(),
-                    max_parallel_turns=self._config.concurrency.max_parallel_turns,
-                    per_topic_queue=self._config.concurrency.per_topic_queue,
+                await self._log_queue_wait_and_update_placeholder(
+                    message,
+                    key,
+                    thread_id,
+                    turn_semaphore,
+                    queue_started_at,
+                    placeholder_id,
+                    placeholder_text,
                 )
-                if (
-                    turn_semaphore.locked()
-                    and placeholder_id is not None
-                    and placeholder_text != PLACEHOLDER_TEXT
-                ):
-                    await self._edit_message_text(
-                        message.chat_id,
-                        placeholder_id,
-                        PLACEHOLDER_TEXT,
-                    )
 
                 try:
                     turn_handle = await client.turn_start(
@@ -3443,7 +3152,7 @@ class ExecutionCommands(TelegramCommandSupportMixin):
                         sandbox_policy=sandbox_policy,
                         **turn_kwargs,
                     )
-                except Exception as exc:
+                except CodexAppServerResponseError as exc:
                     if (
                         pma_mode
                         and _is_missing_thread_error(exc)
@@ -3466,22 +3175,14 @@ class ExecutionCommands(TelegramCommandSupportMixin):
                                 "PMA thread no longer exists. Send a new message to "
                                 "start a PMA thread, then retry /compact."
                             )
-                            if send_failure_response:
-                                await self._send_message(
-                                    message.chat_id,
-                                    failure_message,
-                                    thread_id=message.thread_id,
-                                    reply_to=message.message_id,
-                                )
-                                if placeholder_id is not None:
-                                    await self._delete_message(
-                                        message.chat_id, placeholder_id
-                                    )
-                            return _TurnRunFailure(
+                            return await self._maybe_send_failure(
+                                message,
                                 failure_message,
-                                placeholder_id,
-                                transcript_message_id,
-                                transcript_text,
+                                send=send_failure_response,
+                                placeholder_id=placeholder_id,
+                                delete_placeholder=True,
+                                transcript_message_id=transcript_message_id,
+                                transcript_text=transcript_text,
                             )
                         thread_id = await _start_new_thread()
                         if thread_id is None:
@@ -3532,21 +3233,14 @@ class ExecutionCommands(TelegramCommandSupportMixin):
                     runtime.current_turn_id = None
                     runtime.current_turn_key = None
                     runtime.interrupt_requested = False
-                    failure_message = "Turn collision detected; please retry."
-                    if send_failure_response:
-                        await self._send_message(
-                            message.chat_id,
-                            failure_message,
-                            thread_id=message.thread_id,
-                            reply_to=message.message_id,
-                        )
-                        if placeholder_id is not None:
-                            await self._delete_message(message.chat_id, placeholder_id)
-                    return _TurnRunFailure(
-                        failure_message,
-                        placeholder_id,
-                        transcript_message_id,
-                        transcript_text,
+                    return await self._maybe_send_failure(
+                        message,
+                        "Turn collision detected; please retry.",
+                        send=send_failure_response,
+                        placeholder_id=placeholder_id,
+                        delete_placeholder=True,
+                        transcript_message_id=transcript_message_id,
+                        transcript_text=transcript_text,
                     )
 
                 await self._start_turn_progress(
@@ -3571,7 +3265,7 @@ class ExecutionCommands(TelegramCommandSupportMixin):
                     turn_elapsed_seconds = time.monotonic() - turn_started_at
             finally:
                 turn_semaphore.release()
-        except Exception as exc:
+        except Exception as exc:  # intentional: top-level command handler
             if turn_handle is not None:
                 if turn_key is not None:
                     self._turn_contexts.pop(turn_key, None)
@@ -3639,25 +3333,7 @@ class ExecutionCommands(TelegramCommandSupportMixin):
             )
         finally:
             if turn_handle is not None:
-                if turn_key is not None:
-                    render_turn_progress_summary = getattr(
-                        self, "_render_turn_progress_summary", None
-                    )
-                    if callable(render_turn_progress_summary):
-                        turn_delivery_state["intermediate_response"] = (
-                            render_turn_progress_summary(turn_key)
-                        )
-                    else:
-                        render_final_turn_progress = getattr(
-                            self, "_render_final_turn_progress", None
-                        )
-                        if callable(render_final_turn_progress):
-                            turn_delivery_state["intermediate_response"] = (
-                                render_final_turn_progress(turn_key)
-                            )
-                    self._turn_contexts.pop(turn_key, None)
-                    self._clear_thinking_preview(turn_key)
-                    self._clear_turn_progress(turn_key)
+                self._finalize_turn_progress(turn_key, turn_delivery_state)
             runtime.current_turn_id = None
             runtime.current_turn_key = None
             runtime.interrupt_requested = False
@@ -3779,16 +3455,19 @@ class ExecutionCommands(TelegramCommandSupportMixin):
         if hub_root is None:
             return None
         supervisor = getattr(self, "_hub_supervisor", None)
-        snapshot = await build_hub_snapshot(supervisor, hub_root=Path(hub_root))
-        base_prompt = load_pma_prompt(hub_root)
-        prompt_state_key = self._pma_registry_key(record, message)
-        return format_pma_prompt(
-            base_prompt,
-            snapshot,
-            message_text,
-            hub_root=hub_root,
-            prompt_state_key=prompt_state_key,
-        )
+        try:
+            snapshot = await build_hub_snapshot(supervisor, hub_root=Path(hub_root))
+            base_prompt = load_pma_prompt(hub_root)
+            prompt_state_key = self._pma_registry_key(record, message)
+            return format_pma_prompt(
+                base_prompt,
+                snapshot,
+                message_text,
+                hub_root=hub_root,
+                prompt_state_key=prompt_state_key,
+            )
+        except (OSError, ValueError, RuntimeError, ConfigError):
+            return None
 
     async def _prepare_turn_context(
         self,
@@ -3924,16 +3603,13 @@ class ExecutionCommands(TelegramCommandSupportMixin):
         if pma_enabled:
             hub_root = getattr(self, "_hub_root", None)
             if hub_root is None:
-                failure_message = "PMA unavailable; hub root not configured."
-                if send_failure_response:
-                    await self._send_message(
-                        message.chat_id,
-                        failure_message,
-                        thread_id=message.thread_id,
-                        reply_to=message.message_id,
-                    )
-                return _TurnRunFailure(
-                    failure_message, None, transcript_message_id, transcript_text
+                return await self._maybe_send_failure(
+                    message,
+                    "PMA unavailable; hub root not configured.",
+                    send=send_failure_response,
+                    placeholder_id=None,
+                    transcript_message_id=transcript_message_id,
+                    transcript_text=transcript_text,
                 )
             if record is None:
                 from ...state import TelegramTopicRecord
@@ -3941,16 +3617,13 @@ class ExecutionCommands(TelegramCommandSupportMixin):
                 record = TelegramTopicRecord(pma_enabled=True)
             record = dataclasses.replace(record, workspace_path=str(hub_root))
         if record is None or not record.workspace_path:
-            failure_message = "Topic not bound. Use /bind <repo_id> or /bind <path>."
-            if send_failure_response:
-                await self._send_message(
-                    message.chat_id,
-                    failure_message,
-                    thread_id=message.thread_id,
-                    reply_to=message.message_id,
-                )
-            return _TurnRunFailure(
-                failure_message, None, transcript_message_id, transcript_text
+            return await self._maybe_send_failure(
+                message,
+                TOPIC_NOT_BOUND_MESSAGE,
+                send=send_failure_response,
+                placeholder_id=None,
+                transcript_message_id=transcript_message_id,
+                transcript_text=transcript_text,
             )
 
         if record.active_thread_id and not pma_enabled:
@@ -4020,16 +3693,13 @@ class ExecutionCommands(TelegramCommandSupportMixin):
                 message=message,
             )
             if pma_prompt is None:
-                failure_message = "PMA unavailable; hub snapshot failed."
-                if send_failure_response:
-                    await self._send_message(
-                        message.chat_id,
-                        failure_message,
-                        thread_id=message.thread_id,
-                        reply_to=message.message_id,
-                    )
-                return _TurnRunFailure(
-                    failure_message, None, transcript_message_id, transcript_text
+                return await self._maybe_send_failure(
+                    message,
+                    "PMA unavailable; hub snapshot failed.",
+                    send=send_failure_response,
+                    placeholder_id=None,
+                    transcript_message_id=transcript_message_id,
+                    transcript_text=transcript_text,
                 )
             prompt_text, injected = await self._maybe_inject_github_context(
                 pma_prompt,

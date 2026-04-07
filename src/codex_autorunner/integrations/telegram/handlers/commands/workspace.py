@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Sequence
 
+import httpx
+
 from .....agents.opencode.runtime import extract_session_id
 from .....core.flows import FlowStore
 from .....core.flows.models import FlowRunStatus
@@ -27,6 +29,11 @@ from ....chat.agents import (
     normalize_hermes_profile,
     resolve_chat_agent_and_profile,
     resolve_chat_runtime_agent,
+)
+from ....chat.constants import (
+    APP_SERVER_UNAVAILABLE_MESSAGE,
+    TOPIC_NOT_BOUND_MESSAGE,
+    TOPIC_NOT_BOUND_RESUME_MESSAGE,
 )
 from ....chat.session_messages import (
     build_branch_reset_started_lines,
@@ -176,7 +183,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
             if hub_root is None:
                 return None, "PMA unavailable; hub root not configured."
             return str(hub_root), None
-        return None, "Topic not bound. Use /bind <repo_id> or /bind <path>."
+        return None, TOPIC_NOT_BOUND_MESSAGE
 
     def _record_with_workspace_path(
         self,
@@ -393,7 +400,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
                 client = await supervisor.get_client(workspace_root)
                 await client.get_session(record.active_thread_id)
                 return record
-            except Exception:
+            except (OSError, RuntimeError, ValueError):
                 return await self._router.set_active_thread(
                     message.chat_id, message.thread_id, None
                 )
@@ -415,7 +422,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
             )
             await self._send_message(
                 message.chat_id,
-                "App server unavailable; try again or check logs.",
+                APP_SERVER_UNAVAILABLE_MESSAGE,
                 thread_id=message.thread_id,
                 reply_to=message.message_id,
             )
@@ -423,14 +430,14 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
         if client is None:
             await self._send_message(
                 message.chat_id,
-                "Topic not bound. Use /bind <repo_id> or /bind <path>.",
+                TOPIC_NOT_BOUND_MESSAGE,
                 thread_id=message.thread_id,
                 reply_to=message.message_id,
             )
             return None
         try:
             result = await client.thread_resume(thread_id)
-        except Exception as exc:
+        except (OSError, RuntimeError, ValueError) as exc:
             if is_missing_thread_error(exc):
                 log_event(
                     self._logger,
@@ -475,7 +482,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
         try:
             workspace_root = Path(record.workspace_path or "").expanduser().resolve()
             resumed_root = Path(resumed_path).expanduser().resolve()
-        except Exception:
+        except OSError:
             await self._send_message(
                 message.chat_id,
                 "Active thread has invalid workspace metadata; refusing to continue. "
@@ -575,7 +582,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
                     try:
                         current_root = canonicalize_path(Path(record.workspace_path))
                         incoming_root = canonicalize_path(Path(incoming_workspace))
-                    except Exception:
+                    except OSError:
                         current_root = None
                         incoming_root = None
                     if (
@@ -672,7 +679,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
         if record is None:
             await self._send_message(
                 message.chat_id,
-                prompt or "Topic not bound. Use /bind <repo_id> or /bind <path>.",
+                prompt or TOPIC_NOT_BOUND_MESSAGE,
                 thread_id=message.thread_id,
                 reply_to=message.message_id,
             )
@@ -694,7 +701,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
         if not record.workspace_path:
             await self._send_message(
                 message.chat_id,
-                prompt or "Topic not bound. Use /bind <repo_id> or /bind <path>.",
+                prompt or TOPIC_NOT_BOUND_MESSAGE,
                 thread_id=message.thread_id,
                 reply_to=message.message_id,
             )
@@ -746,7 +753,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
                 session = await opencode_client.create_session(
                     directory=str(workspace_root)
                 )
-            except Exception as exc:
+            except (OSError, RuntimeError, ValueError) as exc:
                 log_event(
                     self._logger,
                     logging.WARNING,
@@ -802,7 +809,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
             )
             await self._send_message(
                 message.chat_id,
-                "App server unavailable; try again or check logs.",
+                APP_SERVER_UNAVAILABLE_MESSAGE,
                 thread_id=message.thread_id,
                 reply_to=message.message_id,
             )
@@ -810,7 +817,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
         if client is None:
             await self._send_message(
                 message.chat_id,
-                "Topic not bound. Use /bind <repo_id> or /bind <path>.",
+                TOPIC_NOT_BOUND_MESSAGE,
                 thread_id=message.thread_id,
                 reply_to=message.message_id,
             )
@@ -845,7 +852,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
             return []
         try:
             manifest = load_manifest(self._manifest_path, self._hub_root)
-        except Exception:
+        except (OSError, ValueError):
             return []
         repo_ids = [repo.id for repo in manifest.repos if repo.enabled]
         return repo_ids
@@ -872,8 +879,10 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
                         "agent_workspace",
                         workspace_id,
                     )
-            except Exception:
-                pass
+            except (OSError, ValueError, RuntimeError):
+                self._logger.debug(
+                    "resolve_workspace: hub_supervisor lookup failed", exc_info=True
+                )
         if self._manifest_path and self._hub_root:
             try:
                 manifest = load_manifest(self._manifest_path, self._hub_root)
@@ -881,15 +890,17 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
                 if repo:
                     workspace = canonicalize_path(self._hub_root / repo.path)
                     return str(workspace), repo.id, "repo", repo.id
-            except Exception:
-                pass
+            except (OSError, ValueError):
+                self._logger.debug(
+                    "resolve_workspace: manifest lookup failed", exc_info=True
+                )
         path = Path(arg)
         if not path.is_absolute():
             path = canonicalize_path(self._config.root / path)
         else:
             try:
                 path = canonicalize_path(path)
-            except Exception:
+            except OSError:
                 return None
         if path.exists():
             return str(path), None, None, None
@@ -927,7 +938,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
         try:
             expected_root = Path(expected_workspace).expanduser().resolve()
             incoming_root = Path(incoming).expanduser().resolve()
-        except Exception:
+        except OSError:
             expected_root = None
             incoming_root = None
         if (
@@ -968,7 +979,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
 
         try:
             manifest = load_manifest(self._manifest_path, self._hub_root)
-        except Exception as exc:
+        except (OSError, ValueError) as exc:
             await self._send_message(
                 message.chat_id,
                 f"Failed to load manifest: {exc}",
@@ -1149,7 +1160,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
                             clear_pma_prompt_state_sessions(
                                 Path(hub_root), keys=(pma_key,)
                             )
-                        except Exception as exc:
+                        except OSError as exc:
                             log_event(
                                 self._logger,
                                 logging.WARNING,
@@ -1195,7 +1206,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
                             mode="pma",
                             pma_enabled=True,
                         )
-                    except Exception as exc:
+                    except (OSError, RuntimeError, ValueError) as exc:
                         log_event(
                             self._logger,
                             logging.WARNING,
@@ -1228,7 +1239,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
         if record is None or not record.workspace_path:
             await self._send_message(
                 message.chat_id,
-                "Topic not bound. Use /bind <repo_id> or /bind <path>.",
+                TOPIC_NOT_BOUND_MESSAGE,
                 thread_id=message.thread_id,
                 reply_to=message.message_id,
             )
@@ -1256,7 +1267,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
             try:
                 client = await supervisor.get_client(workspace_root)
                 session = await client.create_session(directory=str(workspace_root))
-            except Exception as exc:
+            except (OSError, RuntimeError, ValueError) as exc:
                 log_event(
                     self._logger,
                     logging.WARNING,
@@ -1313,7 +1324,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
                 )
                 await self._send_message(
                     message.chat_id,
-                    "App server unavailable; try again or check logs.",
+                    APP_SERVER_UNAVAILABLE_MESSAGE,
                     thread_id=message.thread_id,
                     reply_to=message.message_id,
                 )
@@ -1321,7 +1332,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
             if client is None:
                 await self._send_message(
                     message.chat_id,
-                    "Topic not bound. Use /bind <repo_id> or /bind <path>.",
+                    TOPIC_NOT_BOUND_MESSAGE,
                     thread_id=message.thread_id,
                     reply_to=message.message_id,
                 )
@@ -1331,7 +1342,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
                     record.workspace_path,
                     **self._thread_start_kwargs(record),
                 )
-            except Exception as exc:
+            except (OSError, RuntimeError, ValueError) as exc:
                 log_event(
                     self._logger,
                     logging.WARNING,
@@ -1403,7 +1414,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
                             clear_pma_prompt_state_sessions(
                                 Path(hub_root), keys=(pma_key,)
                             )
-                        except Exception as exc:
+                        except OSError as exc:
                             log_event(
                                 self._logger,
                                 logging.WARNING,
@@ -1449,7 +1460,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
                             mode="pma",
                             pma_enabled=True,
                         )
-                    except Exception as exc:
+                    except (OSError, RuntimeError, ValueError) as exc:
                         log_event(
                             self._logger,
                             logging.WARNING,
@@ -1482,7 +1493,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
         if record is None or not record.workspace_path:
             await self._send_message(
                 message.chat_id,
-                "Topic not bound. Use /bind <repo_id> or /bind <path>.",
+                TOPIC_NOT_BOUND_MESSAGE,
                 thread_id=message.thread_id,
                 reply_to=message.message_id,
             )
@@ -1512,7 +1523,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
             try:
                 client = await supervisor.get_client(workspace_root)
                 session = await client.create_session(directory=str(workspace_root))
-            except Exception as exc:
+            except (OSError, RuntimeError, ValueError) as exc:
                 log_event(
                     self._logger,
                     logging.WARNING,
@@ -1596,7 +1607,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
                 )
                 await self._send_message(
                     message.chat_id,
-                    "App server unavailable; try again or check logs.",
+                    APP_SERVER_UNAVAILABLE_MESSAGE,
                     thread_id=message.thread_id,
                     reply_to=message.message_id,
                 )
@@ -1604,7 +1615,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
             if client is None:
                 await self._send_message(
                     message.chat_id,
-                    "Topic not bound. Use /bind <repo_id> or /bind <path>.",
+                    TOPIC_NOT_BOUND_MESSAGE,
                     thread_id=message.thread_id,
                     reply_to=message.message_id,
                 )
@@ -1614,7 +1625,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
                     record.workspace_path,
                     **self._thread_start_kwargs(record),
                 )
-            except Exception as exc:
+            except (OSError, RuntimeError, ValueError) as exc:
                 log_event(
                     self._logger,
                     logging.WARNING,
@@ -1716,7 +1727,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
         if record is None or not record.workspace_path:
             await self._send_message(
                 message.chat_id,
-                "Topic not bound. Use /bind <repo_id> or /bind <path>.",
+                TOPIC_NOT_BOUND_MESSAGE,
                 thread_id=message.thread_id,
                 reply_to=message.message_id,
             )
@@ -1786,7 +1797,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
                     workspace_root,
                     repo_id_hint=repo_id_hint,
                 )
-            except Exception as exc:
+            except (OSError, RuntimeError, ValueError) as exc:
                 log_event(
                     self._logger,
                     logging.WARNING,
@@ -1830,7 +1841,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
             try:
                 client = await supervisor.get_client(workspace_root)
                 session = await client.create_session(directory=str(workspace_root))
-            except Exception as exc:
+            except (OSError, RuntimeError, ValueError) as exc:
                 log_event(
                     self._logger,
                     logging.WARNING,
@@ -1927,7 +1938,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
                     str(workspace_root),
                     **self._thread_start_kwargs(record),
                 )
-            except Exception as exc:
+            except (OSError, RuntimeError, ValueError) as exc:
                 log_event(
                     self._logger,
                     logging.WARNING,
@@ -2031,7 +2042,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
         if record is None or not record.workspace_path:
             await self._send_message(
                 message.chat_id,
-                "Topic not bound. Use /bind <repo_id> or /bind <path>.",
+                TOPIC_NOT_BOUND_MESSAGE,
                 thread_id=message.thread_id,
                 reply_to=message.message_id,
             )
@@ -2078,7 +2089,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
                 reply_to=message.message_id,
             )
             return
-        except Exception as exc:
+        except Exception as exc:  # intentional: top-level error handler
             log_event(
                 self._logger,
                 logging.WARNING,
@@ -2337,7 +2348,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
         if record is None:
             await self._send_message(
                 message.chat_id,
-                "Topic not bound. Use /bind <repo_id> or /bind <path>.",
+                TOPIC_NOT_BOUND_MESSAGE,
                 thread_id=message.thread_id,
                 reply_to=message.message_id,
             )
@@ -2359,7 +2370,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
             else:
                 await self._send_message(
                     message.chat_id,
-                    "Topic not bound. Use /bind <repo_id> or /bind <path>.",
+                    TOPIC_NOT_BOUND_MESSAGE,
                     thread_id=message.thread_id,
                     reply_to=message.message_id,
                 )
@@ -2392,7 +2403,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
         if workspace_path is None:
             await self._send_message(
                 message.chat_id,
-                error or "Topic not bound. Use /bind <repo_id> or /bind <path>.",
+                error or TOPIC_NOT_BOUND_MESSAGE,
                 thread_id=message.thread_id,
                 reply_to=message.message_id,
             )
@@ -2410,7 +2421,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
             )
             await self._send_message(
                 message.chat_id,
-                "App server unavailable; try again or check logs.",
+                APP_SERVER_UNAVAILABLE_MESSAGE,
                 thread_id=message.thread_id,
                 reply_to=message.message_id,
             )
@@ -2418,7 +2429,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
         if client is None:
             await self._send_message(
                 message.chat_id,
-                error or "Topic not bound. Use /bind <repo_id> or /bind <path>.",
+                error or TOPIC_NOT_BOUND_MESSAGE,
                 thread_id=message.thread_id,
                 reply_to=message.message_id,
             )
@@ -2475,7 +2486,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
                 max_pages=THREAD_LIST_MAX_PAGES,
                 needed_ids=needed_ids,
             )
-        except Exception as exc:
+        except (OSError, RuntimeError, ValueError) as exc:
             list_failed = True
             log_event(
                 self._logger,
@@ -2755,7 +2766,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
         for thread_id in unique_ids:
             try:
                 result = await client.thread_resume(thread_id)
-            except Exception as exc:
+            except (OSError, RuntimeError, ValueError) as exc:
                 log_event(
                     self._logger,
                     logging.WARNING,
@@ -2873,7 +2884,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
                 key,
                 callback,
                 _with_conversation_id(
-                    error or "Topic not bound; use /bind before resuming.",
+                    error or TOPIC_NOT_BOUND_RESUME_MESSAGE,
                     chat_id=chat_id,
                     thread_id=thread_id_val,
                 ),
@@ -2897,7 +2908,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
                 key,
                 callback,
                 _with_conversation_id(
-                    "App server unavailable; try again or check logs.",
+                    APP_SERVER_UNAVAILABLE_MESSAGE,
                     chat_id=chat_id,
                     thread_id=thread_id_val,
                 ),
@@ -2909,7 +2920,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
                 key,
                 callback,
                 _with_conversation_id(
-                    "Topic not bound; use /bind before resuming.",
+                    TOPIC_NOT_BOUND_RESUME_MESSAGE,
                     chat_id=chat_id,
                     thread_id=thread_id_val,
                 ),
@@ -2917,7 +2928,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
             return
         try:
             result = await client.thread_resume(thread_id)
-        except Exception as exc:
+        except (OSError, RuntimeError, ValueError) as exc:
             if is_missing_thread_error(exc):
                 log_event(
                     self._logger,
@@ -2974,7 +2985,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
                 key,
                 callback,
                 _with_conversation_id(
-                    "Topic not bound; use /bind before resuming.",
+                    TOPIC_NOT_BOUND_RESUME_MESSAGE,
                     chat_id=chat_id,
                     thread_id=thread_id_val,
                 ),
@@ -2995,7 +3006,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
         try:
             workspace_root = Path(record.workspace_path).expanduser().resolve()
             resumed_root = Path(resumed_path).expanduser().resolve()
-        except Exception:
+        except OSError:
             await _answer_once("Resume aborted")
             await self._finalize_selection(
                 key,
@@ -3082,7 +3093,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
                 key,
                 callback,
                 _with_conversation_id(
-                    error or "Topic not bound; use /bind before resuming.",
+                    error or TOPIC_NOT_BOUND_RESUME_MESSAGE,
                     chat_id=chat_id,
                     thread_id=thread_id_val,
                 ),
@@ -3119,7 +3130,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
             await _answer_once("Resuming...")
             client = await supervisor.get_client(workspace_root)
             session = await client.get_session(thread_id)
-        except Exception as exc:
+        except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
             if self._is_missing_opencode_session_error(exc):
                 log_event(
                     self._logger,
@@ -3173,7 +3184,7 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
             try:
                 workspace_root = Path(record.workspace_path).expanduser().resolve()
                 resumed_root = Path(resumed_path).expanduser().resolve()
-            except Exception:
+            except OSError:
                 await _answer_once("Resume aborted")
                 await self._finalize_selection(
                     key,
@@ -3363,8 +3374,10 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
                     require_topics = getattr(self._config, "require_topics", False)
                     scoping = "per-topic" if require_topics else "global (per hub)"
                     lines.append(f"PMA thread: {pma_thread_id or 'none'} ({scoping})")
-                except Exception:
-                    pass
+                except (OSError, RuntimeError, ValueError, KeyError):
+                    self._logger.debug(
+                        "status: pma registry lookup failed", exc_info=True
+                    )
             if hub_root:
                 try:
                     pma_dir = hub_root / ".codex-autorunner" / "pma"
@@ -3395,8 +3408,8 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
                     lines.append(
                         f"PMA files: inbox {inbox_count}, outbox {outbox_count}"
                     )
-                except Exception:
-                    pass
+                except OSError:
+                    self._logger.debug("status: pma file count failed", exc_info=True)
         if is_pma and manifest_path and hub_root:
             try:
                 manifest = load_manifest(manifest_path, hub_root)
@@ -3434,8 +3447,10 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
                                 idle_count += 1
                         else:
                             idle_count += 1
-                    except Exception:
-                        pass
+                    except (OSError, RuntimeError, ValueError):
+                        self._logger.debug(
+                            "status: flow store query failed for repo", exc_info=True
+                        )
                     finally:
                         store.close()
                 lines.append(
@@ -3449,8 +3464,10 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
                     preview = ", ".join(paused_repos[:5])
                     suffix = "" if len(paused_repos) <= 5 else "..."
                     lines.append(f"Paused repos: {preview}{suffix}")
-            except Exception:
-                pass
+            except Exception:  # intentional: best-effort
+                self._logger.debug(
+                    "status: hub repo status aggregation failed", exc_info=True
+                )
 
         if not record.workspace_path and not is_pma:
             lines.append("Use /bind <repo_id> or /bind <path>.")
@@ -3471,8 +3488,10 @@ class WorkspaceCommands(TelegramCommandSupportMixin):
                             )
                         elif latest.status == FlowRunStatus.PAUSED:
                             lines.append(f"Active Flow: PAUSED (run {latest.id})")
-                except Exception:
-                    pass
+                except (OSError, RuntimeError, ValueError):
+                    self._logger.debug(
+                        "status: flow store query failed for workspace", exc_info=True
+                    )
                 finally:
                     store.close()
 

@@ -412,7 +412,7 @@ def import_ticket_pack(
         if conflicts:
             conflict_list = ", ".join([f"{idx:03d}" for idx in conflicts])
             errors.append(
-                "Ticket indices already exist in destination: " f"{conflict_list}."
+                f"Ticket indices already exist in destination: {conflict_list}."
             )
 
     width = 3
@@ -438,8 +438,10 @@ def import_ticket_pack(
             try:
                 data = dict(data)
                 data.pop("depends_on", None)
-            except Exception:
-                pass
+            except (TypeError, ValueError, AttributeError):
+                logger.debug(
+                    "failed to strip depends_on from frontmatter", exc_info=True
+                )
             item.warnings.append(
                 "Removed frontmatter.depends_on (CAR executes tickets in filename order)."
             )
@@ -511,7 +513,7 @@ def import_ticket_pack(
                         "zip_path": safe_relpath(zip_path, repo_root),
                     },
                 )
-            except Exception as exc:  # noqa: BLE001
+            except (OSError, ValueError, TypeError) as exc:
                 logger.warning(
                     "Failed to write ingest receipt at %s after import_pack: %s",
                     safe_relpath(ingest_state_path(repo_root), repo_root),

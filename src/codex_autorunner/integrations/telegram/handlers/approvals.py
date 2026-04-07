@@ -22,6 +22,8 @@ from ..helpers import (
 from ..state import PendingApprovalRecord, TopicRouter
 from ..types import PendingApproval
 
+_logger = logging.getLogger(__name__)
+
 
 class TelegramApprovalHandlers(ChatApprovalHandlers):
     _platform = "telegram"
@@ -62,7 +64,9 @@ class TelegramApprovalHandlers(ChatApprovalHandlers):
                     message,
                     thread_id=thread_id,
                 )
-            except Exception:
+            except (
+                Exception
+            ):  # intentional: fire-and-forget notification during stale approval restore
                 log_event(
                     self._logger,
                     logging.WARNING,
@@ -133,7 +137,9 @@ class TelegramApprovalHandlers(ChatApprovalHandlers):
                 reply_markup=keyboard,
                 parse_mode=parse_mode,
             )
-        except Exception as exc:
+        except (
+            Exception
+        ) as exc:  # intentional: Telegram API call, catches network/API errors
             log_event(
                 self._logger,
                 logging.WARNING,
@@ -153,8 +159,8 @@ class TelegramApprovalHandlers(ChatApprovalHandlers):
                     thread_id=ctx.thread_id,
                     reply_to=ctx.reply_to_message_id,
                 )
-            except Exception:
-                pass
+            except Exception:  # intentional: fire-and-forget cancel notification
+                _logger.debug("approval cancel notice failed to send", exc_info=True)
             return "cancel"
         message_id = response.get("message_id") if isinstance(response, dict) else None
         if isinstance(message_id, int):

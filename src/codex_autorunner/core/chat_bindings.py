@@ -88,14 +88,16 @@ def _repo_id_by_workspace_path(
         return {}
     try:
         manifest = load_manifest(manifest_path, hub_root)
-    except Exception as exc:
+    except (
+        Exception
+    ) as exc:  # intentional: manifest loading may fail in unpredictable ways
         logger.warning("Failed loading manifest for chat binding lookup: %s", exc)
         return {}
     mapping: dict[str, str] = {}
     for repo in manifest.repos:
         try:
             workspace_path = (hub_root / repo.path).resolve()
-        except Exception:
+        except (TypeError, OSError):
             continue
         mapping[str(workspace_path)] = repo.id
     return mapping
@@ -130,7 +132,7 @@ def _resolve_workspace_path(value: Any) -> str | None:
             continue
         try:
             return str(path.resolve())
-        except Exception:
+        except OSError:
             return str(path)
     return None
 
@@ -139,7 +141,7 @@ def _normalize_workspace_path(value: Any) -> str | None:
     if isinstance(value, Path):
         try:
             return str(value.resolve())
-        except Exception:
+        except OSError:
             return str(value)
     return _resolve_workspace_path(value)
 
@@ -183,7 +185,7 @@ def _normalize_scope(value: Any) -> str | None:
     return scope or None
 
 
-def _parse_iso_timestamp(raw: Any) -> float:
+def _parse_iso_timestamp_float(raw: Any) -> float:
     if not isinstance(raw, str):
         return float("-inf")
     value = raw.strip()
@@ -352,7 +354,7 @@ def _latest_discord_binding_timestamps_by_workspace(db_path: Path) -> dict[str, 
         workspace_path = _normalize_workspace_path(row["workspace_path"])
         if workspace_path is None:
             continue
-        timestamp = _parse_iso_timestamp(row["updated_at"])
+        timestamp = _parse_iso_timestamp_float(row["updated_at"])
         previous = latest_by_workspace.get(workspace_path, float("-inf"))
         if timestamp > previous:
             latest_by_workspace[workspace_path] = timestamp
@@ -393,8 +395,8 @@ def _latest_current_telegram_binding_timestamps_by_workspace(
         if workspace_path is None:
             continue
         timestamp = max(
-            _parse_iso_timestamp(row["last_active_at"]),
-            _parse_iso_timestamp(row["updated_at"]),
+            _parse_iso_timestamp_float(row["last_active_at"]),
+            _parse_iso_timestamp_float(row["updated_at"]),
         )
         previous = latest_by_workspace.get(workspace_path, float("-inf"))
         if timestamp > previous:
@@ -523,7 +525,7 @@ def active_chat_binding_metadata_by_thread(
         ordered = sorted(
             bindings,
             key=lambda item: (
-                _parse_iso_timestamp(item.get("updated_at")),
+                _parse_iso_timestamp_float(item.get("updated_at")),
                 1 if item.get("surface_kind") == "telegram" else 0,
                 str(item.get("surface_key") or ""),
             ),
@@ -568,7 +570,7 @@ def _orchestration_binding_timestamps_by_workspace(
         workspace_root = row["workspace_root"]
         if not isinstance(workspace_root, str) or not workspace_root:
             continue
-        timestamp = _parse_iso_timestamp(row["updated_at"])
+        timestamp = _parse_iso_timestamp_float(row["updated_at"])
         previous = latest_by_workspace.get(workspace_root, float("-inf"))
         if timestamp > previous:
             latest_by_workspace[workspace_root] = timestamp

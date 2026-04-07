@@ -23,24 +23,16 @@ from .....core.filebox import (
 from .....core.injected_context import wrap_injected_context
 from .....core.logging_utils import log_event
 from .....core.state import now_iso
+from ....chat.constants import TOPIC_NOT_BOUND_MESSAGE
 from ....chat.media import IMAGE_CONTENT_TYPES, IMAGE_EXTS
-from ...adapter import TelegramMessage
+from ...adapter import TelegramAPIError, TelegramMessage
 from ...config import TelegramMediaCandidate
 from ...forwarding import format_forwarded_telegram_message_text
 from ...helpers import _path_within, format_public_error
 from ...state import PendingVoiceRecord, TelegramTopicRecord
 from .. import messages as message_handlers
-from .shared import TelegramCommandSupportMixin
+from .shared import FILES_HINT_TEMPLATE, TelegramCommandSupportMixin
 
-FILES_HINT_TEMPLATE = (
-    "Inbox: {inbox}\n"
-    "Outbox (pending): {outbox}\n"
-    "Topic key: {topic_key}\n"
-    "Topic dir: {topic_dir}\n"
-    "Place files in outbox pending to send after this turn finishes.\n"
-    "Check delivery with /files outbox.\n"
-    "Max file size: {max_bytes} bytes."
-)
 PMA_FILES_HINT_TEMPLATE = (
     "PMA inbox: {inbox}\n"
     "PMA outbox (pending): {outbox}\n"
@@ -141,7 +133,7 @@ class FilesCommands(TelegramCommandSupportMixin):
     ) -> bool:
         try:
             data = path.read_bytes()
-        except Exception as exc:
+        except OSError as exc:
             log_event(
                 self._logger,
                 logging.WARNING,
@@ -160,7 +152,7 @@ class FilesCommands(TelegramCommandSupportMixin):
                 message_thread_id=thread_id,
                 reply_to_message_id=reply_to,
             )
-        except Exception as exc:
+        except TelegramAPIError as exc:
             log_event(
                 self._logger,
                 logging.WARNING,
@@ -284,7 +276,7 @@ class FilesCommands(TelegramCommandSupportMixin):
             )
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except (TelegramAPIError, RuntimeError) as exc:
             detail = self._format_telegram_download_error(exc)
             log_event(
                 self._logger,
@@ -329,7 +321,7 @@ class FilesCommands(TelegramCommandSupportMixin):
             )
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except OSError as exc:
             log_event(
                 self._logger,
                 logging.WARNING,
@@ -360,7 +352,7 @@ class FilesCommands(TelegramCommandSupportMixin):
             )
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except OSError as exc:
             log_event(
                 self._logger,
                 logging.WARNING,
@@ -526,7 +518,7 @@ class FilesCommands(TelegramCommandSupportMixin):
             )
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except (TelegramAPIError, RuntimeError) as exc:
             detail = self._format_telegram_download_error(exc)
             log_event(
                 self._logger,
@@ -573,7 +565,7 @@ class FilesCommands(TelegramCommandSupportMixin):
             )
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except OSError as exc:
             log_event(
                 self._logger,
                 logging.WARNING,
@@ -685,7 +677,7 @@ class FilesCommands(TelegramCommandSupportMixin):
             await self._send_message(
                 first_msg.chat_id,
                 self._with_conversation_id(
-                    "Topic not bound. Use /bind <repo_id> or /bind <path>.",
+                    TOPIC_NOT_BOUND_MESSAGE,
                     chat_id=first_msg.chat_id,
                     thread_id=first_msg.thread_id,
                 ),
@@ -772,7 +764,7 @@ class FilesCommands(TelegramCommandSupportMixin):
             )
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except (TelegramAPIError, RuntimeError) as exc:
             detail = self._format_telegram_download_error(exc)
             log_event(
                 self._logger,
@@ -819,7 +811,7 @@ class FilesCommands(TelegramCommandSupportMixin):
             )
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except OSError as exc:
             log_event(
                 self._logger,
                 logging.WARNING,
@@ -844,7 +836,7 @@ class FilesCommands(TelegramCommandSupportMixin):
             )
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except OSError as exc:
             log_event(
                 self._logger,
                 logging.WARNING,
@@ -895,7 +887,7 @@ class FilesCommands(TelegramCommandSupportMixin):
             )
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except (TelegramAPIError, RuntimeError) as exc:
             detail = self._format_telegram_download_error(exc)
             log_event(
                 self._logger,
@@ -955,7 +947,7 @@ class FilesCommands(TelegramCommandSupportMixin):
             )
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except OSError as exc:
             log_event(
                 self._logger,
                 logging.WARNING,
@@ -1325,7 +1317,7 @@ class FilesCommands(TelegramCommandSupportMixin):
     ) -> bool:
         try:
             data = path.read_bytes()
-        except Exception as exc:
+        except OSError as exc:
             log_event(
                 self._logger,
                 logging.WARNING,
@@ -1344,7 +1336,7 @@ class FilesCommands(TelegramCommandSupportMixin):
                 message_thread_id=thread_id,
                 reply_to_message_id=reply_to,
             )
-        except Exception as exc:
+        except TelegramAPIError as exc:
             log_event(
                 self._logger,
                 logging.WARNING,
@@ -1362,7 +1354,7 @@ class FilesCommands(TelegramCommandSupportMixin):
                 token = secrets.token_hex(3)
                 destination = sent_dir / f"{path.stem}-{token}{path.suffix}"
             path.replace(destination)
-        except Exception as exc:
+        except OSError as exc:
             log_event(
                 self._logger,
                 logging.WARNING,
@@ -1508,7 +1500,7 @@ class FilesCommands(TelegramCommandSupportMixin):
             await self._send_message(
                 message.chat_id,
                 self._with_conversation_id(
-                    "Topic not bound. Use /bind <repo_id> or /bind <path>.",
+                    TOPIC_NOT_BOUND_MESSAGE,
                     chat_id=message.chat_id,
                     thread_id=message.thread_id,
                 ),

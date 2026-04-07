@@ -91,10 +91,6 @@ def _normalize_archive_rel_path(base: Path, rel_path: str) -> tuple[Path, str]:
     return candidate, rel_posix
 
 
-def _normalize_local_archive_rel_path(base: Path, rel_path: str) -> tuple[Path, str]:
-    return _normalize_archive_rel_path(base, rel_path)
-
-
 def _resolve_snapshot_root(
     repo_root: Path,
     snapshot_id: str,
@@ -182,7 +178,7 @@ def _load_meta(meta_path: Path) -> Optional[dict[str, Any]]:
         data = json.loads(raw)
         if isinstance(data, dict):
             return data
-    except Exception as exc:
+    except (OSError, ValueError) as exc:
         logger.debug("Failed to read META.json at %s: %s", meta_path, exc)
     return None
 
@@ -321,7 +317,7 @@ def _list_tree(snapshot_root: Path, rel_path: str) -> ArchiveTreeResponse:
         try:
             resolved = child.resolve(strict=False)
             resolved.relative_to(root_real)
-        except Exception:
+        except ValueError:
             continue
 
         if child.is_dir():
@@ -354,7 +350,8 @@ def _list_tree(snapshot_root: Path, rel_path: str) -> ArchiveTreeResponse:
 
 
 def _list_local_tree(run_root: Path, rel_path: str) -> ArchiveTreeResponse:
-    target, rel_posix = _normalize_local_archive_rel_path(run_root, rel_path)
+    target, rel_posix = _normalize_archive_rel_path(run_root, rel_path)
+    root_real = run_root.resolve(strict=False)
     if not rel_posix:
         nodes: list[ArchiveTreeNode] = []
         for candidate in sorted(run_root.iterdir(), key=lambda p: p.name):
@@ -363,7 +360,7 @@ def _list_local_tree(run_root: Path, rel_path: str) -> ArchiveTreeResponse:
             try:
                 resolved = candidate.resolve(strict=False)
                 resolved.relative_to(run_root.resolve(strict=False))
-            except Exception:
+            except ValueError:
                 continue
             if candidate.is_dir():
                 root_node_type: Literal["file", "folder"] = "folder"
@@ -385,18 +382,23 @@ def _list_local_tree(run_root: Path, rel_path: str) -> ArchiveTreeResponse:
             )
         return ArchiveTreeResponse(path="", nodes=nodes)
 
-    if not target.exists():
+    if (
+        not target.exists()
+    ):  # codeql[py/path-injection] target normalized to run archive root
         raise FileNotFoundError("path not found")
-    if not target.is_dir():
+    if (
+        not target.is_dir()
+    ):  # codeql[py/path-injection] target normalized to run archive root
         raise ValueError("path is not a directory")
 
-    root_real = run_root.resolve(strict=False)
     local_nodes: list[ArchiveTreeNode] = []
-    for child in sorted(target.iterdir(), key=lambda p: p.name):
+    for child in sorted(
+        target.iterdir(), key=lambda p: p.name
+    ):  # codeql[py/path-injection] target validated by normalize helper
         try:
             resolved = child.resolve(strict=False)
             resolved.relative_to(root_real)
-        except Exception:
+        except ValueError:
             continue
 
         if child.is_dir():
@@ -541,17 +543,23 @@ def build_archive_routes() -> APIRouter:
         repo_root = request.app.state.engine.repo_root
         try:
             run_root = _resolve_local_run_root(repo_root, run_id)
-            target, rel_posix = _normalize_local_archive_rel_path(run_root, path)
+            target, rel_posix = _normalize_archive_rel_path(run_root, path)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-        if not rel_posix or not target.exists() or target.is_dir():
+        if (
+            not rel_posix
+            or not target.exists()  # codeql[py/path-injection] target normalized to run archive root
+            or not target.is_file()  # codeql[py/path-injection] target normalized to run archive root
+        ):
             raise HTTPException(status_code=404, detail="file not found")
 
         try:
-            content = target.read_text(encoding="utf-8", errors="replace")
+            content = target.read_text(
+                encoding="utf-8", errors="replace"
+            )  # codeql[py/path-injection] target validated by normalize helper
         except OSError as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
         return PlainTextResponse(content)
@@ -593,13 +601,17 @@ def build_archive_routes() -> APIRouter:
         repo_root = request.app.state.engine.repo_root
         try:
             run_root = _resolve_local_run_root(repo_root, run_id)
-            target, rel_posix = _normalize_local_archive_rel_path(run_root, path)
+            target, rel_posix = _normalize_archive_rel_path(run_root, path)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-        if not rel_posix or not target.exists() or target.is_dir():
+        if (
+            not rel_posix
+            or not target.exists()  # codeql[py/path-injection] target normalized to run archive root
+            or not target.is_file()  # codeql[py/path-injection] target normalized to run archive root
+        ):
             raise HTTPException(status_code=404, detail="file not found")
 
         return FileResponse(

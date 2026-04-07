@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Optional, Sequence
 
+from ...core.text_utils import _normalize_optional_text
 from .errors import (
     ACPError,
     ACPInitializationError,
@@ -96,13 +97,6 @@ class _PromptState:
     closed: bool = False
     replay_task: Optional[asyncio.Task[None]] = None
     request_task: Optional[asyncio.Task[Any]] = None
-
-
-def _normalize_optional_text(value: Any) -> Optional[str]:
-    if not isinstance(value, str):
-        return None
-    text = value.strip()
-    return text or None
 
 
 def _coerce_mapping(value: Any) -> dict[str, Any]:
@@ -363,7 +357,7 @@ class ACPClient:
                     "params": dict(params or {}),
                 }
             )
-        except Exception:
+        except (ACPTransportError, OSError):
             self._pending.pop(request_id, None)
             self._pending_methods.pop(request_id, None)
             raise
@@ -722,7 +716,9 @@ class ACPClient:
                 decision = await self._permission_handler(event)
             except asyncio.CancelledError:
                 decision = "cancel"
-            except Exception:
+            except (
+                Exception
+            ):  # intentional: user-provided permission handler is arbitrary code
                 decision = "cancel"
         await self._write_message(
             {
@@ -794,7 +790,7 @@ class ACPClient:
             task.result()
         except asyncio.CancelledError:
             return
-        except Exception:
+        except Exception:  # intentional: catch-all logging for background task failures
             self._logger.exception("Unhandled ACP background task failure")
 
     def _consume_transport_task_result(self, task: asyncio.Task[Any]) -> None:
@@ -804,7 +800,9 @@ class ACPClient:
             return
         except ACPError:
             return
-        except Exception:
+        except (
+            Exception
+        ):  # intentional: catch-all logging for transport task failures during shutdown
             self._logger.debug(
                 "Unhandled ACP transport task failure during shutdown",
                 exc_info=True,
@@ -898,7 +896,7 @@ class ACPClient:
                     "prompt": [{"type": "text", "text": prompt}],
                 },
             )
-        except Exception as exc:
+        except (ACPError, asyncio.TimeoutError) as exc:
             self._session_active_turns.pop(state.session_id, None)
             if not state.future.done():
                 state.future.set_exception(exc)

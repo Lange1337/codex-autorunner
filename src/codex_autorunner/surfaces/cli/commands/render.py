@@ -122,9 +122,7 @@ def _format_serve_context_details(
     root_value = str(project_root) if project_root is not None else "<none>"
     cwd_value = str(cwd) if cwd is not None else "<inherit>"
     return (
-        f"project_context={context_value}, "
-        f"project_root={root_value}, "
-        f"cwd={cwd_value}"
+        f"project_context={context_value}, project_root={root_value}, cwd={cwd_value}"
     )
 
 
@@ -258,7 +256,7 @@ def _prune_non_media_artifacts(
         try:
             resolved = artifact_path.resolve()
             is_within_output = resolved.is_relative_to(output_root)
-        except Exception:
+        except (OSError, ValueError):
             is_within_output = False
         if is_within_output and artifact_path.exists():
             artifact_path.unlink(missing_ok=True)
@@ -417,7 +415,7 @@ def _resolve_demo_target_base_url(
             yield resolved
     except ServeModeError:
         raise
-    except Exception as exc:
+    except Exception as exc:  # intentional: serve-mode start can fail in many ways
         detail = str(exc) or "Unknown serve-mode error."
         raise ServeModeError(f"{detail} (serve context: {context_details})") from exc
     finally:

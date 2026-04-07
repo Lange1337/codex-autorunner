@@ -21,6 +21,7 @@ from ...core.pr_binding_runtime import (
 )
 from ...core.pr_bindings import PrBinding, PrBindingStore
 from ...core.prompts import build_github_issue_to_spec_prompt, build_sync_agent_prompt
+from ...core.text_utils import _normalize_optional_text
 from ...core.utils import (
     atomic_write,
     read_json,
@@ -327,13 +328,6 @@ def _repo_slug_dirname(slug: str) -> str:
     return f"{safe_base[:80]}-{digest}"
 
 
-def _normalize_optional_text(value: Any) -> Optional[str]:
-    if not isinstance(value, str):
-        return None
-    text = value.strip()
-    return text or None
-
-
 def _normalize_optional_identifier_text(value: Any) -> Optional[str]:
     if isinstance(value, bool):
         return None
@@ -604,7 +598,7 @@ class GitHubService:
 
         try:
             repo_slug = self.repo_info().name_with_owner
-        except Exception:
+        except GitHubError:
             return None
 
         fallback_binding: Optional[PrBinding] = None
@@ -1228,7 +1222,7 @@ class GitHubService:
         if authed:
             try:
                 repo = self.repo_info()
-            except Exception:
+            except GitHubError:
                 repo = None
         branch = self.current_branch()
         clean = self.is_clean()
@@ -1405,7 +1399,7 @@ class GitHubService:
                 )
                 payload = json.loads(body_proc.stdout or "{}")
                 body_text = payload.get("body") if isinstance(payload, dict) else ""
-            except Exception:
+            except (GitHubError, ValueError):
                 body_text = ""
             if body_text and not _body_has_issue_close(body_text, issue_num):
                 updated = _append_issue_close(body_text, issue_num)
@@ -1416,7 +1410,7 @@ class GitHubService:
                         check=True,
                         timeout_seconds=30,
                     )
-                except Exception:
+                except (OSError, subprocess.SubprocessError):
                     pass
             pr = self.pr_for_branch(branch=head_branch, cwd=cwd) or pr
 
@@ -1446,7 +1440,9 @@ class GitHubService:
                         workspace_root=self.repo_root,
                         reaction_config=self.raw_config,
                     )
-                except Exception:
+                except (
+                    Exception
+                ):  # intentional: best-effort SCM polling arm; must not block sync_pr
                     logger.warning(
                         "Failed arming SCM polling watch for %s#%s",
                         persisted_binding.repo_slug,

@@ -489,7 +489,9 @@ class ReviewService:
                 state["worker_started_at"] = now_iso()
                 self._save_state(state)
                 self._log(f"Started review run {state['id']} (blocking)")
-            except Exception:
+            except (
+                Exception
+            ):  # intentional: re-raise safety net to guarantee lock release
                 self._release_lock()
                 raise
 
@@ -500,7 +502,15 @@ class ReviewService:
         try:
             try:
                 await self._run_review_async(state["id"])
-            except Exception as exc:
+            except (
+                ReviewError,
+                ValueError,
+                TypeError,
+                RuntimeError,
+                OSError,
+                AttributeError,
+                ConnectionResetError,
+            ) as exc:  # intentional: top-level review error handler, must capture any agent/infra failure
                 self._log(f"Review run failed: {exc}")
                 failure_state = self._load_state()
                 failure_state["status"] = "failed"
@@ -569,7 +579,9 @@ class ReviewService:
             return
         try:
             self._lock_handle.release()
-        except Exception as e:
+        except (
+            Exception
+        ) as e:  # intentional: best-effort lock release, must not mask original error
             self._logger.debug("Lock release failed: %s", e)
         self._lock_handle = None
 
@@ -609,8 +621,8 @@ class ReviewService:
                 f"[{started_at}] Review run {run_id} started\n",
                 encoding="utf-8",
             )
-        except Exception:
-            pass
+        except OSError:
+            self._log("Failed to create workflow log")
 
     def _append_workflow_log(self, message: str) -> None:
         log_path = self._workflow_log_path()
@@ -620,8 +632,8 @@ class ReviewService:
             log_path.parent.mkdir(parents=True, exist_ok=True)
             with log_path.open("a", encoding="utf-8") as handle:
                 handle.write(f"[{now_iso()}] {message}\n")
-        except Exception:
-            pass
+        except OSError:
+            self._log("Failed to append workflow log")
 
     def _render_prompt(
         self, *, state: dict[str, Any], scratchpad_dir: Path, final_output_path: Path
@@ -645,7 +657,7 @@ class ReviewService:
             target = scratchpad_dir / name
             try:
                 atomic_write(target, str(content) if content is not None else "")
-            except Exception as exc:
+            except OSError as exc:
                 self._log(f"Failed to write seed context '{name}': {exc}")
 
     def _initialize_state(
@@ -703,7 +715,9 @@ class ReviewService:
     def _run_review(self, run_id: str) -> None:
         try:
             asyncio.run(self._run_review_async(run_id))
-        except Exception as exc:
+        except (
+            Exception
+        ) as exc:  # intentional: top-level thread error handler, must capture any async failure
             self._log(f"Review run failed: {exc}")
             state = self._load_state()
             state["status"] = "failed"
@@ -768,13 +782,22 @@ class ReviewService:
                     await client.turn_interrupt(
                         handle.turn_id, thread_id=handle.thread_id
                     )
-                except Exception as exc:
+                except (
+                    RuntimeError,
+                    OSError,
+                    ConnectionError,
+                    asyncio.TimeoutError,
+                    ValueError,
+                    TypeError,
+                ) as exc:  # best-effort interrupt during shutdown
                     self._log(f"Review stop interrupt failed: {exc}")
                 review_task.cancel()
                 try:
                     await review_task
-                except Exception:
-                    pass
+                except (
+                    Exception
+                ) as exc:  # intentional: cancelled task cleanup, must not block stop
+                    self._log(f"Cancelled review task raised: {exc}")
                 state["status"] = "stopped"
                 state["finished_at"] = now_iso()
                 state["updated_at"] = now_iso()
@@ -784,8 +807,12 @@ class ReviewService:
             stop_task.cancel()
             try:
                 await stop_task
-            except Exception:
-                pass
+            except (
+                RuntimeError,
+                OSError,
+                asyncio.CancelledError,
+            ) as exc:  # cancelled stop listener cleanup
+                self._log(f"Cancelled stop listener raised: {exc}")
 
             try:
                 codex_result = await review_task
@@ -886,7 +913,7 @@ class ReviewService:
                         zipf.write(file_path, arcname)
             self._log(f"Created scratchpad bundle: {bundle_path}")
             return bundle_path
-        except Exception as exc:
+        except (OSError, zipfile.BadZipFile) as exc:
             self._log(f"Failed to create scratchpad bundle: {exc}")
             return None
 

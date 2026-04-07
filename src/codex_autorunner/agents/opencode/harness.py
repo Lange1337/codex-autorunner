@@ -123,7 +123,13 @@ async def _pre_connect_event_stream(
                 ):
                     event_seen.set()
                 await event_queue.put(event)
-        except Exception:
+        except (
+            RuntimeError,
+            OSError,
+            ProcessLookupError,
+            BrokenPipeError,
+            httpx.HTTPError,
+        ):  # intentional: background SSE consumer must not crash
             _logger.debug("Pre-connected SSE stream error", exc_info=True)
         finally:
             await event_queue.put(None)
@@ -429,7 +435,14 @@ def _synthetic_message_snapshot_events(
 
 def _observe_background_task(task: asyncio.Task[Any]) -> None:
     def _consume_exception(done: asyncio.Task[Any]) -> None:
-        with contextlib.suppress(asyncio.CancelledError, Exception):
+        # intentional: silently consume exceptions from background tasks
+        with contextlib.suppress(
+            asyncio.CancelledError,
+            RuntimeError,
+            OSError,
+            ProcessLookupError,
+            BrokenPipeError,
+        ):
             done.exception()
 
     task.add_done_callback(_consume_exception)
@@ -930,8 +943,12 @@ class OpenCodeHarness(AgentHarness):
             return
         try:
             await marker(workspace_root)
-        except Exception:
-            pass
+        except (
+            OSError,
+            RuntimeError,
+            ProcessLookupError,
+        ):  # intentional: cleanup path must not raise
+            _logger.debug("turn release marker failed", exc_info=True)
 
     async def ensure_ready(self, workspace_root: Path) -> None:
         await self._supervisor.get_client(workspace_root)
@@ -1020,7 +1037,14 @@ class OpenCodeHarness(AgentHarness):
             if reserved_workspace is not None:
                 self._reserved_conversations[session_id] = reserved_workspace
             return ConversationRef(agent=AgentId("opencode"), id=session_id)
-        except Exception:
+        except (
+            RuntimeError,
+            OSError,
+            ProcessLookupError,
+            BrokenPipeError,
+            httpx.HTTPError,
+        ):  # intentional: catch-all to ensure cleanup, then re-raise
+            _logger.debug("create_session failed, releasing turn client", exc_info=True)
             await self._release_turn_client(reserved_workspace)
             raise
 
@@ -1052,7 +1076,13 @@ class OpenCodeHarness(AgentHarness):
         )
         try:
             result = await client.get_session(conversation_id)
-        except Exception as exc:
+        except (
+            RuntimeError,
+            OSError,
+            ProcessLookupError,
+            BrokenPipeError,
+            httpx.HTTPError,
+        ) as exc:
             await self._release_turn_client(reserved_workspace)
             _raise_fresh_conversation_error(
                 exc,
@@ -1086,7 +1116,16 @@ class OpenCodeHarness(AgentHarness):
                 )
             else:
                 client = await self._supervisor.get_client(canonical_workspace)
-        except Exception:
+        except (
+            RuntimeError,
+            OSError,
+            ProcessLookupError,
+            BrokenPipeError,
+        ):  # intentional: catch-all to ensure cleanup, then re-raise
+            _logger.debug(
+                "start_turn client acquisition failed, releasing turn client",
+                exc_info=True,
+            )
             await self._release_turn_client(reserved_workspace)
             raise
         if model is None:
@@ -1125,7 +1164,13 @@ class OpenCodeHarness(AgentHarness):
                     model=model_payload,
                     variant=reasoning,
                 )
-            except Exception as exc:
+            except (
+                RuntimeError,
+                OSError,
+                ProcessLookupError,
+                BrokenPipeError,
+                httpx.HTTPError,
+            ) as exc:  # intentional: catches any client error for stale-conversation check
                 _raise_fresh_conversation_error(
                     exc,
                     conversation_id=conversation_id,
@@ -1190,7 +1235,13 @@ class OpenCodeHarness(AgentHarness):
                             payload = await client.list_messages(
                                 conversation_id, limit=10
                             )
-                        except Exception:
+                        except (
+                            ConnectionError,
+                            OSError,
+                            TimeoutError,
+                            httpx.HTTPError,
+                        ):
+                            _logger.debug("list_messages poll failed", exc_info=True)
                             await asyncio.sleep(_SILENT_TURN_PROGRESS_POLL_SECONDS)
                             continue
                         if pending.pre_connected_event_seen.is_set():
@@ -1236,7 +1287,16 @@ class OpenCodeHarness(AgentHarness):
                 )
             else:
                 client = await self._supervisor.get_client(canonical_workspace)
-        except Exception:
+        except (
+            RuntimeError,
+            OSError,
+            ProcessLookupError,
+            BrokenPipeError,
+        ):  # intentional: catch-all to ensure cleanup, then re-raise
+            _logger.debug(
+                "start_review client acquisition failed, releasing turn client",
+                exc_info=True,
+            )
             await self._release_turn_client(reserved_workspace)
             raise
         if model is None:
@@ -1275,7 +1335,13 @@ class OpenCodeHarness(AgentHarness):
                     arguments=arguments,
                     model=model,
                 )
-            except Exception as exc:
+            except (
+                RuntimeError,
+                OSError,
+                ProcessLookupError,
+                BrokenPipeError,
+                httpx.HTTPError,
+            ) as exc:  # intentional: catches any client error for stale-conversation check
                 _raise_fresh_conversation_error(
                     exc,
                     conversation_id=conversation_id,
@@ -1340,7 +1406,13 @@ class OpenCodeHarness(AgentHarness):
                             payload = await client.list_messages(
                                 conversation_id, limit=10
                             )
-                        except Exception:
+                        except (
+                            ConnectionError,
+                            OSError,
+                            TimeoutError,
+                            httpx.HTTPError,
+                        ):
+                            _logger.debug("list_messages poll failed", exc_info=True)
                             await asyncio.sleep(_SILENT_TURN_PROGRESS_POLL_SECONDS)
                             continue
                         if pending.pre_connected_event_seen.is_set():
@@ -1387,7 +1459,7 @@ class OpenCodeHarness(AgentHarness):
         client = await self._supervisor.get_client(workspace_root)
         try:
             await client.abort(conversation_id)
-        except Exception as exc:
+        except (httpx.HTTPError, ConnectionError, OSError) as exc:
             _logger.debug(
                 "Failed to abort OpenCode session %s: %s", conversation_id, exc
             )
@@ -1502,7 +1574,13 @@ class OpenCodeHarness(AgentHarness):
                     ):
                         if isinstance(payload, dict):
                             payloads.append(payload)
-                except Exception as exc:
+                except (
+                    RuntimeError,
+                    OSError,
+                    ProcessLookupError,
+                    BrokenPipeError,
+                    httpx.HTTPError,
+                ) as exc:  # intentional: stores any stream error for later propagation
                     stream_error = exc
 
                 assistant_text, errors = _collect_terminal_text(payloads)
@@ -1558,7 +1636,15 @@ class OpenCodeHarness(AgentHarness):
                     ):
                         try:
                             session_payload = await client.get_session(current)
-                        except Exception:
+                        except (
+                            ConnectionError,
+                            OSError,
+                            TimeoutError,
+                            httpx.HTTPError,
+                        ):
+                            _logger.debug(
+                                "get_session for lineage lookup failed", exc_info=True
+                            )
                             return False
                         parent_session_id = _extract_parent_session_id(session_payload)
                         session_parent_cache[current] = parent_session_id
@@ -1935,7 +2021,9 @@ class OpenCodeHarness(AgentHarness):
                                 error=recovered.error or output.error,
                                 usage=output.usage,
                             )
-                except Exception as exc:
+                except (
+                    Exception
+                ) as exc:  # intentional: top-level turn error → error result conversion
                     return TerminalTurnResult(
                         status="error",
                         assistant_text="",

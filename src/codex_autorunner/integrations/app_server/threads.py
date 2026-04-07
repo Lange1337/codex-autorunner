@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Optional
 
 from ...core.locks import file_lock
+from ...core.text_utils import lock_path_for
 from ...core.utils import atomic_write
 
 APP_SERVER_THREADS_FILENAME = ".codex-autorunner/app_server_threads.json"
@@ -307,7 +308,7 @@ class AppServerThreadRegistry:
         return self._path
 
     def _lock_path(self) -> Path:
-        return self._path.with_suffix(self._path.suffix + ".lock")
+        return lock_path_for(self._path)
 
     def _notice_path(self) -> Path:
         return self._path.with_name(
@@ -323,7 +324,7 @@ class AppServerThreadRegistry:
             return None
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
+        except (OSError, json.JSONDecodeError, ValueError):
             return None
         return payload if isinstance(payload, dict) else None
 
@@ -490,14 +491,14 @@ class AppServerThreadRegistry:
         }
         try:
             atomic_write(self._notice_path(), json.dumps(notice, indent=2) + "\n")
-        except Exception:
+        except OSError:
             LOGGER.warning(
                 "Failed to write app server thread corruption notice.",
                 exc_info=True,
             )
         try:
             self._save_unlocked({})
-        except Exception:
+        except OSError:
             LOGGER.warning(
                 "Failed to reset app server thread registry after corruption.",
                 exc_info=True,

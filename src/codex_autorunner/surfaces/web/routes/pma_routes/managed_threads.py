@@ -20,6 +20,7 @@ from .....core.orchestration.catalog import RuntimeAgentDescriptor
 from .....core.orchestration.models import ThreadTarget
 from .....core.orchestration.turn_timeline import list_turn_timeline
 from .....core.pma_thread_store import PmaThreadStore
+from .....core.text_utils import _truncate_text
 from .....integrations.chat.approval_modes import normalize_approval_mode
 from ...schemas import (
     PmaAutomationSubscriptionCreateRequest,
@@ -236,7 +237,7 @@ def _chat_binding_defaults() -> dict[str, Any]:
 def _load_chat_binding_metadata_by_thread(hub_root: Path) -> dict[str, dict[str, Any]]:
     try:
         return active_chat_binding_metadata_by_thread(hub_root=hub_root)
-    except Exception as exc:
+    except Exception as exc:  # intentional: non-critical metadata load
         _logger.warning(
             "Could not load PMA chat-binding metadata for thread response: %s", exc
         )
@@ -397,7 +398,6 @@ def build_automation_routes(
             store,
             (
                 "create_subscription",
-                "add_subscription",
                 "upsert_subscription",
             ),
             payload.model_dump(exclude_none=True),
@@ -449,11 +449,7 @@ def build_automation_routes(
         store = await get_automation_store(request, get_runtime_state())
         deleted = await call_store_action_with_id(
             store,
-            (
-                "delete_subscription",
-                "remove_subscription",
-                "cancel_subscription",
-            ),
+            ("cancel_subscription",),
             normalized_id,
             payload={},
             id_aliases=("subscription_id", "id"),
@@ -478,7 +474,7 @@ def build_automation_routes(
         try:
             created = await call_store_create_with_payload(
                 store,
-                ("create_timer", "add_timer", "upsert_timer"),
+                ("create_timer", "upsert_timer"),
                 payload.model_dump(exclude_none=True),
             )
         except ValueError as exc:
@@ -563,7 +559,7 @@ def build_automation_routes(
         store = await get_automation_store(request, get_runtime_state())
         cancelled = await call_store_action_with_id(
             store,
-            ("cancel_timer", "delete_timer", "remove_timer"),
+            ("cancel_timer",),
             normalized_id,
             payload=payload.model_dump(exclude_none=True) if payload else {},
             id_aliases=("timer_id", "id"),
@@ -666,14 +662,14 @@ def build_managed_thread_crud_routes(
         if callable(profile_getter):
             try:
                 available_profiles = profile_getter(agent_id) or {}
-            except Exception:
+            except (ValueError, TypeError):
                 available_profiles = {}
         if requested_profile is None and callable(default_profile_getter):
             try:
                 requested_profile = normalize_optional_text(
                     default_profile_getter(agent_id)
                 )
-            except Exception:
+            except (ValueError, TypeError):
                 requested_profile = None
         valid_profiles = set(available_profiles.keys())
         if agent_id == "hermes":
@@ -684,8 +680,11 @@ def build_managed_thread_crud_routes(
                     opt.profile
                     for opt in chat_hermes_profile_options(request.app.state)
                 }
-            except Exception:
-                pass
+            except Exception:  # intentional: optional hermes integration
+                _logger.debug(
+                    "Failed to resolve hermes profile options for managed thread",
+                    exc_info=True,
+                )
         if requested_profile is not None and requested_profile not in valid_profiles:
             raise HTTPException(status_code=400, detail="profile is invalid")
         context_profile = normalize_car_context_profile(
@@ -1112,12 +1111,3 @@ def build_managed_thread_crud_routes(
                 for s in summaries
             ]
         }
-
-
-def _truncate_text(value: Any, limit: int) -> str:
-    if value is None:
-        return ""
-    s = str(value)
-    if len(s) <= limit:
-        return s
-    return s[: limit - 3] + "..."

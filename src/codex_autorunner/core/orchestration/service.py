@@ -10,6 +10,7 @@ from typing import Any, Awaitable, Callable, Mapping, Optional, cast
 from ..car_context import CarContextProfile, normalize_car_context_profile
 from ..logging_utils import log_event
 from ..pma_thread_store import PmaThreadStore
+from ..text_utils import _truncate_text
 from .bindings import ActiveWorkSummary, OrchestrationBindingStore
 from .catalog import MappingAgentDefinitionCatalog, RuntimeAgentDescriptor
 from .events import OrchestrationEvent
@@ -76,14 +77,6 @@ class BusyInterruptFailedError(RuntimeError):
         self.detail = detail
 
 
-def _truncate_text(value: str, limit: int = MessagePreviewLimit) -> str:
-    if len(value) <= limit:
-        return value
-    if limit <= 3:
-        return value[:limit]
-    return value[: limit - 3] + "..."
-
-
 def _truncate_rehydration_text(value: str, limit: int = _REHYDRATION_TEXT_LIMIT) -> str:
     stripped = value.strip()
     if len(stripped) <= limit:
@@ -134,7 +127,7 @@ async def _resolve_harness_runtime_instance_id(
         return None
     try:
         runtime_instance_id = await resolver(workspace_root)
-    except Exception:
+    except (AttributeError, TypeError, RuntimeError, OSError, ValueError):
         logger.debug(
             "Failed to resolve backend runtime instance id",
             exc_info=True,
@@ -880,7 +873,14 @@ class HarnessBackedOrchestrationService(OrchestrationThreadService):
                             conversation = await harness.resume_conversation(
                                 workspace_root, conversation_id
                             )
-                        except Exception as exc:
+                        except (
+                            RuntimeError,
+                            OSError,
+                            ValueError,
+                            TypeError,
+                            AttributeError,
+                            ConnectionError,
+                        ) as exc:
                             if not _is_missing_thread_error(exc):
                                 raise
                             log_event(
@@ -1007,7 +1007,9 @@ class HarnessBackedOrchestrationService(OrchestrationThreadService):
                     )
                     conversation_id = None
                     continue
-        except Exception as exc:
+        except (
+            Exception
+        ) as exc:  # intentional: top-level execution boundary records all harness failures
             detail = (
                 str(request.metadata.get("execution_error_message") or "").strip()
                 or str(exc).strip()
@@ -1103,7 +1105,13 @@ class HarnessBackedOrchestrationService(OrchestrationThreadService):
         if running is not None and request.busy_policy == "interrupt":
             try:
                 await self.stop_thread(thread.thread_target_id)
-            except Exception as exc:
+            except (
+                RuntimeError,
+                OSError,
+                ValueError,
+                TypeError,
+                AttributeError,
+            ) as exc:
                 current_running = self.get_running_execution(thread.thread_target_id)
                 raise BusyInterruptFailedError(
                     thread_target_id=thread.thread_target_id,
@@ -1140,7 +1148,7 @@ class HarnessBackedOrchestrationService(OrchestrationThreadService):
         self.thread_store.record_thread_activity(
             thread.thread_target_id,
             execution_id=execution.execution_id,
-            message_preview=_truncate_text(request.message_text),
+            message_preview=_truncate_text(request.message_text, MessagePreviewLimit),
         )
         if execution.status != "running":
             return execution

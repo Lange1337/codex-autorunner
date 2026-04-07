@@ -4130,6 +4130,7 @@ async def test_normalized_interaction_flow_restart_without_run_id_uses_picker(
     captured: dict[str, Any] = {}
 
     async def _fake_prompt(
+        service_or_self: Any,
         interaction_id: str,
         interaction_token: str,
         *,
@@ -4141,6 +4142,9 @@ async def test_normalized_interaction_flow_restart_without_run_id_uses_picker(
         captured["action"] = action
 
     service._prompt_flow_action_picker = _fake_prompt  # type: ignore[assignment]
+    from codex_autorunner.integrations.discord import flow_commands as _fc
+
+    _fc.prompt_flow_action_picker = _fake_prompt  # type: ignore[assignment]
 
     try:
         event = _normalized_interaction_event(command="car:flow:restart")
@@ -4176,6 +4180,7 @@ async def test_normalized_interaction_flow_reply_without_run_id_sets_pending_tex
     )
 
     async def _fake_prompt(
+        service_or_self: Any,
         interaction_id: str,
         interaction_token: str,
         *,
@@ -4187,6 +4192,9 @@ async def test_normalized_interaction_flow_reply_without_run_id_sets_pending_tex
         return
 
     service._prompt_flow_action_picker = _fake_prompt  # type: ignore[assignment]
+    from codex_autorunner.integrations.discord import flow_commands as _fc
+
+    _fc.prompt_flow_action_picker = _fake_prompt  # type: ignore[assignment]
 
     try:
         event = _normalized_interaction_event(

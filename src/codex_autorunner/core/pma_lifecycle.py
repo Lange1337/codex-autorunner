@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -268,7 +269,7 @@ class PmaLifecycleRouter:
                 },
             )
 
-        except Exception as exc:
+        except Exception as exc:  # intentional: top-level lifecycle command handler
             log_event(
                 logger,
                 logging.ERROR,
@@ -375,7 +376,16 @@ class PmaLifecycleRouter:
                 },
             )
 
-        except Exception as exc:
+        except (
+            OSError,
+            RuntimeError,
+            ValueError,
+            TypeError,
+            AttributeError,
+            KeyError,
+            sqlite3.Error,
+            json.JSONDecodeError,
+        ) as exc:
             log_event(
                 logger,
                 logging.ERROR,
@@ -471,7 +481,16 @@ class PmaLifecycleRouter:
                 },
             )
 
-        except Exception as exc:
+        except (
+            OSError,
+            RuntimeError,
+            ValueError,
+            TypeError,
+            AttributeError,
+            KeyError,
+            sqlite3.Error,
+            json.JSONDecodeError,
+        ) as exc:
             log_event(
                 logger,
                 logging.ERROR,
@@ -570,7 +589,16 @@ class PmaLifecycleRouter:
                 },
             )
 
-        except Exception as exc:
+        except (
+            OSError,
+            RuntimeError,
+            ValueError,
+            TypeError,
+            AttributeError,
+            KeyError,
+            sqlite3.Error,
+            json.JSONDecodeError,
+        ) as exc:
             log_event(
                 logger,
                 logging.ERROR,

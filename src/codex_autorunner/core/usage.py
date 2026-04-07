@@ -9,6 +9,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple, cast
 
+from .text_utils import _coerce_int, _iso_now
+
 logger = logging.getLogger("codex_autorunner.core.usage")
 
 
@@ -25,7 +27,7 @@ def _parse_timestamp(value: str) -> datetime:
         if value.endswith("Z"):
             value = value.replace("Z", "+00:00")
         return datetime.fromisoformat(value)
-    except Exception as exc:
+    except (ValueError, TypeError) as exc:
         raise UsageError(f"Invalid timestamp in session log: {value}") from exc
 
 
@@ -210,26 +212,6 @@ def _coerce_opencode_int(value: object) -> int:
     return _coerce_int(value)
 
 
-def _coerce_int(value: object) -> int:
-    if isinstance(value, bool):
-        return int(value)
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return int(value)
-    if isinstance(value, str):
-        stripped = value.strip()
-        if not stripped:
-            return 0
-        try:
-            return int(stripped)
-        except ValueError as exc:
-            logger.debug("Failed to coerce int from %r: %s", value, exc)
-            return 0
-    logger.debug("Failed to coerce int from unsupported type: %s", type(value).__name__)
-    return 0
-
-
 def _coerce_opencode_field(payload: Mapping[str, object], keys: List[str]) -> int:
     for key in keys:
         if key in payload and payload.get(key) is not None:
@@ -285,10 +267,6 @@ def _clamp_non_negative_totals(totals: TokenTotals) -> TokenTotals:
 
 def _opencode_persisted_usage_path(repo_root: Path) -> Path:
     return repo_root / _OPENCODE_PERSISTED_USAGE_REL_PATH
-
-
-def _iso_now() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def persist_opencode_usage_snapshot(
@@ -1046,7 +1024,7 @@ def parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
         return None
     try:
         dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except Exception as exc:
+    except (ValueError, TypeError) as exc:
         raise UsageError(
             "Use ISO timestamps such as 2025-12-01 or 2025-12-01T12:00Z"
         ) from exc
@@ -1760,40 +1738,7 @@ class UsageSeriesCache:
                 since=since,
                 until=until,
             )
-        repo_map = [(repo_id, path.resolve()) for repo_id, path in repo_map]
-
-        def _match_repo(cwd: Optional[Path]) -> Optional[str]:
-            if not cwd:
-                return None
-            for repo_id, repo_path in repo_map:
-                if cwd == repo_path or repo_path in cwd.parents:
-                    return repo_id
-            return None
-
-        base_repo_ids = sorted(
-            {repo_id for repo_id, _ in repo_map}, key=lambda rid: (-len(rid), rid)
-        )
-
-        def _heuristic_match_base(cwd: Optional[Path]) -> Optional[str]:
-            if not cwd:
-                return None
-            for repo_id in base_repo_ids:
-                prefix = f"{repo_id}--"
-                if cwd.name.startswith(prefix):
-                    logger.debug(
-                        "Heuristic matched cwd %s to base %s via name", cwd, repo_id
-                    )
-                    return repo_id
-                for part in cwd.parts:
-                    if part.startswith(prefix):
-                        logger.debug(
-                            "Heuristic matched cwd %s to base %s via path part %s",
-                            cwd,
-                            repo_id,
-                            part,
-                        )
-                        return repo_id
-            return None
+        _match_repo, _heuristic_match_base = _build_repo_matchers(repo_map)
 
         rollups = cast(Dict[str, Any], payload.get("summary", {}).get("by_cwd", {}))
         per_repo: Dict[str, _SummaryAccumulator] = {
@@ -1932,13 +1877,7 @@ class UsageSeriesCache:
             raise UsageError(f"Unsupported bucket: {bucket}")
         if segment not in allowed_segments:
             raise UsageError(f"Unsupported segment: {segment}")
-        repo_map = [(repo_id, path.resolve()) for repo_id, path in repo_map]
-
-        def _match_repo(cwd: Path) -> Optional[str]:
-            for repo_id, repo_path in repo_map:
-                if cwd == repo_path or repo_path in cwd.parents:
-                    return repo_id
-            return None
+        _match_repo, _ = _build_repo_matchers(repo_map)
 
         rollups = cast(Dict[str, Any], payload.get("rollups", {}).get("by_cwd", {}))
         series_map: Dict[Tuple[str, Optional[str], Optional[str]], Dict[str, int]] = {}
@@ -1964,7 +1903,7 @@ class UsageSeriesCache:
                     ) + int(entry.get("total", 0))
                 continue
 
-            repo_id = _match_repo(cwd_path) if cwd_path else None
+            repo_id = _match_repo(cwd_path)
             label = repo_id or "other"
             for bucket_label, entry in bucket_rollups.items():
                 repo_key: Tuple[str, Optional[str], Optional[str]] = (

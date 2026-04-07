@@ -13,6 +13,7 @@ from typing import Any, Optional
 from .locks import file_lock
 from .orchestration.legacy_backfill_gate import ensure_legacy_orchestration_backfill
 from .orchestration.sqlite import open_orchestration_sqlite
+from .text_utils import lock_path_for
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +89,7 @@ class PmaAuditLog:
         return self._path
 
     def _lock_path(self) -> Path:
-        return self._path.with_suffix(PMA_AUDIT_LOG_LOCK_SUFFIX)
+        return lock_path_for(self._path)
 
     def append(self, entry: PmaAuditEntry) -> str:
         self._append_sqlite(entry)
@@ -335,7 +336,7 @@ class PmaAuditLog:
                 ts = datetime.fromisoformat(entry.timestamp.replace("Z", "+00:00"))
                 if ts.timestamp() >= cutoff and entry.fingerprint == fingerprint:
                     count += 1
-            except Exception:
+            except (ValueError, TypeError, AttributeError):
                 continue
         return count
 
@@ -352,7 +353,7 @@ class PmaAuditLog:
             action_type = PmaActionType(str(row["action_type"]))
         except ValueError:
             action_type = PmaActionType.UNKNOWN
-        except Exception:
+        except (KeyError, TypeError):
             return None
         return PmaAuditEntry(
             action_type=action_type,

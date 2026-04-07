@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from codex_autorunner.core import pytest_temp_cleanup as cleanup_module
 from codex_autorunner.core.pytest_temp_cleanup import (
     TempPathScanResult,
     TempRootProcess,
@@ -63,3 +64,29 @@ def test_cleanup_temp_paths_skips_active_roots(tmp_path: Path) -> None:
     assert summary.failed == 0
     assert active_root.exists() is True
     assert summary.active_processes[0].command == "node"
+
+
+def test_cleanup_temp_paths_tolerates_path_vanishing_after_delete_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    target = tmp_path / "stale"
+    (target / "data").mkdir(parents=True)
+    (target / "data" / "artifact.bin").write_bytes(b"1234")
+    original_rmtree = cleanup_module.shutil.rmtree
+
+    def _scan(path: Path) -> TempPathScanResult:
+        return TempPathScanResult(path=path, bytes=4)
+
+    def _rmtree_then_disappear(path: Path) -> None:
+        original_rmtree(path)
+        raise FileNotFoundError("already removed")
+
+    monkeypatch.setattr(cleanup_module.shutil, "rmtree", _rmtree_then_disappear)
+
+    summary = cleanup_temp_paths((target,), scan_fn=_scan)
+
+    assert summary.scanned == 1
+    assert summary.deleted == 0
+    assert summary.failed == 1
+    assert summary.bytes_after == 0
+    assert target.exists() is False

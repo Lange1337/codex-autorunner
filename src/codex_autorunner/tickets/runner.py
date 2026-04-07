@@ -382,8 +382,8 @@ class TicketRunner:
                         previous_ticket_content = _truncate_text_by_bytes(
                             content, 16384
                         )
-            except Exception:
-                pass
+            except OSError:
+                _logger.debug("failed to read previous ticket content", exc_info=True)
 
         prompt = runner_prompt.build_prompt(
             ticket_path=current_path,
@@ -557,7 +557,7 @@ class TicketRunner:
                 turn_diff_stats = git_diff_stats(
                     self._workspace_root, from_ref=None, include_staged=True
                 )
-        except Exception:
+        except (OSError, ValueError, RuntimeError):
             # Best-effort; don't block on stats computation errors
             turn_diff_stats = None
 
@@ -591,7 +591,9 @@ class TicketRunner:
                             ),
                         },
                     )
-                except Exception:
+                except (
+                    Exception
+                ):  # intentional: best-effort event emission via callback
                     # Best-effort; do not block ticket execution on event emission.
                     pass
 
@@ -1154,7 +1156,7 @@ class TicketRunner:
                 "</CAR_TICKET_FLOW_PROMPT>"
             )
 
-        prompt = _shrink_prompt(
+        return _shrink_prompt(
             max_bytes=self._config.prompt_max_bytes,
             render=render,
             sections=sections,
@@ -1167,7 +1169,6 @@ class TicketRunner:
                 "ticket_block",
             ],
         )
-        return prompt
 
     def _prior_no_change_turns(self, state: dict[str, Any], ticket_id: str) -> int:
         loop_guard_raw = state.get("loop_guard")

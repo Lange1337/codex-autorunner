@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 import shutil
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 from urllib.parse import urlsplit, urlunsplit
+
+import yaml
 
 from .actions import (
     DemoPreflightResult,
@@ -26,6 +29,8 @@ from .primitives import (
     observe_page,
     resolve_step_locator,
 )
+
+logger = logging.getLogger(__name__)
 
 PlaywrightLoader = Callable[[], Any]
 
@@ -70,7 +75,9 @@ class BrowserPreflightResult:
 def load_playwright() -> Any:
     try:
         from playwright.sync_api import sync_playwright
-    except Exception as exc:  # pragma: no cover - exercised through optional-deps gate.
+    except (
+        ImportError
+    ) as exc:  # pragma: no cover - exercised through optional-deps gate.
         raise RuntimeError(
             "Playwright is unavailable. Install optional browser dependencies first."
         ) from exc
@@ -241,7 +248,7 @@ class BrowserRuntime:
 
         try:
             manifest = load_demo_manifest(script_path)
-        except Exception as exc:
+        except (OSError, ValueError, yaml.YAMLError) as exc:
             return BrowserRunResult(
                 ok=False,
                 mode="demo",
@@ -289,7 +296,12 @@ class BrowserRuntime:
             page_video = getattr(page, "video", None)
             try:
                 page.goto(nav_url, timeout=timeout_ms, wait_until=wait_until)
-            except Exception as exc:
+            except (
+                RuntimeError,
+                OSError,
+                ConnectionError,
+                TimeoutError,
+            ) as exc:  # intentional: wraps any navigation failure
                 raise BrowserNavigationError(str(exc) or "Navigation failed.") from exc
 
             execution = execute_demo_manifest(
@@ -316,7 +328,7 @@ class BrowserRuntime:
                     execution.error_message or "Demo step execution failed."
                 )
             run_ok = True
-        except Exception as exc:
+        except Exception as exc:  # intentional: top-level error handler
             run_ok = False
             error_type = type(exc).__name__
             error_message = str(exc).strip() or repr(exc)
@@ -344,7 +356,12 @@ class BrowserRuntime:
                         skipped["trace"] = (
                             "Trace capture disabled on success (retain-on-failure)."
                         )
-                except Exception as exc:
+                except (
+                    RuntimeError,
+                    OSError,
+                    ConnectionError,
+                    TimeoutError,
+                ) as exc:  # intentional: cleanup handler
                     skipped["trace"] = f"Trace finalization failed: {exc}"
 
             if not run_ok and page is not None:
@@ -358,7 +375,12 @@ class BrowserRuntime:
                         writer=lambda p: page.screenshot(path=str(p), full_page=True),
                     )
                     artifacts["failure_screenshot"] = failure_path
-                except Exception as exc:
+                except (
+                    RuntimeError,
+                    OSError,
+                    ConnectionError,
+                    TimeoutError,
+                ) as exc:  # intentional: cleanup handler
                     skipped["failure_screenshot"] = (
                         f"Failure screenshot capture failed: {exc}"
                     )
@@ -384,7 +406,12 @@ class BrowserRuntime:
                                 output_name=None,
                             )
                             artifacts["video"] = video_artifact
-                except Exception as exc:
+                except (
+                    RuntimeError,
+                    OSError,
+                    ConnectionError,
+                    TimeoutError,
+                ) as exc:  # intentional: cleanup handler
                     skipped["video"] = f"Video finalization failed: {exc}"
 
             if browser is not None:
@@ -394,8 +421,12 @@ class BrowserRuntime:
             if video_tmp_dir is not None and video_tmp_dir.exists():
                 try:
                     shutil.rmtree(video_tmp_dir, ignore_errors=True)
-                except Exception:
-                    pass
+                except OSError:
+                    logger.debug(
+                        "Failed to remove video temp dir %s",
+                        video_tmp_dir,
+                        exc_info=True,
+                    )
 
             summary_payload = {
                 "status": "ok" if run_ok else "failed",
@@ -423,7 +454,7 @@ class BrowserRuntime:
                     payload=summary_payload,
                 )
                 artifacts["summary"] = summary_result.path
-            except Exception as exc:
+            except (OSError, ValueError, TypeError) as exc:
                 if run_ok:
                     run_ok = False
                     error_type = BrowserArtifactError.__name__
@@ -452,7 +483,7 @@ class BrowserRuntime:
     ) -> BrowserPreflightResult:
         try:
             manifest = load_demo_manifest(script_path)
-        except Exception as exc:
+        except (OSError, ValueError, yaml.YAMLError) as exc:
             message = str(exc) or "Demo manifest failed validation."
             return BrowserPreflightResult(
                 ok=False,
@@ -484,7 +515,12 @@ class BrowserRuntime:
             )
             page = context.new_page()
             page.goto(nav_url, timeout=timeout_ms, wait_until=wait_until)
-        except Exception as exc:
+        except (
+            RuntimeError,
+            OSError,
+            ConnectionError,
+            TimeoutError,
+        ) as exc:  # intentional: top-level error handler
             fatal_error = str(exc).strip() or repr(exc)
         finally:
             if fatal_error is not None:
@@ -573,7 +609,12 @@ class BrowserRuntime:
                         detail="no locator assumptions to validate.",
                     )
                 )
-            except Exception as exc:
+            except (
+                RuntimeError,
+                OSError,
+                ConnectionError,
+                TimeoutError,
+            ) as exc:  # intentional: step execution boundary
                 run_ok = False
                 detail = str(exc).strip() or repr(exc)
                 reports.append(
@@ -637,11 +678,21 @@ class BrowserRuntime:
             page = context.new_page()
             try:
                 page.goto(nav_url, timeout=timeout_ms, wait_until=wait_until)
-            except Exception as exc:
+            except (
+                RuntimeError,
+                OSError,
+                ConnectionError,
+                TimeoutError,
+            ) as exc:  # intentional: wraps any navigation failure
                 raise BrowserNavigationError(str(exc) or "Navigation failed.") from exc
             try:
                 artifacts, skipped = action(page)
-            except Exception as exc:
+            except (
+                RuntimeError,
+                OSError,
+                ConnectionError,
+                TimeoutError,
+            ) as exc:  # intentional: wraps any artifact capture failure
                 raise BrowserArtifactError(
                     str(exc) or "Artifact capture failed."
                 ) from exc
@@ -652,7 +703,7 @@ class BrowserRuntime:
                 artifacts=artifacts,
                 skipped=skipped,
             )
-        except Exception as exc:
+        except Exception as exc:  # intentional: top-level error handler
             message = str(exc).strip() or repr(exc)
             return BrowserRunResult(
                 ok=False,
@@ -672,7 +723,7 @@ class BrowserRuntime:
             return
         try:
             resource.close()
-        except Exception:
+        except (RuntimeError, OSError):  # intentional: cleanup handler
             return
 
     @staticmethod
@@ -681,7 +732,7 @@ class BrowserRuntime:
             return
         try:
             playwright.stop()
-        except Exception:
+        except (RuntimeError, OSError):  # intentional: cleanup handler
             return
 
     @staticmethod

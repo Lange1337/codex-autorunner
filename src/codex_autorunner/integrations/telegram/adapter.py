@@ -16,6 +16,7 @@ from typing import (
 )
 
 import httpx
+from pydantic import ValidationError
 
 from ...core.circuit_breaker import CircuitBreaker
 from ...core.exceptions import CodexError, PermanentError, TransientError
@@ -38,7 +39,11 @@ from .api_schemas import (
     parse_update_payload,
 )
 from .command_parsing import parse_command_payload
-from .constants import TELEGRAM_CALLBACK_DATA_LIMIT, TELEGRAM_MAX_MESSAGE_LENGTH
+from .constants import (
+    TELEGRAM_API_BASE_URL,
+    TELEGRAM_CALLBACK_DATA_LIMIT,
+    TELEGRAM_MAX_MESSAGE_LENGTH,
+)
 from .rendering import sanitize_telegram_outbound_text
 from .retry import _extract_retry_after_seconds
 
@@ -348,7 +353,7 @@ def is_interrupt_alias(text: Optional[str]) -> bool:
 def parse_update(update: dict[str, Any]) -> Optional[TelegramUpdate]:
     try:
         schema = parse_update_payload(update)
-    except Exception:
+    except ValidationError:
         return None
     message = _parse_message(schema.update_id, schema.message, edited=False)
     if message is None:
@@ -582,7 +587,7 @@ def _parse_photo_sizes(payload: Any) -> tuple[TelegramPhotoSize, ...]:
             continue
         try:
             schema = TelegramPhotoSizeSchema.model_validate(item)
-        except Exception:
+        except ValidationError:
             continue
         sizes.append(
             TelegramPhotoSize(
@@ -601,7 +606,7 @@ def _parse_document(payload: Any) -> Optional[TelegramDocument]:
         return None
     try:
         schema = TelegramDocumentSchema.model_validate(payload)
-    except Exception:
+    except ValidationError:
         return None
     return TelegramDocument(
         file_id=schema.file_id,
@@ -617,7 +622,7 @@ def _parse_audio(payload: Any) -> Optional[TelegramAudio]:
         return None
     try:
         schema = TelegramAudioSchema.model_validate(payload)
-    except Exception:
+    except ValidationError:
         return None
     return TelegramAudio(
         file_id=schema.file_id,
@@ -634,7 +639,7 @@ def _parse_voice(payload: Any) -> Optional[TelegramVoice]:
         return None
     try:
         schema = TelegramVoiceSchema.model_validate(payload)
-    except Exception:
+    except ValidationError:
         return None
     return TelegramVoice(
         file_id=schema.file_id,
@@ -654,7 +659,7 @@ def _parse_entities(payload: Any) -> tuple[TelegramMessageEntity, ...]:
             continue
         try:
             schema = TelegramMessageEntitySchema.model_validate(item)
-        except Exception:
+        except ValidationError:
             continue
         entities.append(
             TelegramMessageEntity(
@@ -1130,8 +1135,8 @@ class TelegramBotClient:
         client: Optional[httpx.AsyncClient] = None,
     ) -> None:
         self._bot_token = bot_token
-        self._base_url = "https://api.telegram.org"
-        self._file_base_url = f"https://api.telegram.org/file/bot{bot_token}"
+        self._base_url = TELEGRAM_API_BASE_URL
+        self._file_base_url = f"{TELEGRAM_API_BASE_URL}/file/bot{bot_token}"
         self._logger = logger or logging.getLogger(__name__)
         if client is None:
             self._client = httpx.AsyncClient(timeout=timeout_seconds)
@@ -1413,7 +1418,7 @@ class TelegramBotClient:
             return response.content
         except TelegramAPIError:
             raise
-        except Exception as exc:
+        except (httpx.HTTPError, OSError) as exc:
             log_event(
                 self._logger,
                 logging.WARNING,
@@ -1583,7 +1588,9 @@ class TelegramBotClient:
                 raise await self._handle_http_status_error(method, exc) from exc
             except httpx.RequestError as exc:
                 raise await self._handle_transport_error(method, exc) from exc
-            except Exception as exc:
+            except (
+                Exception
+            ) as exc:  # intentional: last-resort catch for unexpected errors in request pipeline
                 raise await self._handle_unexpected_error(method, exc) from exc
 
             if not isinstance(payload, dict) or not payload.get("ok"):

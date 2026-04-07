@@ -17,6 +17,7 @@ from ..ports.run_event import (
     ToolCall,
     ToolResult,
 )
+from ..text_utils import _json_dumps
 from .sqlite import open_orchestration_sqlite
 
 _EVENT_FAMILY = "turn.timeline"
@@ -33,10 +34,6 @@ def iso_from_epoch_millis(epoch_millis: Any) -> Optional[str]:
         .isoformat()
         .replace("+00:00", "Z")
     )
-
-
-def _json_dumps(value: Any) -> str:
-    return json.dumps(value, separators=(",", ":"), sort_keys=True)
 
 
 def _event_type_and_status(event: RunEvent) -> tuple[str, str]:
@@ -169,7 +166,7 @@ def list_turn_timeline(hub_root, *, execution_id: str) -> list[dict[str, Any]]:
     for row in rows:
         try:
             payload = json.loads(str(row["payload_json"] or "{}"))
-        except Exception:
+        except (ValueError, TypeError):
             payload = {}
         data = dict(payload) if isinstance(payload, dict) else {}
         data.setdefault("event_id", str(row["event_id"] or ""))

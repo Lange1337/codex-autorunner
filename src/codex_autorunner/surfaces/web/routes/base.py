@@ -30,6 +30,8 @@ from .shared import (
     build_opencode_terminal_cmd,
 )
 
+_logger = logging.getLogger(__name__)
+
 ALT_SCREEN_ENTER = b"\x1b[?1049h"
 
 
@@ -136,7 +138,13 @@ def build_base_routes(static_dir: Path) -> APIRouter:
         if profile is None and callable(default_profile):
             try:
                 profile = default_profile(agent)
-            except Exception:
+            except (
+                TypeError,
+                ValueError,
+                RuntimeError,
+                AttributeError,
+                OSError,
+            ):
                 profile = None
         model = (ws.query_params.get("model") or "").strip() or None
         reasoning = (ws.query_params.get("reasoning") or "").strip() or None
@@ -272,8 +280,18 @@ def build_base_routes(static_dir: Path) -> APIRouter:
                                     binary_agent = opt.runtime_agent
                                     binary_profile = None
                                     break
-                        except Exception:
-                            pass
+                        except (
+                            ImportError,
+                            AttributeError,
+                            TypeError,
+                            RuntimeError,
+                            ValueError,
+                            KeyError,
+                        ):
+                            _logger.debug(
+                                "Failed to resolve hermes profile for terminal cmd",
+                                exc_info=True,
+                            )
                     cmd = build_hermes_terminal_cmd(
                         engine.config.agent_binary(binary_agent, profile=binary_profile)
                     )
@@ -402,7 +420,7 @@ def build_base_routes(static_dir: Path) -> APIRouter:
                     await ws.send_bytes(bytes(data))
                     if session_id:
                         _touch_session(session_id)
-            except Exception:
+            except Exception:  # intentional: top-level PTY→WS bridge error boundary
                 safe_log(logger, logging.WARNING, "Terminal PTY to WS bridge failed")
 
         async def ws_to_pty():
@@ -517,7 +535,14 @@ def build_base_routes(static_dir: Path) -> APIRouter:
                             _touch_session(session_id)
             except WebSocketDisconnect:
                 pass
-            except Exception:
+            except (
+                RuntimeError,
+                OSError,
+                ValueError,
+                TypeError,
+                ConnectionError,
+                asyncio.CancelledError,
+            ):
                 safe_log(logger, logging.WARNING, "Terminal WS to PTY bridge failed")
 
         forward_task = asyncio.create_task(pty_to_ws())
@@ -529,7 +554,13 @@ def build_base_routes(static_dir: Path) -> APIRouter:
             for task in done:
                 try:
                     task.result()
-                except Exception:
+                except (
+                    RuntimeError,
+                    OSError,
+                    ValueError,
+                    TypeError,
+                    asyncio.CancelledError,
+                ):
                     safe_log(logger, logging.WARNING, "Terminal websocket task failed")
         finally:
             forward_task.cancel()
@@ -555,7 +586,7 @@ def build_base_routes(static_dir: Path) -> APIRouter:
 
         try:
             await ws.close()
-        except Exception:
+        except (RuntimeError, OSError):
             safe_log(logger, logging.WARNING, "Terminal websocket close failed")
         finally:
             # Unregister websocket from active set

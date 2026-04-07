@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -52,6 +53,7 @@ from ...core.ports.run_event import (
 )
 from ...core.sse import parse_sse_lines
 from ...core.state import RunnerState
+from ...core.text_utils import _normalize_optional_text
 from ...manifest import ManifestError, load_manifest
 from ...tickets.agent_pool import AgentTurnRequest, AgentTurnResult, EmitEventFn
 from ..app_server.event_buffer import AppServerEventBuffer
@@ -89,13 +91,6 @@ def _find_hub_root(repo_root: Path) -> Path:
             break
         current = parent
     return repo_root.resolve()
-
-
-def _normalize_optional_text(value: Any) -> Optional[str]:
-    if not isinstance(value, str):
-        return None
-    text = value.strip()
-    return text or None
 
 
 def _runtime_message_id(params: dict[str, Any]) -> Optional[str]:
@@ -258,7 +253,7 @@ class DefaultAgentPool:
                 base_env=None,
                 command_override=None,
             )
-        except Exception:
+        except (RuntimeError, ValueError, OSError, TypeError):
             _logger.debug(
                 "OpenCode supervisor unavailable for agent pool runtime context.",
                 exc_info=True,
@@ -563,7 +558,12 @@ class DefaultAgentPool:
                         timestamp=now_iso(),
                     )
                     summary.streamed_live = True
-        except Exception:
+        except (
+            RuntimeError,
+            OSError,
+            TypeError,
+            ValueError,
+        ):  # harness stream must not crash
             _logger.debug(
                 "Delegated execution event stream failed (thread=%s execution=%s)",
                 started.thread.thread_target_id,
@@ -681,7 +681,12 @@ class DefaultAgentPool:
                 status = "error"
                 error = _DEFAULT_EXECUTION_ERROR
                 result_status = normalized_status or "failed"
-        except Exception as exc:
+        except (
+            RuntimeError,
+            OSError,
+            TypeError,
+            ValueError,
+        ) as exc:  # harness execution boundary
             status = "error"
             error = str(exc).strip() or _DEFAULT_EXECUTION_ERROR
             result_status = "failed"
@@ -793,7 +798,7 @@ class DefaultAgentPool:
                 },
                 events=effective_summary.timeline_events,
             )
-        except Exception:
+        except (sqlite3.Error, OSError, ValueError, TypeError):
             _logger.exception(
                 "Failed to persist delegated turn timeline (thread=%s execution=%s)",
                 thread_id,
@@ -853,7 +858,12 @@ class DefaultAgentPool:
                         break
                 try:
                     await self._run_started_execution(started)
-                except Exception as exc:
+                except (
+                    RuntimeError,
+                    OSError,
+                    TypeError,
+                    ValueError,
+                ) as exc:  # worker loop must not crash
                     _logger.exception(
                         "Delegated execution drain failed (thread=%s execution=%s)",
                         started.thread.thread_target_id,

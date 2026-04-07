@@ -22,6 +22,7 @@ from .....core.pma_context import (
     get_latest_ticket_flow_run_state_with_record,
 )
 from .....core.pma_thread_store import PmaThreadStore, default_pma_threads_db_path
+from .....core.text_utils import _coerce_int as _standalone_coerce_int
 from .....integrations.app_server.threads import (
     AppServerThreadRegistry,
     default_app_server_threads_path,
@@ -101,7 +102,7 @@ class HubChannelService:
                 continue
             try:
                 return str(path.resolve())
-            except Exception:
+            except OSError:
                 return str(path)
         return None
 
@@ -115,7 +116,7 @@ class HubChannelService:
             mapping[str(path)] = repo_id
             try:
                 mapping[str(path.resolve())] = repo_id
-            except Exception:
+            except OSError:
                 pass
         return mapping
 
@@ -165,12 +166,7 @@ class HubChannelService:
         return normalized or None
 
     def _coerce_int(self, value: Any) -> int:
-        if isinstance(value, bool):
-            return 0
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return 0
+        return _standalone_coerce_int(value)
 
     def _coerce_usage_int(self, value: Any) -> Optional[int]:
         if isinstance(value, bool):
@@ -297,7 +293,7 @@ class HubChannelService:
                         f"discord:{binding['chat_id']}:{guild_id.strip()}",
                         binding,
                     )
-        except Exception as exc:
+        except (sqlite3.Error, OSError, ValueError, TypeError, KeyError) as exc:
             safe_log(
                 self._context.logger,
                 logging.WARNING,
@@ -309,8 +305,10 @@ class HubChannelService:
             if conn is not None:
                 try:
                     conn.close()
-                except Exception:
-                    pass
+                except sqlite3.Error:
+                    logging.getLogger(__name__).debug(
+                        "Failed to close discord sqlite connection", exc_info=True
+                    )
         return bindings
 
     def _read_telegram_scope_map(
@@ -463,7 +461,7 @@ class HubChannelService:
                         "active_thread_id": active_thread_id,
                     },
                 )
-        except Exception as exc:
+        except (sqlite3.Error, OSError, ValueError, TypeError, KeyError) as exc:
             safe_log(
                 self._context.logger,
                 logging.WARNING,
@@ -475,8 +473,10 @@ class HubChannelService:
             if conn is not None:
                 try:
                     conn.close()
-                except Exception:
-                    pass
+                except sqlite3.Error:
+                    logging.getLogger(__name__).debug(
+                        "Failed to close telegram sqlite connection", exc_info=True
+                    )
         return bindings
 
     def _read_orchestration_bindings(
@@ -556,7 +556,7 @@ class HubChannelService:
                     },
                 )
             return bindings
-        except Exception as exc:
+        except (sqlite3.Error, OSError, ValueError, TypeError, KeyError) as exc:
             safe_log(
                 self._context.logger,
                 logging.WARNING,
@@ -568,8 +568,10 @@ class HubChannelService:
             if conn is not None:
                 try:
                     conn.close()
-                except Exception:
-                    pass
+                except sqlite3.Error:
+                    logging.getLogger(__name__).debug(
+                        "Failed to close orchestration sqlite connection", exc_info=True
+                    )
 
     def _read_active_pma_threads(
         self, hub_root: Path, repo_id_by_workspace: dict[str, str]
@@ -634,7 +636,7 @@ class HubChannelService:
                     }
                 )
             return threads
-        except Exception as exc:
+        except (sqlite3.Error, OSError, ValueError, TypeError, KeyError) as exc:
             safe_log(
                 self._context.logger,
                 logging.WARNING,
@@ -762,7 +764,7 @@ class HubChannelService:
                         "timestamp": timestamp,
                         "__index": index,
                     }
-        except Exception:
+        except OSError:
             return {}
 
         for payload in by_session.values():
@@ -905,14 +907,14 @@ class HubChannelService:
                     for key, value in loaded.items():
                         if isinstance(key, str) and isinstance(value, str) and value:
                             thread_map[key] = value
-            except Exception:
+            except (OSError, ValueError):
                 thread_map = {}
             thread_map_cache[canonical_workspace] = thread_map
         try:
             resolved = thread_map.get(registry_key)
             if isinstance(resolved, str) and resolved:
                 return resolved
-        except Exception:
+        except TypeError:
             return None
         return None
 
@@ -953,7 +955,7 @@ class HubChannelService:
                 repo_id or workspace_root.name,
             )
             payload["run_state"] = run_state
-        except Exception:
+        except (sqlite3.Error, OSError):
             run_record = None
         if run_record is not None:
             db_path = workspace_root / ".codex-autorunner" / "flows.db"
@@ -972,12 +974,12 @@ class HubChannelService:
                             data.get("files_changed")
                         )
                     payload["diff_stats"] = totals
-                except Exception:
+                except sqlite3.Error:
                     payload["diff_stats"] = None
         try:
             if (workspace_root / ".git").exists():
                 payload["dirty"] = not git_is_clean(workspace_root)
-        except Exception:
+        except OSError:
             payload["dirty"] = None
         cache[canonical] = payload
         return payload
@@ -997,7 +999,7 @@ class HubChannelService:
         snapshots: list[Any] = []
         try:
             snapshots = await asyncio.to_thread(self._context.supervisor.list_repos)
-        except Exception as exc:
+        except (RuntimeError, OSError, ValueError, TypeError) as exc:
             safe_log(
                 self._context.logger,
                 logging.WARNING,
@@ -1234,7 +1236,7 @@ class HubChannelService:
                                 "turn_id": usage_payload.get("turn_id"),
                                 "timestamp": usage_payload.get("timestamp"),
                             }
-                except Exception as exc:
+                except (RuntimeError, OSError, ValueError, TypeError, KeyError) as exc:
                     safe_log(
                         self._context.logger,
                         logging.WARNING,

@@ -32,6 +32,7 @@ from .scm_observability import (
 from .scm_reaction_router import route_scm_reactions
 from .scm_reaction_state import ScmReactionStateStore
 from .scm_reaction_types import ReactionIntent, ScmReactionConfig
+from .text_utils import _normalize_text
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -165,13 +166,6 @@ class ScmReactionStateTracker(Protocol):
 
 
 def _normalize_event_id(value: object) -> Optional[str]:
-    if not isinstance(value, str):
-        return None
-    text = value.strip()
-    return text or None
-
-
-def _normalize_text(value: object) -> Optional[str]:
     if not isinstance(value, str):
         return None
     text = value.strip()
@@ -588,7 +582,9 @@ class ScmAutomationService:
                         "escalation_reason": reason,
                     },
                 )
-            except Exception:  # pragma: no cover - defensive logging
+            except (
+                Exception
+            ):  # intentional: defensive audit logging, must not crash caller
                 _LOGGER.warning(
                     "SCM publish-created audit recording failed for %s",
                     operation.operation_id,
@@ -603,7 +599,7 @@ class ScmAutomationService:
                 operation_key=operation_key,
                 metadata=escalation_metadata,
             )
-        except Exception:  # pragma: no cover - defensive logging
+        except Exception:  # intentional: defensive state update, must not crash caller
             _LOGGER.warning(
                 "SCM escalation state update failed for operation %s",
                 operation.operation_id,
@@ -646,7 +642,9 @@ class ScmAutomationService:
                     error_text=operation.last_error_text,
                     metadata=tracking,
                 )
-            except Exception:  # pragma: no cover - defensive logging
+            except (
+                Exception
+            ):  # intentional: defensive state update, must not crash caller
                 _LOGGER.warning(
                     "SCM reaction-state update failed for operation %s",
                     operation.operation_id,
@@ -697,7 +695,9 @@ class ScmAutomationService:
                     correlation_id=correlation_id,
                     operation=operation,
                 )
-            except Exception:  # pragma: no cover - defensive logging
+            except (
+                Exception
+            ):  # intentional: defensive audit logging, must not crash caller
                 _LOGGER.warning(
                     "SCM publish-finished audit recording failed for %s",
                     operation.operation_id,

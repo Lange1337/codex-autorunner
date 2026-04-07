@@ -65,7 +65,9 @@ def open_sqlite(
     try:
         yield conn
         conn.commit()
-    except Exception:
+    except (
+        Exception
+    ):  # intentional: rollback must cover any error from yielded caller code
         conn.rollback()
         raise
     finally:

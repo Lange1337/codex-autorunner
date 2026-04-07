@@ -67,7 +67,7 @@ def resolve_flow_run_record(
     if store is not None:
         try:
             record = store.get_flow_run(target.run_id)
-        except Exception:
+        except sqlite3.Error:
             record = None
     if record is not None:
         return record
@@ -131,7 +131,9 @@ def load_flow_run_records(
             store=store,
             build_service=build_flow_orchestration_service_fn,
         )
-    except Exception:
+    except (
+        Exception
+    ):  # intentional: orchestration layer errors are heterogeneous; fallback to empty
         records = []
 
     if not records:
@@ -200,7 +202,7 @@ def is_probably_corrupt_flow_db_error(exc: Exception, db_path: Path) -> bool:
     if "disk i/o error" in msg:
         try:
             header = db_path.read_bytes()[:16]
-        except Exception:
+        except OSError:
             return False
         return header not in (b"", b"SQLite format 3\x00")
     return False
@@ -218,14 +220,14 @@ def rotate_corrupt_flow_db(db_path: Path, detail: str) -> Optional[Path]:
         try:
             db_path.replace(backup_path)
             backup_value = str(backup_path)
-        except Exception:
+        except OSError:
             backup_value = ""
 
     for suffix in ("-wal", "-shm"):
         sidecar = db_path.with_name(f"{db_path.name}{suffix}")
         try:
             sidecar.unlink(missing_ok=True)
-        except Exception:
+        except OSError:
             pass
 
     notice = {
@@ -237,7 +239,7 @@ def rotate_corrupt_flow_db(db_path: Path, detail: str) -> Optional[Path]:
     }
     try:
         atomic_write(notice_path, json.dumps(notice, indent=2) + "\n")
-    except Exception:
+    except OSError:
         _logger.warning("Failed to write flow DB corruption notice at %s", notice_path)
     return backup_path if backup_value else None
 
@@ -252,8 +254,10 @@ def evict_cached_controller(
         return
     try:
         cast(Any, controller).shutdown()
-    except Exception:
-        pass
+    except (
+        Exception
+    ):  # intentional: cached controller type is unknown; shutdown must not propagate
+        _logger.debug("Failed to shutdown cached flow controller", exc_info=True)
 
 
 def cleanup_worker_handle(run_id: str, state: FlowRoutesState) -> None:
@@ -266,17 +270,17 @@ def cleanup_worker_handle(run_id: str, state: FlowRoutesState) -> None:
     if proc and proc.poll() is None:
         try:
             proc.terminate()
-        except Exception:
+        except OSError:
             pass
     for stream in (stdout, stderr):
         if stream and not stream.closed:
             try:
                 stream.flush()
-            except Exception:
+            except OSError:
                 pass
             try:
                 stream.close()
-            except Exception:
+            except OSError:
                 pass
 
 
@@ -302,7 +306,7 @@ def recover_flow_store_if_possible(
             exc,
         )
         return True
-    except Exception as recover_exc:
+    except (sqlite3.Error, OSError) as recover_exc:
         _logger.warning(
             "Flow DB recovery failed at %s after error %s: %s",
             db_path,
@@ -313,5 +317,5 @@ def recover_flow_store_if_possible(
     finally:
         try:
             store.close()
-        except Exception:
-            pass
+        except sqlite3.Error:
+            _logger.debug("Failed to close flow store during recovery", exc_info=True)

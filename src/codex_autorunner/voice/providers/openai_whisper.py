@@ -20,6 +20,8 @@ from ..provider import (
 
 RequestFn = Callable[[bytes, Mapping[str, Any]], Dict[str, Any]]
 
+DEFAULT_OPENAI_BASE_URL = "https://api.openai.com"
+
 _EXT_TO_CONTENT_TYPE: dict[str, str] = {
     # Keep these aligned with OpenAI's documented accepted formats for /audio/transcriptions.
     "webm": "audio/webm",
@@ -93,10 +95,10 @@ def _extract_http_error_detail(
                 detail = json.dumps(payload, ensure_ascii=False)
         else:
             detail = json.dumps(payload, ensure_ascii=False)
-    except Exception:
+    except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
         try:
             detail = exc.response.text
-        except Exception:
+        except (UnicodeDecodeError, ValueError):
             detail = None
 
     if detail is not None:
@@ -253,7 +255,9 @@ class _OpenAIWhisperStream(TranscriptionStream):
             latency_ms = int((time.monotonic() - started) * 1000)
             text = (result or {}).get("text", "") if isinstance(result, Mapping) else ""
             return [TranscriptionEvent(text=text, is_final=True, latency_ms=latency_ms)]
-        except Exception as exc:
+        except (
+            Exception
+        ) as exc:  # intentional: request_fn is injectable, surface arbitrary errors gracefully
             status_code, error_detail = _extract_http_error_detail(exc)
             if status_code is None and isinstance(exc, httpx.HTTPStatusError):
                 status_code = (
@@ -303,7 +307,7 @@ class _OpenAIWhisperStream(TranscriptionStream):
             self._logger.info("OpenAI Whisper stream aborted: %s", reason)
 
     def _build_payload(self) -> Dict[str, Any]:
-        base_url = self._settings.base_url or "https://api.openai.com"
+        base_url = self._settings.base_url or DEFAULT_OPENAI_BASE_URL
         payload = {
             "api_key": self._api_key,
             "base_url": base_url,

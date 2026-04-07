@@ -771,7 +771,7 @@ async def opencode_missing_env(
         return []
     try:
         payload = await client.providers(directory=workspace_root)
-    except Exception:
+    except (httpx.HTTPError, ValueError, OSError):
         return []
     providers: list[dict[str, Any]] = []
     if isinstance(payload, dict):
@@ -989,7 +989,7 @@ async def collect_opencode_output_from_events(
             try:
                 payload = await session_fetcher()
                 resolved_ids = _extract_model_ids(payload)
-            except Exception:
+            except (httpx.HTTPError, ValueError, OSError):
                 resolved_ids = None
         # If we failed to resolve model ids from the session (including the empty
         # tuple case), fall back to the caller-provided model payload so we can
@@ -1014,7 +1014,7 @@ async def collect_opencode_output_from_events(
         if providers_cache is None:
             try:
                 payload = await provider_fetcher()
-            except Exception:
+            except (httpx.HTTPError, ValueError, OSError):
                 context_window_cache[cache_key] = None
                 return None
             providers: list[dict[str, Any]] = []
@@ -1277,7 +1277,7 @@ async def collect_opencode_output_from_events(
             try:
                 fetched = await session_fetcher()
                 status_type = _extract_status_type(fetched)
-            except Exception as exc:
+            except (httpx.HTTPError, ValueError, OSError) as exc:
                 log_event(
                     logger,
                     logging.WARNING,
@@ -1320,8 +1320,11 @@ async def collect_opencode_output_from_events(
                         try:
                             fetched = await session_fetcher()
                             status_type = _extract_status_type(fetched)
-                        except Exception:
-                            pass
+                        except (ConnectionError, OSError, TimeoutError):
+                            logger.debug(
+                                "session fetch during stall recovery failed",
+                                exc_info=True,
+                            )
                     if _status_is_idle(status_type):
                         break
                 return (True, False)
@@ -1393,13 +1396,17 @@ async def collect_opencode_output_from_events(
                             try:
                                 fetched = await session_fetcher()
                                 status_type = _extract_status_type(fetched)
-                            except Exception:
-                                pass
+                            except (ConnectionError, OSError, TimeoutError):
+                                logger.debug(
+                                    "session fetch during first-event timeout check failed",
+                                    exc_info=True,
+                                )
 
                         if status_type and not _status_is_idle(status_type):
-                            should_break, should_continue = (
-                                await _handle_stall_recovery(now=now)
-                            )
+                            (
+                                should_break,
+                                should_continue,
+                            ) = await _handle_stall_recovery(now=now)
                             if should_break:
                                 break
                             if should_continue:
@@ -1433,13 +1440,17 @@ async def collect_opencode_output_from_events(
                             try:
                                 fetched = await session_fetcher()
                                 status_type = _extract_status_type(fetched)
-                            except Exception:
-                                pass
+                            except (ConnectionError, OSError, TimeoutError):
+                                logger.debug(
+                                    "session fetch during irrelevant-event timeout check failed",
+                                    exc_info=True,
+                                )
 
                         if status_type and not _status_is_idle(status_type):
-                            should_break, should_continue = (
-                                await _handle_stall_recovery(now=now)
-                            )
+                            (
+                                should_break,
+                                should_continue,
+                            ) = await _handle_stall_recovery(now=now)
                             if should_break:
                                 break
                             if should_continue:
@@ -1486,7 +1497,7 @@ async def collect_opencode_output_from_events(
                 if question_handler is not None:
                     try:
                         answers = await question_handler(request_id, props)
-                    except Exception as exc:
+                    except Exception as exc:  # intentional: pluggable callback handler
                         log_event(
                             logger,
                             logging.WARNING,
@@ -1498,15 +1509,21 @@ async def collect_opencode_output_from_events(
                         if reject_question is not None:
                             try:
                                 await reject_question(request_id)
-                            except Exception:
-                                pass
+                            except (OSError, RuntimeError, ValueError):
+                                logger.debug(
+                                    "reject_question after auto_reply_failed failed",
+                                    exc_info=True,
+                                )
                         continue
                     if answers is None:
                         if reject_question is not None:
                             try:
                                 await reject_question(request_id)
-                            except Exception:
-                                pass
+                            except (OSError, RuntimeError, ValueError):
+                                logger.debug(
+                                    "reject_question for null answers failed",
+                                    exc_info=True,
+                                )
                         continue
                     normalized_answers = _normalize_question_answers(
                         answers, question_count=question_count
@@ -1523,7 +1540,7 @@ async def collect_opencode_output_from_events(
                                 session_id=event_session_id,
                                 mode="handler",
                             )
-                        except Exception as exc:
+                        except (OSError, RuntimeError, ValueError) as exc:
                             log_event(
                                 logger,
                                 logging.WARNING,
@@ -1539,7 +1556,7 @@ async def collect_opencode_output_from_events(
                     if reject_question is not None:
                         try:
                             await reject_question(request_id)
-                        except Exception as exc:
+                        except (OSError, RuntimeError, ValueError) as exc:
                             log_event(
                                 logger,
                                 logging.WARNING,
@@ -1569,7 +1586,7 @@ async def collect_opencode_output_from_events(
                             policy=normalized_question_policy,
                             answers=_summarize_question_answers(normalized_answers),
                         )
-                    except Exception as exc:
+                    except (OSError, RuntimeError, ValueError) as exc:
                         log_event(
                             logger,
                             logging.WARNING,
@@ -1588,14 +1605,14 @@ async def collect_opencode_output_from_events(
                     ):
                         try:
                             decision = await permission_handler(request_id, props)
-                        except Exception:
+                        except Exception:  # intentional: pluggable callback handler
                             decision = OPENCODE_PERMISSION_REJECT
                         reply = _normalize_permission_decision(decision)
                     else:
                         reply = _permission_policy_reply(permission_policy)
                     try:
                         await respond_permission(request_id, reply)
-                    except Exception as exc:
+                    except (httpx.HTTPError, OSError, ValueError, RuntimeError) as exc:
                         status_code = None
                         body_preview = None
                         if isinstance(exc, httpx.HTTPStatusError):
@@ -1863,7 +1880,7 @@ async def collect_opencode_output_from_events(
     if not text_parts and messages_fetcher is not None:
         try:
             messages_payload = await messages_fetcher()
-        except Exception as exc:
+        except (httpx.HTTPError, ValueError, OSError, AttributeError) as exc:
             log_event(
                 logger,
                 logging.DEBUG,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shlex
@@ -17,6 +18,8 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 
 from ..core.process_termination import terminate_record
+
+logger = logging.getLogger(__name__)
 
 
 class ServeModeError(RuntimeError):
@@ -149,7 +152,7 @@ def load_render_session(
 
     try:
         payload = json.loads(record_path.read_text(encoding="utf-8"))
-    except Exception as exc:
+    except (OSError, ValueError) as exc:
         remove_render_session(repo_root=repo_root, session_id=session_id)
         raise StaleRenderSessionError(
             (
@@ -387,7 +390,7 @@ class BrowserServerSupervisor:
         if os.name != "nt":
             try:
                 self._pgid = os.getpgid(self._process.pid)
-            except Exception:
+            except OSError:
                 self._pgid = None
         self._start_watchers()
 
@@ -457,8 +460,8 @@ class BrowserServerSupervisor:
                     continue
                 try:
                     stream.close()
-                except Exception:
-                    pass
+                except OSError:
+                    logger.debug("Failed to close process stream", exc_info=True)
         for thread in self._watchers:
             thread.join(timeout=1.0)
 

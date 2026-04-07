@@ -9,6 +9,8 @@ import httpx
 
 from .config import Config
 
+_TELEGRAM_API_BASE_URL = "https://api.telegram.org"
+
 DEFAULT_EVENTS = {"run_finished", "run_error", "tui_idle"}
 KNOWN_EVENTS = {"run_finished", "run_error", "tui_idle", "tui_session_finished", "all"}
 DEFAULT_TIMEOUT_SECONDS = 5.0
@@ -216,7 +218,7 @@ class NotificationManager:
         try:
             with httpx.Client(timeout=self._timeout_seconds) as client:
                 self._send_sync(client, targets, message)
-        except Exception as exc:
+        except httpx.HTTPError as exc:
             self._log_warning("Notification delivery failed", exc)
 
     async def _notify_async(
@@ -230,7 +232,7 @@ class NotificationManager:
         try:
             async with httpx.AsyncClient(timeout=self._timeout_seconds) as client:
                 await self._send_async(client, targets, message)
-        except Exception as exc:
+        except httpx.HTTPError as exc:
             self._log_warning("Notification delivery failed", exc)
 
     def _resolve_targets(
@@ -356,7 +358,7 @@ class NotificationManager:
             candidate = (self.config.root / candidate).expanduser()
         try:
             return str(candidate.resolve())
-        except Exception:
+        except OSError:
             return str(candidate.absolute())
 
     def _send_sync(
@@ -367,7 +369,7 @@ class NotificationManager:
                 webhook_url = targets["discord"].get("webhook_url")
                 if isinstance(webhook_url, str):
                     self._send_discord_sync(client, webhook_url, message)
-            except Exception as exc:
+            except httpx.HTTPError as exc:
                 self._log_delivery_failure("discord", exc)
         if "telegram" in targets:
             telegram = targets["telegram"]
@@ -383,7 +385,7 @@ class NotificationManager:
                         thread_id if isinstance(thread_id, int) else None,
                         message,
                     )
-            except Exception as exc:
+            except httpx.HTTPError as exc:
                 self._log_delivery_failure("telegram", exc)
 
     async def _send_async(
@@ -397,7 +399,7 @@ class NotificationManager:
                 webhook_url = targets["discord"].get("webhook_url")
                 if isinstance(webhook_url, str):
                     await self._send_discord_async(client, webhook_url, message)
-            except Exception as exc:
+            except httpx.HTTPError as exc:
                 self._log_delivery_failure("discord", exc)
         if "telegram" in targets:
             telegram = targets["telegram"]
@@ -413,7 +415,7 @@ class NotificationManager:
                         thread_id if isinstance(thread_id, int) else None,
                         message,
                     )
-            except Exception as exc:
+            except httpx.HTTPError as exc:
                 self._log_delivery_failure("telegram", exc)
 
     def _send_discord_sync(
@@ -436,7 +438,7 @@ class NotificationManager:
         thread_id: Optional[int],
         message: str,
     ) -> None:
-        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        url = f"{_TELEGRAM_API_BASE_URL}/bot{bot_token}/sendMessage"
         payload: dict[str, object] = {"chat_id": chat_id, "text": message}
         if thread_id is not None:
             payload["message_thread_id"] = thread_id
@@ -451,7 +453,7 @@ class NotificationManager:
         thread_id: Optional[int],
         message: str,
     ) -> None:
-        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        url = f"{_TELEGRAM_API_BASE_URL}/bot{bot_token}/sendMessage"
         payload: dict[str, object] = {"chat_id": chat_id, "text": message}
         if thread_id is not None:
             payload["message_thread_id"] = thread_id
@@ -473,5 +475,5 @@ class NotificationManager:
                 self.logger.warning("%s: %s", message, exc)
             else:
                 self.logger.warning("%s", message)
-        except Exception:
-            pass
+        except Exception:  # intentional: logging fallback - must never raise
+            logging.getLogger(__name__).debug("failed to log warning", exc_info=True)
