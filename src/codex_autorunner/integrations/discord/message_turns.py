@@ -2,19 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import functools
-import inspect
 import logging
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any, Optional, cast
 
-from ...agents.base import (
-    harness_progress_event_stream,
-    harness_supports_progress_event_stream,
-)
 from ...agents.registry import get_registered_agents, wrap_requested_agent_context
 from ...core.context_awareness import (
     maybe_inject_car_awareness,
@@ -31,20 +26,12 @@ from ...core.orchestration import (
     build_harness_backed_orchestration_service,
     build_surface_orchestration_ingress,
 )
-from ...core.orchestration.runtime_thread_events import (
-    RuntimeThreadRunEventState,
-    normalize_runtime_thread_raw_event,
-    recover_post_completion_outcome,
-    terminal_run_event_from_outcome,
-)
+from ...core.orchestration.runtime_thread_events import RuntimeThreadRunEventState
 from ...core.orchestration.runtime_threads import (
     RuntimeThreadExecution,
-    RuntimeThreadOutcome,
-    await_runtime_thread_outcome,
     begin_next_queued_runtime_thread_execution,
     begin_runtime_thread_execution,
 )
-from ...core.orchestration.turn_timeline import persist_turn_timeline
 from ...core.pma_context import (
     build_hub_snapshot,
     format_pma_discoverability_preamble,
@@ -57,19 +44,7 @@ from ...core.pma_notification_store import (
     notification_surface_key,
 )
 from ...core.pma_thread_store import PmaThreadStore
-from ...core.pma_transcripts import PmaTranscriptStore
-from ...core.ports.run_event import (
-    RUN_EVENT_DELTA_TYPE_ASSISTANT_MESSAGE,
-    RUN_EVENT_DELTA_TYPE_ASSISTANT_STREAM,
-    ApprovalRequested,
-    Completed,
-    Failed,
-    OutputDelta,
-    RunNotice,
-    Started,
-    TokenUsage,
-    ToolCall,
-)
+from ...core.ports.run_event import TokenUsage
 from ...core.utils import canonicalize_path
 from ...integrations.chat.agents import resolve_chat_runtime_agent
 from ...integrations.chat.approval_modes import resolve_approval_mode_policies
@@ -82,14 +57,25 @@ from ...integrations.chat.forwarding import (
 )
 from ...integrations.chat.models import ChatMessageEvent
 from ...integrations.chat.runtime_thread_errors import (
-    resolve_runtime_thread_error_detail as _resolve_runtime_thread_result_error_detail,
-)
-from ...integrations.chat.runtime_thread_errors import (
     sanitize_runtime_thread_error,
 )
 from ..chat.managed_thread_progress import (
     ProgressRuntimeState,
     apply_run_event_to_progress_tracker,
+)
+from ..chat.managed_thread_turns import (
+    ManagedThreadCoordinatorHooks,
+    ManagedThreadErrorMessages,
+    ManagedThreadSurfaceInfo,
+    ManagedThreadTargetRequest,
+    ManagedThreadTurnCoordinator,
+    complete_managed_thread_execution,
+)
+from ..chat.managed_thread_turns import (
+    build_managed_thread_input_items as _shared_build_managed_thread_input_items,
+)
+from ..chat.managed_thread_turns import (
+    resolve_managed_thread_target as _shared_resolve_managed_thread_target,
 )
 from ..chat.progress_primitives import TurnProgressTracker, render_progress_text
 from ..chat.turn_metrics import (
@@ -137,27 +123,90 @@ class _DiscordReusableProgressMessage:
     message_id: str
 
 
+@dataclass
+class _DiscordOrchestrationState:
+    progress_reuse_requests: dict[str, _DiscordProgressReuseRequest]
+    reusable_progress_messages: dict[str, _DiscordReusableProgressMessage]
+    thread_queue_tasks: dict[str, asyncio.Task[Any]]
+
+
+@dataclass(frozen=True)
+class _DiscordMessageTurnDispatch:
+    service: Any
+    event: ChatMessageEvent
+    context: DispatchContext
+    channel_id: str
+    text: str
+    has_attachments: bool
+    log_event_fn: Any
+    build_ticket_flow_controller_fn: Any
+    ensure_worker_fn: Any
+    workspace_root: Path
+    pma_enabled: bool
+    effective_pma_enabled: bool
+    notification_reply: Any
+    agent: str
+    agent_profile: Optional[str]
+    runtime_agent: str
+    model_override: Optional[str]
+    reasoning_effort: Optional[str]
+    session_key: str
+    pending_compact_seed: Optional[str]
+    turn_text: str
+    flow_reply_text: str
+    paused_records: dict[str, Any] = field(default_factory=dict)
+
+    def build_request(
+        self,
+        *,
+        workspace_root: Optional[Path] = None,
+        pma_enabled: Optional[bool] = None,
+    ) -> SurfaceThreadMessageRequest:
+        return SurfaceThreadMessageRequest(
+            surface_kind="discord",
+            workspace_root=workspace_root or self.workspace_root,
+            prompt_text=self.turn_text,
+            agent_id=self.runtime_agent,
+            pma_enabled=(
+                self.effective_pma_enabled if pma_enabled is None else pma_enabled
+            ),
+        )
+
+
 _sanitize_runtime_thread_result_error = sanitize_runtime_thread_error
 
 
 def _get_discord_progress_reuse_requests(
     service: Any,
 ) -> dict[str, _DiscordProgressReuseRequest]:
-    requests = getattr(service, "_discord_turn_progress_reuse_requests", None)
-    if not isinstance(requests, dict):
-        requests = {}
-        service._discord_turn_progress_reuse_requests = requests
-    return requests
+    return _discord_orchestration_state(service).progress_reuse_requests
 
 
 def _get_discord_reusable_progress_messages(
     service: Any,
 ) -> dict[str, _DiscordReusableProgressMessage]:
+    return _discord_orchestration_state(service).reusable_progress_messages
+
+
+def _discord_orchestration_state(service: Any) -> _DiscordOrchestrationState:
+    requests = getattr(service, "_discord_turn_progress_reuse_requests", None)
+    if not isinstance(requests, dict):
+        requests = {}
+        service._discord_turn_progress_reuse_requests = requests
     messages = getattr(service, "_discord_reusable_progress_messages", None)
     if not isinstance(messages, dict):
         messages = {}
         service._discord_reusable_progress_messages = messages
-    return messages
+    task_map = getattr(service, "_discord_thread_queue_tasks", None)
+    if not isinstance(task_map, dict):
+        task_map = {}
+        service._discord_thread_queue_tasks = task_map
+        service._discord_managed_thread_queue_tasks = task_map
+    return _DiscordOrchestrationState(
+        progress_reuse_requests=requests,
+        reusable_progress_messages=messages,
+        thread_queue_tasks=task_map,
+    )
 
 
 def request_discord_turn_progress_reuse(
@@ -318,18 +367,6 @@ async def _acknowledge_discord_progress_reuse(
     return True
 
 
-def _get_thread_runtime_binding(
-    orchestration_service: Any, thread_target_id: str
-) -> Any:
-    getter = getattr(orchestration_service, "get_thread_runtime_binding", None)
-    if not callable(getter) or not thread_target_id:
-        return None
-    try:
-        return getter(thread_target_id)
-    except (AttributeError, KeyError, TypeError, RuntimeError):
-        return None
-
-
 def _resolve_discord_turn_policies(
     binding: Optional[dict[str, Any]],
     *,
@@ -416,6 +453,381 @@ async def resolve_bound_workspace_root(
     return binding, workspace_root
 
 
+def _build_discord_surface_ingress(
+    dispatch: _DiscordMessageTurnDispatch,
+) -> Any:
+    return build_surface_orchestration_ingress(
+        event_sink=lambda orchestration_event: dispatch.log_event_fn(
+            dispatch.service._logger,
+            logging.INFO,
+            f"discord.{orchestration_event.event_type}",
+            channel_id=dispatch.channel_id,
+            conversation_id=dispatch.context.conversation_id,
+            surface_kind=orchestration_event.surface_kind,
+            target_kind=orchestration_event.target_kind,
+            target_id=orchestration_event.target_id,
+            status=orchestration_event.status,
+            **orchestration_event.metadata,
+        )
+    )
+
+
+async def _resolve_discord_paused_flow(
+    _request: SurfaceThreadMessageRequest,
+    *,
+    dispatch: _DiscordMessageTurnDispatch,
+) -> Optional[PausedFlowTarget]:
+    paused = await dispatch.service._find_paused_flow_run(dispatch.workspace_root)
+    if paused is None:
+        return None
+    if dispatch.service._is_user_ticket_pause(dispatch.workspace_root, paused):
+        dispatch.log_event_fn(
+            dispatch.service._logger,
+            logging.INFO,
+            "discord.flow.reply.skipped_for_user_ticket_pause",
+            channel_id=dispatch.channel_id,
+            run_id=paused.id,
+        )
+        return None
+    dispatch.paused_records[paused.id] = paused
+    paused_status = getattr(paused, "status", None)
+    return PausedFlowTarget(
+        flow_target=FlowTarget(
+            flow_target_id="ticket_flow",
+            flow_type="ticket_flow",
+            display_name="ticket_flow",
+            workspace_root=str(dispatch.workspace_root),
+        ),
+        run_id=paused.id,
+        status=(
+            str(getattr(paused_status, "value", paused_status))
+            if paused_status is not None
+            else None
+        ),
+        workspace_root=dispatch.workspace_root,
+    )
+
+
+async def _submit_discord_flow_reply(
+    _request: SurfaceThreadMessageRequest,
+    flow_target: PausedFlowTarget,
+    *,
+    dispatch: _DiscordMessageTurnDispatch,
+) -> None:
+    paused_record = dispatch.paused_records.get(flow_target.run_id)
+    if paused_record is None:
+        return
+    reply_text = dispatch.flow_reply_text
+    if dispatch.has_attachments:
+        (
+            reply_text,
+            saved_attachments,
+            failed_attachments,
+            transcript_message,
+            _native_input_items,
+        ) = await dispatch.service._with_attachment_context(
+            prompt_text=dispatch.flow_reply_text,
+            workspace_root=dispatch.workspace_root,
+            attachments=dispatch.event.attachments,
+            channel_id=dispatch.channel_id,
+        )
+        if transcript_message:
+            await dispatch.service._send_channel_message_safe(
+                dispatch.channel_id,
+                {
+                    "content": transcript_message,
+                    "allowed_mentions": {"parse": []},
+                },
+            )
+        if failed_attachments > 0:
+            await dispatch.service._send_channel_message_safe(
+                dispatch.channel_id,
+                {
+                    "content": (
+                        "Some Discord attachments could not be downloaded. "
+                        "Continuing with available inputs."
+                    )
+                },
+            )
+        if not reply_text.strip() and saved_attachments == 0:
+            await dispatch.service._send_channel_message_safe(
+                dispatch.channel_id,
+                {
+                    "content": (
+                        "Failed to download attachments from Discord. Please retry."
+                    ),
+                },
+            )
+            return
+
+    reply_path = dispatch.service._write_user_reply(
+        dispatch.workspace_root, paused_record, reply_text
+    )
+    run_mirror = dispatch.service._flow_run_mirror(dispatch.workspace_root)
+    run_mirror.mirror_inbound(
+        run_id=flow_target.run_id,
+        platform="discord",
+        event_type="flow_reply_message",
+        kind="command",
+        actor="user",
+        text=reply_text,
+        chat_id=dispatch.channel_id,
+        thread_id=dispatch.event.thread.thread_id,
+        message_id=dispatch.event.message.message_id,
+    )
+    controller = dispatch.build_ticket_flow_controller_fn(dispatch.workspace_root)
+    try:
+        updated = await controller.resume_flow(flow_target.run_id)
+    except ValueError as exc:
+        await dispatch.service._send_channel_message_safe(
+            dispatch.channel_id,
+            {"content": f"Failed to resume paused run: {exc}"},
+        )
+        return
+    ensure_result = dispatch.ensure_worker_fn(
+        dispatch.workspace_root,
+        updated.id,
+        is_terminal=updated.status.is_terminal(),
+    )
+    dispatch.service._close_worker_handles(ensure_result)
+    content = format_discord_message(
+        f"Reply saved to `{reply_path.name}` and resumed paused run `{updated.id}`."
+    )
+    await dispatch.service._send_channel_message_safe(
+        dispatch.channel_id, {"content": content}
+    )
+    run_mirror.mirror_outbound(
+        run_id=updated.id,
+        platform="discord",
+        event_type="flow_reply_notice",
+        kind="notice",
+        actor="car",
+        text=content,
+        chat_id=dispatch.channel_id,
+        thread_id=dispatch.event.thread.thread_id,
+    )
+
+
+async def _submit_discord_thread_message(
+    request: SurfaceThreadMessageRequest,
+    *,
+    dispatch: _DiscordMessageTurnDispatch,
+) -> DiscordMessageTurnResult:
+    request_workspace_root = request.workspace_root
+    prompt_text = dispatch.turn_text
+    (
+        prompt_text,
+        saved_attachments,
+        failed_attachments,
+        transcript_message,
+        attachment_input_items,
+    ) = await dispatch.service._with_attachment_context(
+        prompt_text=prompt_text,
+        workspace_root=request_workspace_root,
+        attachments=dispatch.event.attachments,
+        channel_id=dispatch.channel_id,
+    )
+    if transcript_message:
+        await dispatch.service._send_channel_message_safe(
+            dispatch.channel_id,
+            {
+                "content": transcript_message,
+                "allowed_mentions": {"parse": []},
+            },
+        )
+    if failed_attachments > 0:
+        await dispatch.service._send_channel_message_safe(
+            dispatch.channel_id,
+            {
+                "content": (
+                    "Some Discord attachments could not be downloaded. "
+                    "Continuing with available inputs."
+                )
+            },
+        )
+    if not prompt_text.strip():
+        if dispatch.has_attachments and saved_attachments == 0:
+            await dispatch.service._send_channel_message_safe(
+                dispatch.channel_id,
+                {
+                    "content": (
+                        "Failed to download attachments from Discord. Please retry."
+                    ),
+                },
+            )
+        return DiscordMessageTurnResult(final_message="", send_final_message=False)
+
+    if not dispatch.effective_pma_enabled:
+        prompt_text, injected = maybe_inject_car_awareness(
+            prompt_text,
+            declared_profile="car_ambient",
+        )
+        if injected:
+            dispatch.log_event_fn(
+                dispatch.service._logger,
+                logging.INFO,
+                "discord.car_context.injected",
+                channel_id=dispatch.channel_id,
+                message_id=dispatch.event.message.message_id,
+            )
+        prompt_text, injected = maybe_inject_prompt_writing_hint(
+            prompt_text,
+            trigger_text=dispatch.text,
+        )
+        if injected:
+            dispatch.log_event_fn(
+                dispatch.service._logger,
+                logging.INFO,
+                "discord.prompt_context.injected",
+                channel_id=dispatch.channel_id,
+                message_id=dispatch.event.message.message_id,
+            )
+        prompt_text, injected = _maybe_inject_discord_filebox_hint(
+            prompt_text,
+            user_text=dispatch.text,
+            workspace_root=request_workspace_root,
+        )
+        if injected:
+            dispatch.log_event_fn(
+                dispatch.service._logger,
+                logging.INFO,
+                "discord.filebox_context.injected",
+                channel_id=dispatch.channel_id,
+                message_id=dispatch.event.message.message_id,
+            )
+
+    if dispatch.effective_pma_enabled:
+        try:
+            snapshot = await build_hub_snapshot(
+                dispatch.service._hub_supervisor, hub_root=dispatch.service._config.root
+            )
+            prompt_base = load_pma_prompt(dispatch.service._config.root)
+            if dispatch.notification_reply is not None:
+                prompt_text = (
+                    f"{build_notification_context_block(dispatch.notification_reply)}\n\n"
+                    f"{prompt_text}"
+                )
+            prompt_text = format_pma_prompt(
+                prompt_base,
+                snapshot,
+                prompt_text,
+                hub_root=dispatch.service._config.root,
+                prompt_state_key=dispatch.session_key,
+            )
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            dispatch.log_event_fn(
+                dispatch.service._logger,
+                logging.WARNING,
+                "discord.pma.prompt_build.failed",
+                channel_id=dispatch.channel_id,
+                exc=exc,
+            )
+            await dispatch.service._send_channel_message_safe(
+                dispatch.channel_id,
+                {"content": "Failed to build PMA context. Please try again."},
+            )
+            return DiscordMessageTurnResult(final_message="", send_final_message=False)
+
+    prompt_text, _github_injected = await dispatch.service._maybe_inject_github_context(
+        prompt_text,
+        request_workspace_root,
+        link_source_text=dispatch.turn_text,
+        allow_cross_repo=dispatch.pma_enabled,
+    )
+    if dispatch.pending_compact_seed:
+        prompt_text = f"{dispatch.pending_compact_seed}\n\n{prompt_text}"
+
+    turn_input_items: Optional[list[dict[str, Any]]] = None
+    if attachment_input_items:
+        turn_input_items = [
+            {"type": "text", "text": prompt_text},
+            *attachment_input_items,
+        ]
+    run_turn_kwargs: dict[str, Any] = {
+        "workspace_root": request_workspace_root,
+        "prompt_text": prompt_text,
+        "agent": dispatch.agent,
+        "model_override": dispatch.model_override,
+        "reasoning_effort": dispatch.reasoning_effort,
+        "session_key": dispatch.session_key,
+        "orchestrator_channel_key": (
+            dispatch.channel_id
+            if not dispatch.effective_pma_enabled
+            else f"pma:{dispatch.channel_id}"
+        ),
+        "source_message_id": dispatch.event.message.message_id,
+    }
+    if dispatch.notification_reply is not None:
+        run_turn_kwargs["managed_thread_surface_key"] = notification_surface_key(
+            dispatch.notification_reply.notification_id
+        )
+    if turn_input_items:
+        run_turn_kwargs["input_items"] = turn_input_items
+    try:
+        return cast(
+            DiscordMessageTurnResult,
+            await dispatch.service._run_agent_turn_for_message(**run_turn_kwargs),
+        )
+    except (
+        RuntimeError,
+        ConnectionError,
+        OSError,
+        ValueError,
+        TypeError,
+        KeyError,
+        TimeoutError,
+        AttributeError,
+    ) as exc:
+        dispatch.log_event_fn(
+            dispatch.service._logger,
+            logging.WARNING,
+            "discord.turn.failed",
+            channel_id=dispatch.channel_id,
+            conversation_id=dispatch.context.conversation_id,
+            workspace_root=str(dispatch.workspace_root),
+            agent=dispatch.agent,
+            exc=exc,
+        )
+        await dispatch.service._send_channel_message_safe(
+            dispatch.channel_id,
+            {
+                "content": (
+                    f"Turn failed: {exc} (conversation {dispatch.context.conversation_id})"
+                )
+            },
+        )
+        return DiscordMessageTurnResult(final_message="", send_final_message=False)
+
+
+async def _handle_discord_notification_turn(
+    dispatch: _DiscordMessageTurnDispatch,
+) -> DiscordMessageTurnResult:
+    notification_workspace_root = dispatch.workspace_root
+    stored_workspace_root = getattr(dispatch.notification_reply, "workspace_root", None)
+    if isinstance(stored_workspace_root, str) and stored_workspace_root.strip():
+        notification_workspace_root = Path(stored_workspace_root)
+    turn_result = await _submit_discord_thread_message(
+        dispatch.build_request(
+            workspace_root=notification_workspace_root,
+            pma_enabled=True,
+        ),
+        dispatch=dispatch,
+    )
+    surface_key = notification_surface_key(dispatch.notification_reply.notification_id)
+    orch_binding = build_discord_thread_orchestration_service(
+        dispatch.service
+    ).get_binding(
+        surface_kind="discord",
+        surface_key=surface_key,
+    )
+    if orch_binding is not None:
+        PmaNotificationStore(dispatch.service._config.root).bind_continuation_thread(
+            notification_id=dispatch.notification_reply.notification_id,
+            thread_target_id=orch_binding.thread_target_id,
+        )
+    return turn_result
+
+
 async def handle_message_event(
     service: Any,
     event: ChatMessageEvent,
@@ -493,391 +905,44 @@ async def handle_message_event(
         pending_target_id=binding.get("pending_compact_session_key"),
         active_target_id=session_key,
     )
-    ingress = build_surface_orchestration_ingress(
-        event_sink=lambda orchestration_event: log_event_fn(
-            service._logger,
-            logging.INFO,
-            f"discord.{orchestration_event.event_type}",
-            channel_id=channel_id,
-            conversation_id=context.conversation_id,
-            surface_kind=orchestration_event.surface_kind,
-            target_kind=orchestration_event.target_kind,
-            target_id=orchestration_event.target_id,
-            status=orchestration_event.status,
-            **orchestration_event.metadata,
-        )
+    dispatch = _DiscordMessageTurnDispatch(
+        service=service,
+        event=event,
+        context=context,
+        channel_id=channel_id,
+        text=text,
+        has_attachments=has_attachments,
+        log_event_fn=log_event_fn,
+        build_ticket_flow_controller_fn=build_ticket_flow_controller_fn,
+        ensure_worker_fn=ensure_worker_fn,
+        workspace_root=workspace_root,
+        pma_enabled=pma_enabled,
+        effective_pma_enabled=effective_pma_enabled,
+        notification_reply=notification_reply,
+        agent=agent,
+        agent_profile=agent_profile,
+        runtime_agent=runtime_agent,
+        model_override=model_override,
+        reasoning_effort=reasoning_effort,
+        session_key=session_key,
+        pending_compact_seed=pending_compact_seed,
+        turn_text=turn_text,
+        flow_reply_text=flow_reply_text,
     )
-    paused_records: dict[str, Any] = {}
-
-    async def _resolve_paused_flow(
-        _request: SurfaceThreadMessageRequest,
-    ) -> Optional[PausedFlowTarget]:
-        paused = await service._find_paused_flow_run(workspace_root)
-        if paused is None:
-            return None
-        if service._is_user_ticket_pause(workspace_root, paused):
-            log_event_fn(
-                service._logger,
-                logging.INFO,
-                "discord.flow.reply.skipped_for_user_ticket_pause",
-                channel_id=channel_id,
-                run_id=paused.id,
-            )
-            return None
-        paused_records[paused.id] = paused
-        paused_status = getattr(paused, "status", None)
-        return PausedFlowTarget(
-            flow_target=FlowTarget(
-                flow_target_id="ticket_flow",
-                flow_type="ticket_flow",
-                display_name="ticket_flow",
-                workspace_root=str(workspace_root),
-            ),
-            run_id=paused.id,
-            status=(
-                str(getattr(paused_status, "value", paused_status))
-                if paused_status is not None
-                else None
-            ),
-            workspace_root=workspace_root,
-        )
-
-    async def _submit_flow_reply(
-        _request: SurfaceThreadMessageRequest, flow_target: PausedFlowTarget
-    ) -> None:
-        paused_record = paused_records.get(flow_target.run_id)
-        if paused_record is None:
-            return
-        reply_text = flow_reply_text
-        if has_attachments:
-            (
-                reply_text,
-                saved_attachments,
-                failed_attachments,
-                transcript_message,
-                _native_input_items,
-            ) = await service._with_attachment_context(
-                prompt_text=flow_reply_text,
-                workspace_root=workspace_root,
-                attachments=event.attachments,
-                channel_id=channel_id,
-            )
-            if transcript_message:
-                await service._send_channel_message_safe(
-                    channel_id,
-                    {
-                        "content": transcript_message,
-                        "allowed_mentions": {"parse": []},
-                    },
-                )
-            if failed_attachments > 0:
-                warning = (
-                    "Some Discord attachments could not be downloaded. "
-                    "Continuing with available inputs."
-                )
-                await service._send_channel_message_safe(
-                    channel_id,
-                    {"content": warning},
-                )
-            if not reply_text.strip() and saved_attachments == 0:
-                await service._send_channel_message_safe(
-                    channel_id,
-                    {
-                        "content": (
-                            "Failed to download attachments from Discord. Please retry."
-                        ),
-                    },
-                )
-                return
-
-        reply_path = service._write_user_reply(
-            workspace_root, paused_record, reply_text
-        )
-        run_mirror = service._flow_run_mirror(workspace_root)
-        run_mirror.mirror_inbound(
-            run_id=flow_target.run_id,
-            platform="discord",
-            event_type="flow_reply_message",
-            kind="command",
-            actor="user",
-            text=reply_text,
-            chat_id=channel_id,
-            thread_id=event.thread.thread_id,
-            message_id=event.message.message_id,
-        )
-        controller = build_ticket_flow_controller_fn(workspace_root)
-        try:
-            updated = await controller.resume_flow(flow_target.run_id)
-        except ValueError as exc:
-            await service._send_channel_message_safe(
-                channel_id,
-                {"content": f"Failed to resume paused run: {exc}"},
-            )
-            return
-        ensure_result = ensure_worker_fn(
-            workspace_root,
-            updated.id,
-            is_terminal=updated.status.is_terminal(),
-        )
-        service._close_worker_handles(ensure_result)
-        content = format_discord_message(
-            f"Reply saved to `{reply_path.name}` and resumed paused run `{updated.id}`."
-        )
-        await service._send_channel_message_safe(channel_id, {"content": content})
-        run_mirror.mirror_outbound(
-            run_id=updated.id,
-            platform="discord",
-            event_type="flow_reply_notice",
-            kind="notice",
-            actor="car",
-            text=content,
-            chat_id=channel_id,
-            thread_id=event.thread.thread_id,
-        )
-
-    async def _submit_thread_message(
-        request: SurfaceThreadMessageRequest,
-    ) -> DiscordMessageTurnResult:
-        request_workspace_root = request.workspace_root
-        prompt_text = turn_text
-        (
-            prompt_text,
-            saved_attachments,
-            failed_attachments,
-            transcript_message,
-            attachment_input_items,
-        ) = await service._with_attachment_context(
-            prompt_text=prompt_text,
-            workspace_root=request_workspace_root,
-            attachments=event.attachments,
-            channel_id=channel_id,
-        )
-        if transcript_message:
-            await service._send_channel_message_safe(
-                channel_id,
-                {
-                    "content": transcript_message,
-                    "allowed_mentions": {"parse": []},
-                },
-            )
-        if failed_attachments > 0:
-            warning = (
-                "Some Discord attachments could not be downloaded. "
-                "Continuing with available inputs."
-            )
-            await service._send_channel_message_safe(
-                channel_id,
-                {"content": warning},
-            )
-        if not prompt_text.strip():
-            if has_attachments and saved_attachments == 0:
-                await service._send_channel_message_safe(
-                    channel_id,
-                    {
-                        "content": (
-                            "Failed to download attachments from Discord. Please retry."
-                        ),
-                    },
-                )
-            return DiscordMessageTurnResult(
-                final_message="",
-                send_final_message=False,
-            )
-
-        if not effective_pma_enabled:
-            prompt_text, injected = maybe_inject_car_awareness(
-                prompt_text,
-                declared_profile="car_ambient",
-            )
-            if injected:
-                log_event_fn(
-                    service._logger,
-                    logging.INFO,
-                    "discord.car_context.injected",
-                    channel_id=channel_id,
-                    message_id=event.message.message_id,
-                )
-            prompt_text, injected = maybe_inject_prompt_writing_hint(
-                prompt_text,
-                trigger_text=text,
-            )
-            if injected:
-                log_event_fn(
-                    service._logger,
-                    logging.INFO,
-                    "discord.prompt_context.injected",
-                    channel_id=channel_id,
-                    message_id=event.message.message_id,
-                )
-            prompt_text, injected = _maybe_inject_discord_filebox_hint(
-                prompt_text,
-                user_text=text,
-                workspace_root=request_workspace_root,
-            )
-            if injected:
-                log_event_fn(
-                    service._logger,
-                    logging.INFO,
-                    "discord.filebox_context.injected",
-                    channel_id=channel_id,
-                    message_id=event.message.message_id,
-                )
-
-        if effective_pma_enabled:
-            try:
-                snapshot = await build_hub_snapshot(
-                    service._hub_supervisor, hub_root=service._config.root
-                )
-                prompt_base = load_pma_prompt(service._config.root)
-                if notification_reply is not None:
-                    prompt_text = (
-                        f"{build_notification_context_block(notification_reply)}\n\n"
-                        f"{prompt_text}"
-                    )
-                prompt_text = format_pma_prompt(
-                    prompt_base,
-                    snapshot,
-                    prompt_text,
-                    hub_root=service._config.root,
-                    prompt_state_key=session_key,
-                )
-            except (OSError, ValueError, KeyError, TypeError) as exc:
-                log_event_fn(
-                    service._logger,
-                    logging.WARNING,
-                    "discord.pma.prompt_build.failed",
-                    channel_id=channel_id,
-                    exc=exc,
-                )
-                await service._send_channel_message_safe(
-                    channel_id,
-                    {"content": "Failed to build PMA context. Please try again."},
-                )
-                return DiscordMessageTurnResult(
-                    final_message="",
-                    send_final_message=False,
-                )
-
-        prompt_text, _github_injected = await service._maybe_inject_github_context(
-            prompt_text,
-            request_workspace_root,
-            link_source_text=turn_text,
-            allow_cross_repo=pma_enabled,
-        )
-        if pending_compact_seed:
-            prompt_text = f"{pending_compact_seed}\n\n{prompt_text}"
-
-        turn_input_items: Optional[list[dict[str, Any]]] = None
-        if attachment_input_items:
-            turn_input_items = [
-                {"type": "text", "text": prompt_text},
-                *attachment_input_items,
-            ]
-        run_turn_kwargs: dict[str, Any] = {
-            "workspace_root": request_workspace_root,
-            "prompt_text": prompt_text,
-            "agent": agent,
-            "model_override": model_override,
-            "reasoning_effort": reasoning_effort,
-            "session_key": session_key,
-            "orchestrator_channel_key": (
-                channel_id if not effective_pma_enabled else f"pma:{channel_id}"
-            ),
-        }
-        if notification_reply is not None:
-            surface_key = notification_surface_key(notification_reply.notification_id)
-            try:
-                if (
-                    "managed_thread_surface_key"
-                    in inspect.signature(service._run_agent_turn_for_message).parameters
-                ):
-                    run_turn_kwargs["managed_thread_surface_key"] = surface_key
-            except (TypeError, ValueError):
-                pass
-        try:
-            if (
-                "source_message_id"
-                in inspect.signature(service._run_agent_turn_for_message).parameters
-            ):
-                run_turn_kwargs["source_message_id"] = event.message.message_id
-        except (TypeError, ValueError):
-            pass
-        if turn_input_items:
-            run_turn_kwargs["input_items"] = turn_input_items
-        try:
-            return cast(
-                DiscordMessageTurnResult,
-                await service._run_agent_turn_for_message(**run_turn_kwargs),
-            )
-        except (
-            RuntimeError,
-            ConnectionError,
-            OSError,
-            ValueError,
-            TypeError,
-            KeyError,
-            TimeoutError,
-            AttributeError,
-        ) as exc:
-            log_event_fn(
-                service._logger,
-                logging.WARNING,
-                "discord.turn.failed",
-                channel_id=channel_id,
-                conversation_id=context.conversation_id,
-                workspace_root=str(workspace_root),
-                agent=agent,
-                exc=exc,
-            )
-            await service._send_channel_message_safe(
-                channel_id,
-                {
-                    "content": (
-                        f"Turn failed: {exc} (conversation {context.conversation_id})"
-                    )
-                },
-            )
-            return DiscordMessageTurnResult(
-                final_message="",
-                send_final_message=False,
-            )
+    ingress = _build_discord_surface_ingress(dispatch)
 
     if notification_reply is not None:
-        notification_workspace_root = workspace_root
-        stored_workspace_root = getattr(notification_reply, "workspace_root", None)
-        if isinstance(stored_workspace_root, str) and stored_workspace_root.strip():
-            notification_workspace_root = Path(stored_workspace_root)
-        turn_result = await _submit_thread_message(
-            SurfaceThreadMessageRequest(
-                surface_kind="discord",
-                workspace_root=notification_workspace_root,
-                prompt_text=turn_text,
-                agent_id=runtime_agent,
-                pma_enabled=True,
-            )
-        )
-        surface_key = notification_surface_key(notification_reply.notification_id)
-        orch_binding = build_discord_thread_orchestration_service(service).get_binding(
-            surface_kind="discord",
-            surface_key=surface_key,
-        )
-        if orch_binding is not None:
-            PmaNotificationStore(service._config.root).bind_continuation_thread(
-                notification_id=notification_reply.notification_id,
-                thread_target_id=orch_binding.thread_target_id,
-            )
+        turn_result = await _handle_discord_notification_turn(dispatch)
     else:
         result = await ingress.submit_message(
-            SurfaceThreadMessageRequest(
-                surface_kind="discord",
-                workspace_root=workspace_root,
-                prompt_text=turn_text,
-                agent_id=runtime_agent,
-                pma_enabled=pma_enabled,
+            dispatch.build_request(pma_enabled=pma_enabled),
+            resolve_paused_flow_target=partial(
+                _resolve_discord_paused_flow, dispatch=dispatch
             ),
-            resolve_paused_flow_target=_resolve_paused_flow,
-            submit_flow_reply=_submit_flow_reply,
-            submit_thread_message=_submit_thread_message,
+            submit_flow_reply=partial(_submit_discord_flow_reply, dispatch=dispatch),
+            submit_thread_message=partial(
+                _submit_discord_thread_message, dispatch=dispatch
+            ),
         )
         if result.route == "flow":
             return
@@ -986,51 +1051,14 @@ async def run_agent_turn_for_message(
     )
 
 
-def _note_runtime_event_state(
-    event_state: RuntimeThreadRunEventState,
-    run_event: Any,
-) -> None:
-    if isinstance(run_event, OutputDelta):
-        if run_event.delta_type == RUN_EVENT_DELTA_TYPE_ASSISTANT_STREAM:
-            event_state.note_stream_text(str(run_event.content or ""))
-            return
-        if run_event.delta_type == RUN_EVENT_DELTA_TYPE_ASSISTANT_MESSAGE:
-            event_state.note_message_text(str(run_event.content or ""))
-            return
-        return
-    if isinstance(run_event, TokenUsage) and isinstance(run_event.usage, dict):
-        event_state.token_usage = dict(run_event.usage)
-        return
-    if isinstance(run_event, Completed):
-        event_state.completed_seen = True
-        if isinstance(run_event.final_message, str):
-            event_state.note_message_text(run_event.final_message)
-        return
-    if isinstance(run_event, Failed):
-        error_message = str(run_event.error_message or "").strip()
-        if error_message:
-            event_state.last_error_message = error_message
-
-
 def _build_managed_thread_input_items(
     runtime_prompt: str,
     input_items: Optional[list[dict[str, Any]]],
 ) -> Optional[list[dict[str, Any]]]:
-    if not input_items:
-        return None
-    normalized: list[dict[str, Any]] = []
-    replaced_text = False
-    for item in input_items:
-        if not isinstance(item, dict):
-            continue
-        item_copy = dict(item)
-        if not replaced_text and str(item_copy.get("type") or "").strip() == "text":
-            item_copy["text"] = runtime_prompt
-            replaced_text = True
-        normalized.append(item_copy)
-    if not replaced_text:
-        normalized.insert(0, {"type": "text", "text": runtime_prompt})
-    return normalized or None
+    return _shared_build_managed_thread_input_items(
+        runtime_prompt,
+        input_items,
+    )
 
 
 def build_discord_thread_orchestration_service(service: Any) -> Any:
@@ -1040,12 +1068,7 @@ def build_discord_thread_orchestration_service(service: Any) -> Any:
     if cached is not None:
         return cached
 
-    try:
-        descriptors = get_registered_agents(service)
-    except TypeError as exc:
-        if "positional argument" not in str(exc):
-            raise
-        descriptors = get_registered_agents()
+    descriptors = get_registered_agents(service)
 
     def _make_harness(agent_id: str, profile: Optional[str] = None) -> Any:
         descriptor = descriptors.get(agent_id)
@@ -1081,32 +1104,11 @@ def resolve_discord_thread_target(
 ) -> Any:
     orchestration_service = build_discord_thread_orchestration_service(service)
     surface_key = managed_thread_surface_key or channel_id
-    binding = orchestration_service.get_binding(
-        surface_kind="discord",
-        surface_key=surface_key,
-    )
-    thread_target_id = (
-        binding.thread_target_id
-        if binding is not None and str(binding.mode or "").strip().lower() == mode
-        else None
-    )
-    thread: Any = (
-        orchestration_service.get_thread_target(thread_target_id)
-        if isinstance(thread_target_id, str) and thread_target_id
-        else None
-    )
-    canonical_workspace = str(workspace_root.resolve())
     runtime_agent = resolve_chat_runtime_agent(
         agent,
         agent_profile,
         default=getattr(service, "DEFAULT_AGENT", "codex"),
         context=service,
-    )
-    reusable_thread = (
-        thread is not None
-        and str(thread.agent_id or "").strip() in {agent, runtime_agent}
-        and (thread.agent_profile or None) == (agent_profile or None)
-        and str(thread.workspace_root or "").strip() == canonical_workspace
     )
     owner_kind, owner_id, normalized_repo_id = service._resource_owner_for_workspace(
         workspace_root,
@@ -1114,573 +1116,124 @@ def resolve_discord_thread_target(
         resource_kind=resource_kind,
         resource_id=resource_id,
     )
-    if (
-        reusable_thread
-        and str(thread.lifecycle_status or "").strip().lower() != "active"
-    ):
-        thread = orchestration_service.resume_thread_target(thread.thread_target_id)
-    elif not reusable_thread:
-        thread_metadata: Optional[dict[str, Any]] = (
-            {"agent_profile": agent_profile} if agent_profile else None
-        )
-        thread = orchestration_service.create_thread_target(
-            agent,
-            workspace_root,
+    return _shared_resolve_managed_thread_target(
+        orchestration_service,
+        request=ManagedThreadTargetRequest(
+            surface_kind="discord",
+            surface_key=surface_key,
+            mode=mode,
+            agent=agent,
+            agent_profile=agent_profile,
+            workspace_root=workspace_root,
+            display_name=f"discord:{surface_key}",
             repo_id=normalized_repo_id,
             resource_kind=owner_kind,
             resource_id=owner_id,
-            display_name=f"discord:{surface_key}",
-            metadata=thread_metadata,
-        )
-    orchestration_service.upsert_binding(
-        surface_kind="discord",
-        surface_key=surface_key,
-        thread_target_id=thread.thread_target_id,
-        agent_id=agent,
-        repo_id=normalized_repo_id,
-        resource_kind=owner_kind,
-        resource_id=owner_id,
-        mode=mode,
-        metadata={"channel_id": channel_id, "pma_enabled": pma_enabled},
+            binding_metadata={"channel_id": channel_id, "pma_enabled": pma_enabled},
+            reusable_agent_ids=(runtime_agent,),
+        ),
     )
-    return orchestration_service, thread
 
 
-async def _finalize_discord_thread_execution(
-    service: Any,
+def _build_discord_managed_thread_coordinator(
     *,
+    service: Any,
     orchestration_service: Any,
-    started: RuntimeThreadExecution,
     channel_id: str,
     public_execution_error: str,
     timeout_error: str,
     interrupted_error: str,
-    runtime_event_state: Optional[RuntimeThreadRunEventState] = None,
-    on_progress_event: Optional[Any] = None,
-) -> dict[str, Any]:
-    thread_store = PmaThreadStore(service._config.root)
-    transcripts = PmaTranscriptStore(service._config.root)
-    managed_thread_id = started.thread.thread_target_id
-    managed_turn_id = started.execution.execution_id
-    current_thread_row = thread_store.get_thread(managed_thread_id) or {}
-    current_preview = truncate_for_discord(
-        str(started.request.message_text or ""),
-        max_len=120,
-    )
-    runtime_binding = _get_thread_runtime_binding(
-        orchestration_service, managed_thread_id
-    )
-    current_backend_thread_id = str(
-        getattr(runtime_binding, "backend_thread_id", None)
-        or started.thread.backend_thread_id
-        or ""
-    ).strip()
-    started_execution_status = str(
-        getattr(started.execution, "status", "") or ""
-    ).strip()
-    started_execution_error = str(getattr(started.execution, "error", "") or "").strip()
-    event_state = runtime_event_state or RuntimeThreadRunEventState()
-    stream_task: Optional[asyncio.Task[None]] = None
-    timeline_events: list[Any] = []
-    live_timeline_count = 0
-    live_timeline_error_logged = False
-
-    def _persist_live_timeline_events(events: list[Any]) -> None:
-        nonlocal live_timeline_count
-        nonlocal live_timeline_error_logged
-        if not events:
-            return
-        try:
-            persist_turn_timeline(
-                service._config.root,
-                execution_id=managed_turn_id,
-                target_kind="thread_target",
-                target_id=managed_thread_id,
-                repo_id=str(current_thread_row.get("repo_id") or "").strip() or None,
-                resource_kind=(
-                    str(current_thread_row.get("resource_kind") or "").strip() or None
-                ),
-                resource_id=(
-                    str(current_thread_row.get("resource_id") or "").strip() or None
-                ),
-                metadata={
-                    "agent": getattr(started.thread, "agent_id", None),
-                    "execution_id": managed_turn_id,
-                    "thread_target_id": managed_thread_id,
-                    "backend_thread_id": current_backend_thread_id or None,
-                    "backend_turn_id": started.execution.backend_id,
-                    "model": started.request.model,
-                    "reasoning": started.request.reasoning,
-                    "request_kind": getattr(started.request, "kind", None),
-                    "status": "running",
-                    "surface_kind": "discord",
-                    "surface_key": channel_id,
-                },
-                events=events,
-                start_index=live_timeline_count + 1,
-            )
-        except Exception:
-            if not live_timeline_error_logged:
-                live_timeline_error_logged = True
-                _logger.exception(
-                    "Failed to persist live Discord thread timeline (thread=%s turn=%s)",
-                    managed_thread_id,
-                    managed_turn_id,
-                )
-        else:
-            live_timeline_count += len(events)
-
-    stream_backend_thread_id = current_backend_thread_id
-    stream_backend_turn_id = str(started.execution.backend_id or "").strip()
-    if not stream_backend_turn_id:
-        stream_backend_turn_id = str(started.execution.execution_id or "").strip()
-        _logger.warning(
-            "Discord finalize: backend_id missing, falling back to execution_id=%s "
-            "for thread=%s",
-            stream_backend_turn_id,
-            managed_thread_id,
-        )
-
-    if (
-        harness_supports_progress_event_stream(started.harness)
-        and stream_backend_thread_id
-        and stream_backend_turn_id
-    ):
-
-        async def _pump_runtime_events() -> None:
-            raw_events_received = 0
-            run_events_dispatched = 0
-            try:
-                async for raw_event in harness_progress_event_stream(
-                    started.harness,
-                    started.workspace_root,
-                    stream_backend_thread_id,
-                    stream_backend_turn_id,
-                ):
-                    raw_events_received += 1
-                    run_events: list[Any]
-                    if isinstance(
-                        raw_event,
-                        (
-                            OutputDelta,
-                            ToolCall,
-                            ApprovalRequested,
-                            RunNotice,
-                            TokenUsage,
-                            Completed,
-                            Failed,
-                            Started,
-                        ),
-                    ):
-                        run_events = [raw_event]
-                        for run_event in run_events:
-                            _note_runtime_event_state(event_state, run_event)
-                    else:
-                        run_events = await normalize_runtime_thread_raw_event(
-                            raw_event,
-                            event_state,
-                        )
-                    timeline_events.extend(run_events)
-                    _persist_live_timeline_events(run_events)
-                    if on_progress_event is None:
-                        continue
-                    for run_event in run_events:
-                        run_events_dispatched += 1
-                        try:
-                            await on_progress_event(run_event)
-                        except (
-                            RuntimeError,
-                            ConnectionError,
-                            OSError,
-                            ValueError,
-                            TypeError,
-                        ):
-                            _logger.debug(
-                                "Discord progress event handler failed for %s",
-                                type(run_event).__name__,
-                                exc_info=True,
-                            )
-                            continue
-            except (RuntimeError, ConnectionError, OSError, ValueError, TypeError):
-                _logger.warning("Discord progress event pump failed", exc_info=True)
-            finally:
-                _logger.info(
-                    "Discord progress pump finished thread=%s turn=%s "
-                    "raw_events=%d run_events_dispatched=%d",
-                    managed_thread_id,
-                    managed_turn_id,
-                    raw_events_received,
-                    run_events_dispatched,
-                )
-
-        stream_task = asyncio.create_task(_pump_runtime_events())
-
-    try:
-        if started_execution_status == "error":
-            outcome = RuntimeThreadOutcome(
-                status="error",
-                assistant_text="",
-                error=started_execution_error or public_execution_error,
-                backend_thread_id=current_backend_thread_id,
-                backend_turn_id=started.execution.backend_id,
-            )
-        elif started_execution_status == "interrupted":
-            outcome = RuntimeThreadOutcome(
-                status="interrupted",
-                assistant_text="",
-                error=interrupted_error,
-                backend_thread_id=current_backend_thread_id,
-                backend_turn_id=started.execution.backend_id,
-            )
-        else:
-            outcome = await await_runtime_thread_outcome(
-                started,
-                interrupt_event=None,
-                timeout_seconds=DISCORD_PMA_TIMEOUT_SECONDS,
-                execution_error_message=public_execution_error,
-            )
-    except (RuntimeError, ConnectionError, OSError, ValueError, TypeError):
-        outcome = RuntimeThreadOutcome(
-            status="error",
-            assistant_text="",
-            error=started_execution_error or public_execution_error,
-            backend_thread_id=current_backend_thread_id,
-            backend_turn_id=started.execution.backend_id,
-        )
-    finally:
-        if stream_task is not None:
-            drain_cancel: Optional[BaseException] = None
-            try:
-                await asyncio.wait_for(stream_task, timeout=0.5)
-            except asyncio.TimeoutError:
-                stream_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await stream_task
-            except asyncio.CancelledError as exc:
-                drain_cancel = exc
-                stream_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await stream_task
-            if drain_cancel is not None:
-                raise drain_cancel
-
-    recovered_outcome = recover_post_completion_outcome(outcome, event_state)
-    if recovered_outcome is not outcome:
-        service._logger.warning(
-            "Discord runtime turn recovered from post-completion error: thread=%s turn=%s error=%s",
-            managed_thread_id,
-            managed_turn_id,
-            outcome.error,
-        )
-        outcome = recovered_outcome
-
-    if on_progress_event is not None:
-        terminal_event = terminal_run_event_from_outcome(outcome, event_state)
-        timeline_events.append(terminal_event)
-        try:
-            await on_progress_event(terminal_event)
-        except (RuntimeError, ConnectionError, OSError):
-            _logger.debug("Discord terminal progress event failed", exc_info=True)
-    else:
-        timeline_events.append(terminal_run_event_from_outcome(outcome, event_state))
-
-    try:
-        persist_turn_timeline(
-            service._config.root,
-            execution_id=managed_turn_id,
-            target_kind="thread_target",
-            target_id=managed_thread_id,
-            repo_id=str(current_thread_row.get("repo_id") or "").strip() or None,
-            resource_kind=(
-                str(current_thread_row.get("resource_kind") or "").strip() or None
-            ),
-            resource_id=(
-                str(current_thread_row.get("resource_id") or "").strip() or None
-            ),
-            metadata={
-                "agent": getattr(started.thread, "agent_id", None),
-                "execution_id": managed_turn_id,
-                "thread_target_id": managed_thread_id,
-                "backend_thread_id": current_backend_thread_id or None,
-                "backend_turn_id": outcome.backend_turn_id
-                or started.execution.backend_id,
-                "model": started.request.model,
-                "reasoning": started.request.reasoning,
-                "request_kind": getattr(started.request, "kind", None),
-                "status": outcome.status,
-                "surface_kind": "discord",
-                "surface_key": channel_id,
-            },
-            events=timeline_events,
-        )
-    except Exception:
-        _logger.exception(
-            "Failed to persist Discord thread timeline (thread=%s turn=%s)",
-            managed_thread_id,
-            managed_turn_id,
-        )
-
-    resolved_assistant_text = (
-        outcome.assistant_text or event_state.best_assistant_text()
+) -> ManagedThreadTurnCoordinator:
+    return ManagedThreadTurnCoordinator(
+        orchestration_service=orchestration_service,
+        state_root=service._config.root,
+        surface=ManagedThreadSurfaceInfo(
+            log_label="Discord",
+            surface_kind="discord",
+            surface_key=channel_id,
+        ),
+        errors=ManagedThreadErrorMessages(
+            public_execution_error=public_execution_error,
+            timeout_error=timeout_error,
+            interrupted_error=interrupted_error,
+            timeout_seconds=DISCORD_PMA_TIMEOUT_SECONDS,
+        ),
+        logger=getattr(service, "_logger", _logger),
+        turn_preview="",
+        preview_builder=lambda message_text: truncate_for_discord(
+            message_text,
+            max_len=120,
+        ),
     )
 
-    finalized_thread = orchestration_service.get_thread_target(managed_thread_id)
-    finalized_runtime_binding = _get_thread_runtime_binding(
-        orchestration_service, managed_thread_id
-    )
-    resolved_backend_thread_id = (
-        str(
-            getattr(finalized_runtime_binding, "backend_thread_id", None)
-            or getattr(finalized_thread, "backend_thread_id", None)
-            or ""
-        ).strip()
-        or outcome.backend_thread_id
-        or current_backend_thread_id
-    )
 
-    if outcome.status == "ok":
-        transcript_turn_id: Optional[str] = None
-        transcript_metadata = {
-            "managed_thread_id": managed_thread_id,
-            "managed_turn_id": managed_turn_id,
-            "repo_id": current_thread_row.get("repo_id"),
-            "workspace_root": str(started.workspace_root),
-            "agent": current_thread_row.get("agent"),
-            "backend_thread_id": resolved_backend_thread_id,
-            "backend_turn_id": outcome.backend_turn_id,
-            "model": started.request.model,
-            "reasoning": started.request.reasoning,
-            "status": "ok",
-            "surface_kind": "discord",
-            "surface_key": channel_id,
-        }
-        try:
-            transcripts.write_transcript(
-                turn_id=managed_turn_id,
-                metadata=transcript_metadata,
-                assistant_text=resolved_assistant_text,
-            )
-            transcript_turn_id = managed_turn_id
-        except OSError as exc:
-            service._logger.warning(
-                "Failed to persist Discord transcript (thread=%s turn=%s): %s",
-                managed_thread_id,
-                managed_turn_id,
-                exc,
-            )
-        try:
-            finalized_execution = orchestration_service.record_execution_result(
-                managed_thread_id,
-                managed_turn_id,
-                status="ok",
-                assistant_text=resolved_assistant_text,
-                error=outcome.error,
-                backend_turn_id=outcome.backend_turn_id,
-                transcript_turn_id=transcript_turn_id,
-            )
-        except KeyError:
-            finalized_execution = orchestration_service.get_execution(
-                managed_thread_id, managed_turn_id
-            )
-        finalized_status = str(
-            getattr(finalized_execution, "status", "") if finalized_execution else ""
-        ).strip()
-        if finalized_status != "ok":
-            detail = public_execution_error
-            if finalized_status == "interrupted":
-                detail = interrupted_error
-            elif finalized_status == "error" and finalized_execution is not None:
-                detail = _resolve_runtime_thread_result_error_detail(
-                    execution_error=getattr(finalized_execution, "error", None),
-                    event_error=event_state.last_error_message,
-                    public_error=public_execution_error,
-                    timeout_error=timeout_error,
-                    interrupted_error=interrupted_error,
-                )
-            return {
-                "status": "error",
-                "assistant_text": "",
-                "error": detail,
-                "managed_thread_id": managed_thread_id,
-                "managed_turn_id": managed_turn_id,
-                "backend_thread_id": resolved_backend_thread_id,
-                "token_usage": event_state.token_usage,
-            }
-        thread_store.update_thread_after_turn(
-            managed_thread_id,
-            last_turn_id=managed_turn_id,
-            last_message_preview=current_preview,
-        )
-        return {
-            "status": "ok",
-            "assistant_text": resolved_assistant_text,
-            "error": None,
-            "managed_thread_id": managed_thread_id,
-            "managed_turn_id": managed_turn_id,
-            "backend_thread_id": resolved_backend_thread_id,
-            "token_usage": event_state.token_usage,
-        }
-
-    if outcome.status == "interrupted":
-        try:
-            orchestration_service.record_execution_interrupted(
-                managed_thread_id, managed_turn_id
-            )
-        except KeyError:
-            pass
-        return {
-            "status": "interrupted",
-            "assistant_text": "",
-            "error": interrupted_error,
-            "managed_thread_id": managed_thread_id,
-            "managed_turn_id": managed_turn_id,
-            "backend_thread_id": resolved_backend_thread_id,
-            "token_usage": event_state.token_usage,
-        }
-
-    detail = _resolve_runtime_thread_result_error_detail(
-        outcome_error=outcome.error,
-        event_error=event_state.last_error_message,
-        public_error=public_execution_error,
-        timeout_error=timeout_error,
-        interrupted_error=interrupted_error,
-    )
-    try:
-        orchestration_service.record_execution_result(
-            managed_thread_id,
-            managed_turn_id,
-            status="error",
-            assistant_text="",
-            error=detail,
-            backend_turn_id=outcome.backend_turn_id,
-            transcript_turn_id=None,
-        )
-    except KeyError:
-        pass
-    return {
-        "status": "error",
-        "assistant_text": "",
-        "error": detail,
-        "managed_thread_id": managed_thread_id,
-        "managed_turn_id": managed_turn_id,
-        "backend_thread_id": resolved_backend_thread_id,
-        "token_usage": event_state.token_usage,
-    }
+def _get_discord_thread_queue_task_map(service: Any) -> dict[str, asyncio.Task[Any]]:
+    return _discord_orchestration_state(service).thread_queue_tasks
 
 
-def _ensure_discord_thread_queue_worker(
+def _build_discord_queue_worker_hooks(
     service: Any,
     *,
-    orchestration_service: Any,
+    channel_id: str,
     managed_thread_id: str,
-    channel_id: str,
     public_execution_error: str,
-    timeout_error: str,
-    interrupted_error: str,
-) -> None:
-    task_map = getattr(service, "_discord_thread_queue_tasks", None)
-    if not isinstance(task_map, dict):
-        task_map = {}
-        service._discord_thread_queue_tasks = task_map
-        service._discord_managed_thread_queue_tasks = task_map
-    existing = task_map.get(managed_thread_id)
-    if isinstance(existing, asyncio.Task) and not existing.done():
-        return
-
-    worker_task: Optional[asyncio.Task[Any]] = None
-
-    async def _run_with_discord_typing_indicator(
-        *,
-        channel_id: str,
-        work: Any,
-    ) -> None:
+) -> ManagedThreadCoordinatorHooks:
+    async def _run_with_discord_typing_indicator(work: Any) -> None:
         run_with_typing = getattr(service, "_run_with_typing_indicator", None)
         if callable(run_with_typing):
             await run_with_typing(channel_id=channel_id, work=work)
             return
         await work()
 
-    async def _queue_worker() -> None:
-        try:
-            while True:
-                if (
-                    orchestration_service.get_running_execution(managed_thread_id)
-                    is not None
-                ):
-                    await asyncio.sleep(0.1)
-                    continue
-                started = await begin_next_queued_runtime_thread_execution(
-                    orchestration_service,
-                    managed_thread_id,
+    async def _on_execution_started(
+        started_execution: RuntimeThreadExecution,
+    ) -> None:
+        service._register_discord_turn_approval_context(
+            started_execution=started_execution,
+            channel_id=channel_id,
+        )
+
+    def _on_execution_finished(started_execution: RuntimeThreadExecution) -> None:
+        service._clear_discord_turn_approval_context(
+            started_execution=started_execution
+        )
+
+    async def _deliver_result(finalized: dict[str, Any]) -> None:
+        if finalized["status"] == "ok":
+            assistant_text = str(finalized.get("assistant_text") or "").strip()
+            message = (
+                format_discord_message(assistant_text)
+                if assistant_text
+                else "(No response text returned.)"
+            )
+            await service._send_channel_message_safe(
+                channel_id,
+                {"content": message},
+                record_id=(
+                    "discord-queued:"
+                    f"{managed_thread_id}:{finalized['managed_turn_id']}"
+                ),
+            )
+            return
+        await service._send_channel_message_safe(
+            channel_id,
+            {
+                "content": (
+                    f"Turn failed: {finalized.get('error') or public_execution_error}"
                 )
-                if started is None:
-                    break
+            },
+            record_id=(
+                "discord-queued-error:"
+                f"{managed_thread_id}:{finalized['managed_turn_id']}"
+            ),
+        )
 
-                async def _process_started_execution(
-                    started_execution: RuntimeThreadExecution,
-                ) -> None:
-                    service._register_discord_turn_approval_context(
-                        started_execution=started_execution,
-                        channel_id=channel_id,
-                    )
-                    try:
-                        finalized = await _finalize_discord_thread_execution(
-                            service,
-                            orchestration_service=orchestration_service,
-                            started=started_execution,
-                            channel_id=channel_id,
-                            public_execution_error=public_execution_error,
-                            timeout_error=timeout_error,
-                            interrupted_error=interrupted_error,
-                        )
-                    finally:
-                        service._clear_discord_turn_approval_context(
-                            started_execution=started_execution
-                        )
-                    if finalized["status"] == "ok":
-                        assistant_text = str(
-                            finalized.get("assistant_text") or ""
-                        ).strip()
-                        message = (
-                            format_discord_message(assistant_text)
-                            if assistant_text
-                            else "(No response text returned.)"
-                        )
-                        await service._send_channel_message_safe(
-                            channel_id,
-                            {"content": message},
-                            record_id=(
-                                "discord-queued:"
-                                f"{managed_thread_id}:{finalized['managed_turn_id']}"
-                            ),
-                        )
-                        return
-                    await service._send_channel_message_safe(
-                        channel_id,
-                        {
-                            "content": (
-                                f"Turn failed: {finalized.get('error') or public_execution_error}"
-                            )
-                        },
-                        record_id=(
-                            "discord-queued-error:"
-                            f"{managed_thread_id}:{finalized['managed_turn_id']}"
-                        ),
-                    )
-
-                await _run_with_discord_typing_indicator(
-                    channel_id=channel_id,
-                    work=functools.partial(_process_started_execution, started),
-                )
-        finally:
-            if (
-                worker_task is not None
-                and task_map.get(managed_thread_id) is worker_task
-            ):
-                task_map.pop(managed_thread_id, None)
-
-    worker_task = service._spawn_task(_queue_worker())
-    task_map[managed_thread_id] = worker_task
+    return ManagedThreadCoordinatorHooks(
+        on_execution_started=_on_execution_started,
+        on_execution_finished=_on_execution_finished,
+        deliver_result=_deliver_result,
+        run_with_indicator=_run_with_discord_typing_indicator,
+    )
 
 
 async def _run_discord_orchestrated_turn_for_message(
@@ -1748,6 +1301,14 @@ async def _run_discord_orchestrated_turn_for_message(
     )
     max_progress_len = max(int(service._config.max_message_length), 32)
     managed_thread_id = thread.thread_target_id
+    coordinator = _build_discord_managed_thread_coordinator(
+        service=service,
+        orchestration_service=orchestration_service,
+        channel_id=channel_id,
+        public_execution_error=public_execution_error,
+        timeout_error=timeout_error,
+        interrupted_error=interrupted_error,
+    )
     tracker = TurnProgressTracker(
         started_at=time.monotonic(),
         agent=agent,
@@ -1835,6 +1396,20 @@ async def _run_discord_orchestrated_turn_for_message(
                 await progress_heartbeat_task
             progress_heartbeat_task = None
 
+    def ensure_queue_worker() -> None:
+        coordinator.ensure_queue_worker(
+            task_map=_get_discord_thread_queue_task_map(service),
+            managed_thread_id=managed_thread_id,
+            spawn_task=service._spawn_task,
+            hooks=_build_discord_queue_worker_hooks(
+                service,
+                channel_id=channel_id,
+                managed_thread_id=managed_thread_id,
+                public_execution_error=public_execution_error,
+            ),
+            begin_next_execution=begin_next_queued_runtime_thread_execution,
+        )
+
     try:
         if reusable_progress_message_id:
             progress_message_id = reusable_progress_message_id
@@ -1878,8 +1453,7 @@ async def _run_discord_orchestrated_turn_for_message(
         progress_message_id = None
 
     try:
-        started_execution = await begin_runtime_thread_execution(
-            orchestration_service,
+        submission = await coordinator.submit_execution(
             MessageRequest(
                 target_id=thread.thread_target_id,
                 target_kind="thread",
@@ -1896,6 +1470,7 @@ async def _run_discord_orchestrated_turn_for_message(
             ),
             client_request_id=f"discord:{channel_id}:{uuid.uuid4().hex[:12]}",
             sandbox_policy=sandbox_policy,
+            begin_execution=begin_runtime_thread_execution,
         )
     except (RuntimeError, ConnectionError, OSError, ValueError, TypeError):
         await _stop_progress_heartbeat()
@@ -1909,6 +1484,7 @@ async def _run_discord_orchestrated_turn_for_message(
                 ),
             )
         raise
+    started_execution = submission.started_execution
 
     progress_execution_id = (
         str(getattr(started_execution.execution, "execution_id", "") or "").strip()
@@ -1924,10 +1500,7 @@ async def _run_discord_orchestrated_turn_for_message(
                 exc_info=True,
             )
 
-    if (
-        str(getattr(started_execution.execution, "status", "") or "").strip()
-        == "queued"
-    ):
+    if submission.queued:
         await _stop_progress_heartbeat()
         tracker.set_label("queued")
         try:
@@ -1939,55 +1512,41 @@ async def _run_discord_orchestrated_turn_for_message(
                 channel_id,
                 exc_info=True,
             )
-        _ensure_discord_thread_queue_worker(
-            service,
-            orchestration_service=orchestration_service,
-            managed_thread_id=managed_thread_id,
-            channel_id=channel_id,
-            public_execution_error=public_execution_error,
-            timeout_error=timeout_error,
-            interrupted_error=interrupted_error,
-        )
+        ensure_queue_worker()
         return DiscordMessageTurnResult(
             final_message="Queued (waiting for available worker...)"
         )
 
-    service._register_discord_turn_approval_context(
-        started_execution=started_execution,
-        channel_id=channel_id,
-    )
     try:
-        finalized = await _finalize_discord_thread_execution(
-            service,
-            orchestration_service=orchestration_service,
-            started=started_execution,
-            channel_id=channel_id,
-            public_execution_error=public_execution_error,
-            timeout_error=timeout_error,
-            interrupted_error=interrupted_error,
-            runtime_event_state=RuntimeThreadRunEventState(),
-            on_progress_event=lambda run_event: _apply_discord_progress_run_event(
-                tracker,
-                run_event,
-                runtime_state=runtime_state,
-                edit_progress=_edit_progress,
+        finalized_flow = await complete_managed_thread_execution(
+            coordinator,
+            submission,
+            ensure_queue_worker=ensure_queue_worker,
+            direct_hooks=ManagedThreadCoordinatorHooks(
+                on_execution_started=(
+                    lambda active_execution: service._register_discord_turn_approval_context(
+                        started_execution=active_execution,
+                        channel_id=channel_id,
+                    )
+                ),
+                on_execution_finished=(
+                    lambda active_execution: service._clear_discord_turn_approval_context(
+                        started_execution=active_execution
+                    )
+                ),
+                on_progress_event=lambda run_event: _apply_discord_progress_run_event(
+                    tracker,
+                    run_event,
+                    runtime_state=runtime_state,
+                    edit_progress=_edit_progress,
+                ),
             ),
+            runtime_event_state=RuntimeThreadRunEventState(),
         )
     finally:
-        service._clear_discord_turn_approval_context(
-            started_execution=started_execution
-        )
         await _stop_progress_heartbeat()
 
-    _ensure_discord_thread_queue_worker(
-        service,
-        orchestration_service=orchestration_service,
-        managed_thread_id=managed_thread_id,
-        channel_id=channel_id,
-        public_execution_error=public_execution_error,
-        timeout_error=timeout_error,
-        interrupted_error=interrupted_error,
-    )
+    finalized = cast(dict[str, Any], finalized_flow.finalized)
     if finalized["status"] != "ok":
         if finalized["status"] == "interrupted":
             reuse_request = _peek_discord_progress_reuse_request(

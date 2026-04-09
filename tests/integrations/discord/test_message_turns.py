@@ -13,6 +13,7 @@ from typing import Any, Optional
 import anyio
 import pytest
 
+import codex_autorunner.integrations.chat.managed_thread_turns as managed_thread_turns_module
 import codex_autorunner.integrations.discord.message_turns as discord_message_turns_module
 import codex_autorunner.integrations.discord.service as discord_service_module
 from codex_autorunner.agents.registry import AgentDescriptor
@@ -384,6 +385,7 @@ async def test_orchestrated_turn_interrupt_send_hands_off_progress_message(
             self._config = _config(tmp_path)
             self._store = _Store()
             self._rest = rest
+            self._spawn_task = asyncio.create_task
 
         async def _send_channel_message(
             self, channel_id: str, payload: dict[str, Any]
@@ -415,6 +417,10 @@ async def test_orchestrated_turn_interrupt_send_hands_off_progress_message(
         _ = args, kwargs
         return {"status": "interrupted", "error": "Discord PMA turn interrupted"}
 
+    async def _fake_complete(*args: Any, **kwargs: Any) -> Any:
+        _ = args, kwargs
+        return SimpleNamespace(finalized=await _fake_finalize())
+
     monkeypatch.setattr(
         discord_message_turns_module,
         "resolve_discord_thread_target",
@@ -427,13 +433,8 @@ async def test_orchestrated_turn_interrupt_send_hands_off_progress_message(
     )
     monkeypatch.setattr(
         discord_message_turns_module,
-        "_finalize_discord_thread_execution",
-        _fake_finalize,
-    )
-    monkeypatch.setattr(
-        discord_message_turns_module,
-        "_ensure_discord_thread_queue_worker",
-        lambda *args, **kwargs: None,
+        "complete_managed_thread_execution",
+        _fake_complete,
     )
 
     service = _Service()
@@ -510,6 +511,7 @@ async def test_orchestrated_turn_interrupt_send_reuses_existing_progress_message
             self._config = _config(tmp_path)
             self._store = _Store()
             self._rest = rest
+            self._spawn_task = asyncio.create_task
 
         async def _send_channel_message(
             self, channel_id: str, payload: dict[str, Any]
@@ -545,6 +547,10 @@ async def test_orchestrated_turn_interrupt_send_reuses_existing_progress_message
             "token_usage": None,
         }
 
+    async def _fake_complete(*args: Any, **kwargs: Any) -> Any:
+        _ = args, kwargs
+        return SimpleNamespace(finalized=await _fake_finalize())
+
     monkeypatch.setattr(
         discord_message_turns_module,
         "resolve_discord_thread_target",
@@ -557,13 +563,8 @@ async def test_orchestrated_turn_interrupt_send_reuses_existing_progress_message
     )
     monkeypatch.setattr(
         discord_message_turns_module,
-        "_finalize_discord_thread_execution",
-        _fake_finalize,
-    )
-    monkeypatch.setattr(
-        discord_message_turns_module,
-        "_ensure_discord_thread_queue_worker",
-        lambda *args, **kwargs: None,
+        "complete_managed_thread_execution",
+        _fake_complete,
     )
 
     service = _Service()
@@ -665,6 +666,10 @@ async def test_orchestrated_turn_interrupt_send_acknowledges_when_progress_messa
         _ = args, kwargs
         return {"status": "interrupted", "error": "Discord PMA turn interrupted"}
 
+    async def _fake_complete(*args: Any, **kwargs: Any) -> Any:
+        _ = args, kwargs
+        return SimpleNamespace(finalized=await _fake_finalize())
+
     monkeypatch.setattr(
         discord_message_turns_module,
         "resolve_discord_thread_target",
@@ -677,13 +682,8 @@ async def test_orchestrated_turn_interrupt_send_acknowledges_when_progress_messa
     )
     monkeypatch.setattr(
         discord_message_turns_module,
-        "_finalize_discord_thread_execution",
-        _fake_finalize,
-    )
-    monkeypatch.setattr(
-        discord_message_turns_module,
-        "_ensure_discord_thread_queue_worker",
-        lambda *args, **kwargs: None,
+        "complete_managed_thread_execution",
+        _fake_complete,
     )
 
     service = _Service()
@@ -787,6 +787,10 @@ async def test_orchestrated_turn_interrupt_send_falls_back_when_progress_ack_edi
         _ = args, kwargs
         return {"status": "interrupted", "error": "Discord PMA turn interrupted"}
 
+    async def _fake_complete(*args: Any, **kwargs: Any) -> Any:
+        _ = args, kwargs
+        return SimpleNamespace(finalized=await _fake_finalize())
+
     monkeypatch.setattr(
         discord_message_turns_module,
         "resolve_discord_thread_target",
@@ -799,13 +803,8 @@ async def test_orchestrated_turn_interrupt_send_falls_back_when_progress_ack_edi
     )
     monkeypatch.setattr(
         discord_message_turns_module,
-        "_finalize_discord_thread_execution",
-        _fake_finalize,
-    )
-    monkeypatch.setattr(
-        discord_message_turns_module,
-        "_ensure_discord_thread_queue_worker",
-        lambda *args, **kwargs: None,
+        "complete_managed_thread_execution",
+        _fake_complete,
     )
 
     service = _Service()
@@ -872,6 +871,10 @@ async def test_orchestrated_turn_placeholder_sent_before_runtime_begin(
         call_order.append("finalize")
         return {"status": "ok", "assistant_text": "ok", "token_usage": None}
 
+    async def _fake_complete(*args: Any, **kwargs: Any) -> Any:
+        _ = args, kwargs
+        return SimpleNamespace(finalized=await _fake_finalize())
+
     class _Store:
         async def get_binding(self, *, channel_id: str) -> dict[str, Any]:
             assert channel_id == "channel-1"
@@ -931,13 +934,8 @@ async def test_orchestrated_turn_placeholder_sent_before_runtime_begin(
     )
     monkeypatch.setattr(
         discord_message_turns_module,
-        "_finalize_discord_thread_execution",
-        _fake_finalize,
-    )
-    monkeypatch.setattr(
-        discord_message_turns_module,
-        "_ensure_discord_thread_queue_worker",
-        lambda *args, **kwargs: None,
+        "complete_managed_thread_execution",
+        _fake_complete,
     )
 
     service = _Service()
@@ -1108,6 +1106,7 @@ async def test_orchestrated_turn_queued_updates_placeholder_skips_finalize(
             self._config = _config(tmp_path)
             self._store = _Store()
             self._rest = rest
+            self._spawn_task = asyncio.create_task
 
         async def _send_channel_message(
             self, channel_id: str, payload: dict[str, Any]
@@ -1156,13 +1155,13 @@ async def test_orchestrated_turn_queued_updates_placeholder_skips_finalize(
     )
     monkeypatch.setattr(
         discord_message_turns_module,
-        "_finalize_discord_thread_execution",
+        "complete_managed_thread_execution",
         _fake_finalize,
     )
     monkeypatch.setattr(
-        discord_message_turns_module,
-        "_ensure_discord_thread_queue_worker",
-        _fake_ensure_queue,
+        discord_message_turns_module.ManagedThreadTurnCoordinator,
+        "ensure_queue_worker",
+        lambda *args, **kwargs: _fake_ensure_queue(),
     )
 
     service = _Service()
@@ -1510,7 +1509,7 @@ def _patch_streaming_harness(
     monkeypatch.setattr(
         discord_message_turns_module,
         "get_registered_agents",
-        lambda: {
+        lambda context=None: {
             agent_id: AgentDescriptor(
                 id=agent_id,
                 name=agent_id.title(),
@@ -1671,6 +1670,8 @@ async def test_message_create_personal_bound_channel_runs_without_collaboration_
         reasoning_effort: Optional[str],
         session_key: str,
         orchestrator_channel_key: str,
+        source_message_id: Optional[str] = None,
+        managed_thread_surface_key: Optional[str] = None,
     ) -> DiscordMessageTurnResult:
         captured.append(
             {
@@ -1766,6 +1767,8 @@ async def test_car_session_compact_finishes_interaction_when_finalize_fails(
         reasoning_effort: Optional[str],
         session_key: str,
         orchestrator_channel_key: str,
+        source_message_id: Optional[str] = None,
+        managed_thread_surface_key: Optional[str] = None,
     ) -> DiscordMessageTurnResult:
         _ = (
             workspace_root,
@@ -1866,6 +1869,8 @@ async def test_car_session_compact_restores_previous_thread_when_seed_save_fails
         reasoning_effort: Optional[str],
         session_key: str,
         orchestrator_channel_key: str,
+        source_message_id: Optional[str] = None,
+        managed_thread_surface_key: Optional[str] = None,
     ) -> DiscordMessageTurnResult:
         _ = (
             workspace_root,
@@ -1989,6 +1994,8 @@ async def test_car_session_compact_keeps_previous_thread_when_summary_is_blank(
         reasoning_effort: Optional[str],
         session_key: str,
         orchestrator_channel_key: str,
+        source_message_id: Optional[str] = None,
+        managed_thread_surface_key: Optional[str] = None,
     ) -> DiscordMessageTurnResult:
         _ = (
             workspace_root,
@@ -2106,6 +2113,8 @@ async def test_car_session_compact_uses_transcript_fallback_when_summary_is_blan
         reasoning_effort: Optional[str],
         session_key: str,
         orchestrator_channel_key: str,
+        source_message_id: Optional[str] = None,
+        managed_thread_surface_key: Optional[str] = None,
     ) -> DiscordMessageTurnResult:
         _ = (
             workspace_root,
@@ -2298,6 +2307,8 @@ async def test_message_create_after_compact_uses_pending_seed_and_clears_it(
         reasoning_effort: Optional[str],
         session_key: str,
         orchestrator_channel_key: str,
+        source_message_id: Optional[str] = None,
+        managed_thread_surface_key: Optional[str] = None,
     ) -> str:
         _ = (
             workspace_root,
@@ -2368,6 +2379,8 @@ async def test_message_create_flushes_pending_outbox_files_after_turn(
         reasoning_effort: Optional[str],
         session_key: str,
         orchestrator_channel_key: str,
+        source_message_id: Optional[str] = None,
+        managed_thread_surface_key: Optional[str] = None,
     ) -> str:
         _ = (
             workspace_root,
@@ -2438,6 +2451,8 @@ async def test_message_create_flushes_root_outbox_files_after_turn(
         reasoning_effort: Optional[str],
         session_key: str,
         orchestrator_channel_key: str,
+        source_message_id: Optional[str] = None,
+        managed_thread_surface_key: Optional[str] = None,
     ) -> str:
         _ = (
             workspace_root,
@@ -2513,6 +2528,8 @@ async def test_message_create_flush_outbox_skips_symlink_outside_pending(
         reasoning_effort: Optional[str],
         session_key: str,
         orchestrator_channel_key: str,
+        source_message_id: Optional[str] = None,
+        managed_thread_surface_key: Optional[str] = None,
     ) -> str:
         _ = (
             workspace_root,
@@ -2587,6 +2604,8 @@ async def test_message_create_flush_outbox_preserves_root_file_when_pending_syml
         reasoning_effort: Optional[str],
         session_key: str,
         orchestrator_channel_key: str,
+        source_message_id: Optional[str] = None,
+        managed_thread_surface_key: Optional[str] = None,
     ) -> str:
         _ = (
             workspace_root,
@@ -2658,6 +2677,8 @@ async def test_message_create_non_pma_injects_prompt_context_hints(
         reasoning_effort: Optional[str],
         session_key: str,
         orchestrator_channel_key: str,
+        source_message_id: Optional[str] = None,
+        managed_thread_surface_key: Optional[str] = None,
     ) -> str:
         _ = (
             workspace_root,
@@ -2741,6 +2762,8 @@ async def test_message_create_non_pma_prompt_hint_ignores_reply_context_prompt_t
         reasoning_effort: Optional[str],
         session_key: str,
         orchestrator_channel_key: str,
+        source_message_id: Optional[str] = None,
+        managed_thread_surface_key: Optional[str] = None,
     ) -> str:
         _ = (
             workspace_root,
@@ -2807,6 +2830,8 @@ async def test_message_create_non_pma_injects_filebox_hint_for_outbox_keyword(
         reasoning_effort: Optional[str],
         session_key: str,
         orchestrator_channel_key: str,
+        source_message_id: Optional[str] = None,
+        managed_thread_surface_key: Optional[str] = None,
     ) -> str:
         _ = (
             workspace_root,
@@ -2873,6 +2898,8 @@ async def test_message_create_non_pma_injects_filebox_hint_for_inbox_keyword(
         reasoning_effort: Optional[str],
         session_key: str,
         orchestrator_channel_key: str,
+        source_message_id: Optional[str] = None,
+        managed_thread_surface_key: Optional[str] = None,
     ) -> str:
         _ = (
             workspace_root,
@@ -2957,6 +2984,8 @@ async def test_message_create_non_pma_uses_raw_message_for_github_link_source(
         input_items: Optional[list[dict[str, Any]]] = None,
         session_key: str,
         orchestrator_channel_key: str,
+        source_message_id: Optional[str] = None,
+        managed_thread_surface_key: Optional[str] = None,
     ) -> str:
         _ = (
             workspace_root,
@@ -3045,6 +3074,8 @@ async def test_message_create_attachment_only_downloads_to_inbox_and_runs_turn(
         input_items: Optional[list[dict[str, Any]]] = None,
         session_key: str,
         orchestrator_channel_key: str,
+        source_message_id: Optional[str] = None,
+        managed_thread_surface_key: Optional[str] = None,
     ) -> str:
         _ = (
             workspace_root,
@@ -3138,6 +3169,8 @@ async def test_message_create_attachment_and_text_keeps_text_and_adds_file_conte
         input_items: Optional[list[dict[str, Any]]] = None,
         session_key: str,
         orchestrator_channel_key: str,
+        source_message_id: Optional[str] = None,
+        managed_thread_surface_key: Optional[str] = None,
     ) -> str:
         _ = (
             workspace_root,
@@ -3215,6 +3248,8 @@ async def test_message_create_injects_car_context_for_car_trigger(
         reasoning_effort: Optional[str],
         session_key: str,
         orchestrator_channel_key: str,
+        source_message_id: Optional[str] = None,
+        managed_thread_surface_key: Optional[str] = None,
     ) -> str:
         _ = (
             workspace_root,
@@ -3303,6 +3338,8 @@ async def test_message_create_audio_attachment_injects_transcript_context(
         reasoning_effort: Optional[str],
         session_key: str,
         orchestrator_channel_key: str,
+        source_message_id: Optional[str] = None,
+        managed_thread_surface_key: Optional[str] = None,
     ) -> str:
         _ = (
             workspace_root,
@@ -3409,6 +3446,8 @@ async def test_message_create_audio_attachment_does_not_transcribe_when_voice_di
         reasoning_effort: Optional[str],
         session_key: str,
         orchestrator_channel_key: str,
+        source_message_id: Optional[str] = None,
+        managed_thread_surface_key: Optional[str] = None,
     ) -> str:
         _ = (
             workspace_root,
@@ -3502,6 +3541,8 @@ async def test_message_create_audio_attachment_without_content_type_still_transc
         reasoning_effort: Optional[str],
         session_key: str,
         orchestrator_channel_key: str,
+        source_message_id: Optional[str] = None,
+        managed_thread_surface_key: Optional[str] = None,
     ) -> str:
         _ = (
             workspace_root,
@@ -3597,6 +3638,8 @@ async def test_message_create_audio_attachment_with_generic_content_type_transcr
         reasoning_effort: Optional[str],
         session_key: str,
         orchestrator_channel_key: str,
+        source_message_id: Optional[str] = None,
+        managed_thread_surface_key: Optional[str] = None,
     ) -> str:
         _ = (
             workspace_root,
@@ -3700,6 +3743,8 @@ async def test_message_create_mixed_audio_and_file_attachment_keeps_outbox_hint(
         reasoning_effort: Optional[str],
         session_key: str,
         orchestrator_channel_key: str,
+        source_message_id: Optional[str] = None,
+        managed_thread_surface_key: Optional[str] = None,
     ) -> str:
         _ = (
             workspace_root,
@@ -3793,6 +3838,8 @@ async def test_message_create_video_attachment_does_not_transcribe(
         reasoning_effort: Optional[str],
         session_key: str,
         orchestrator_channel_key: str,
+        source_message_id: Optional[str] = None,
+        managed_thread_surface_key: Optional[str] = None,
     ) -> str:
         _ = (
             workspace_root,
@@ -6591,6 +6638,8 @@ async def test_message_create_in_pma_mode_uses_pma_session_key(tmp_path: Path) -
         reasoning_effort: Optional[str],
         session_key: str,
         orchestrator_channel_key: str,
+        source_message_id: Optional[str] = None,
+        managed_thread_surface_key: Optional[str] = None,
     ) -> str:
         captured.append(
             {
@@ -6687,6 +6736,8 @@ async def test_message_create_attachment_only_in_pma_mode_uses_hub_inbox_snapsho
         reasoning_effort: Optional[str],
         session_key: str,
         orchestrator_channel_key: str,
+        source_message_id: Optional[str] = None,
+        managed_thread_surface_key: Optional[str] = None,
     ) -> str:
         _ = (
             agent,
@@ -6793,6 +6844,8 @@ async def test_message_create_image_attachment_in_pma_mode_adds_native_local_ima
         input_items: Optional[list[dict[str, Any]]] = None,
         session_key: str,
         orchestrator_channel_key: str,
+        source_message_id: Optional[str] = None,
+        managed_thread_surface_key: Optional[str] = None,
     ) -> str:
         _ = (
             workspace_root,
@@ -6860,6 +6913,8 @@ async def test_message_create_in_pma_mode_falls_back_to_hub_root_when_binding_pa
         reasoning_effort: Optional[str],
         session_key: str,
         orchestrator_channel_key: str,
+        source_message_id: Optional[str] = None,
+        managed_thread_surface_key: Optional[str] = None,
     ) -> str:
         captured.append(
             {
@@ -7293,6 +7348,8 @@ async def test_message_create_skips_inbox_reply_for_user_ticket_pause(
         reasoning_effort: Optional[str],
         session_key: Optional[str] = None,
         orchestrator_channel_key: Optional[str] = None,
+        source_message_id: Optional[str] = None,
+        managed_thread_surface_key: Optional[str] = None,
         input_items: Optional[list[dict[str, Any]]] = None,
     ) -> str:
         _ = (
@@ -7400,6 +7457,8 @@ async def test_message_create_sends_queued_notice_when_dispatch_queue_is_busy(
         reasoning_effort: Optional[str],
         session_key: str,
         orchestrator_channel_key: str,
+        source_message_id: Optional[str] = None,
+        managed_thread_surface_key: Optional[str] = None,
     ) -> str:
         nonlocal turn_count
         turn_count += 1
@@ -7594,7 +7653,7 @@ async def test_repo_message_create_routes_repeated_messages_through_orchestratio
     monkeypatch.setattr(
         discord_message_turns_module,
         "get_registered_agents",
-        lambda: {
+        lambda context=None: {
             "codex": AgentDescriptor(
                 id="codex",
                 name="Codex",
@@ -7644,6 +7703,231 @@ async def test_repo_message_create_routes_repeated_messages_through_orchestratio
         assert binding.thread_target_id == threads[0]["managed_thread_id"]
         assert harness.resume_conversation_calls == [
             (workspace.resolve(), "backend-thread-1")
+        ]
+    finally:
+        if not release_task.done():
+            release_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await release_task
+        await store.close()
+
+
+@pytest.mark.anyio
+async def test_repo_message_create_routes_repeated_messages_through_orchestration_thread_for_hermes_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seed_hub_files(tmp_path, force=True)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    store = DiscordStateStore(tmp_path / "discord_state.sqlite3")
+    await store.initialize()
+    await store.upsert_binding(
+        channel_id="channel-1",
+        guild_id="guild-1",
+        workspace_path=str(workspace),
+        repo_id="repo-1",
+    )
+    await store.update_agent_state(
+        channel_id="channel-1",
+        agent="hermes",
+        agent_profile="m4-pma",
+    )
+
+    rest = _FakeRest()
+    gateway = _FakeGateway(
+        [
+            (
+                "MESSAGE_CREATE",
+                _message_create("first hermes orchestration prompt", message_id="m-1"),
+            ),
+            (
+                "MESSAGE_CREATE",
+                _message_create("second hermes orchestration prompt", message_id="m-2"),
+            ),
+        ]
+    )
+    service = DiscordBotService(
+        _config(tmp_path),
+        logger=logging.getLogger("test"),
+        rest_client=rest,
+        gateway_client=gateway,
+        state_store=store,
+        outbox_manager=_FakeOutboxManager(),
+    )
+
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    class _FakeHarness:
+        display_name = "Hermes"
+        capabilities = frozenset(
+            {
+                "durable_threads",
+                "message_turns",
+                "interrupt",
+                "event_streaming",
+                "approvals",
+            }
+        )
+
+        def __init__(self) -> None:
+            self.turn_prompts: list[str] = []
+            self.resume_conversation_calls: list[tuple[Path, str]] = []
+
+        async def ensure_ready(self, workspace_root: Path) -> None:
+            _ = workspace_root
+
+        def supports(self, capability: str) -> bool:
+            return capability in self.capabilities
+
+        async def new_conversation(
+            self, workspace_root: Path, title: Optional[str] = None
+        ) -> SimpleNamespace:
+            _ = workspace_root, title
+            return SimpleNamespace(id="hermes-backend-thread-1")
+
+        async def resume_conversation(
+            self, workspace_root: Path, conversation_id: str
+        ) -> SimpleNamespace:
+            self.resume_conversation_calls.append((workspace_root, conversation_id))
+            return SimpleNamespace(id=conversation_id)
+
+        async def start_turn(
+            self,
+            workspace_root: Path,
+            conversation_id: str,
+            prompt: str,
+            model: Optional[str],
+            reasoning: Optional[str],
+            *,
+            approval_mode: Optional[str],
+            sandbox_policy: Optional[Any],
+            input_items: Optional[list[dict[str, Any]]] = None,
+        ) -> SimpleNamespace:
+            _ = (
+                workspace_root,
+                conversation_id,
+                model,
+                reasoning,
+                approval_mode,
+                sandbox_policy,
+                input_items,
+            )
+            turn_id = f"hermes-backend-turn-{len(self.turn_prompts) + 1}"
+            self.turn_prompts.append(prompt)
+            return SimpleNamespace(conversation_id=conversation_id, turn_id=turn_id)
+
+        async def start_review(self, *args: Any, **kwargs: Any) -> SimpleNamespace:
+            raise AssertionError("review mode should not be used in this test")
+
+        async def wait_for_turn(
+            self,
+            workspace_root: Path,
+            conversation_id: str,
+            turn_id: Optional[str],
+            *,
+            timeout: Optional[float] = None,
+        ) -> SimpleNamespace:
+            _ = workspace_root, conversation_id, timeout
+            if turn_id == "hermes-backend-turn-1":
+                first_started.set()
+                await release_first.wait()
+                return SimpleNamespace(
+                    status="ok",
+                    assistant_text="first hermes orchestration reply",
+                    errors=[],
+                )
+            return SimpleNamespace(
+                status="ok",
+                assistant_text="second hermes orchestration reply",
+                errors=[],
+            )
+
+        async def interrupt(
+            self, workspace_root: Path, conversation_id: str, turn_id: Optional[str]
+        ) -> None:
+            _ = workspace_root, conversation_id, turn_id
+
+        async def stream_events(
+            self, workspace_root: Path, conversation_id: str, turn_id: str
+        ):
+            _ = workspace_root, conversation_id, turn_id
+            if False:
+                yield ""
+
+    harness = _FakeHarness()
+    hub_config = SimpleNamespace(
+        agent_profiles=lambda agent_id: (
+            {"m4-pma": SimpleNamespace(display_name="M4 PMA")}
+            if agent_id == "hermes"
+            else {}
+        ),
+        agent_binary=lambda agent_id, **kw: agent_id,
+    )
+    monkeypatch.setattr(
+        "codex_autorunner.agents.registry._resolve_runtime_agent_config",
+        lambda ctx: hub_config,
+    )
+    monkeypatch.setattr(
+        discord_message_turns_module,
+        "get_registered_agents",
+        lambda context=None: {
+            "hermes": AgentDescriptor(
+                id="hermes",
+                name="Hermes",
+                capabilities=harness.capabilities,
+                make_harness=lambda _ctx: harness,
+            )
+        },
+    )
+
+    async def _release_later() -> None:
+        await first_started.wait()
+        await asyncio.sleep(0.05)
+        release_first.set()
+
+    release_task = asyncio.create_task(_release_later())
+    try:
+        await asyncio.wait_for(service.run_forever(), timeout=5)
+        with anyio.fail_after(2):
+            while not any(
+                "second hermes orchestration reply" in msg["payload"].get("content", "")
+                for msg in rest.channel_messages
+            ):
+                await anyio.sleep(0.05)
+
+        contents = [msg["payload"].get("content", "") for msg in rest.channel_messages]
+        assert any(
+            "Queued (waiting for available worker...)" in content
+            for content in contents
+        )
+        assert any(
+            "first hermes orchestration reply" in content for content in contents
+        )
+        assert any(
+            "second hermes orchestration reply" in content for content in contents
+        )
+
+        orchestration_service = service._discord_thread_service()
+        binding = orchestration_service.get_binding(
+            surface_kind="discord",
+            surface_key="channel-1",
+        )
+        assert binding is not None
+        resolved_thread = orchestration_service.get_thread_target(
+            binding.thread_target_id
+        )
+        assert resolved_thread is not None
+        assert resolved_thread.agent_id == "hermes"
+        assert resolved_thread.agent_profile == "m4-pma"
+
+        thread_store = discord_message_turns_module.PmaThreadStore(tmp_path)
+        turns = thread_store.list_turns(resolved_thread.thread_target_id, limit=10)
+        assert len(turns) == 2
+        assert [turn["status"] for turn in turns] == ["ok", "ok"]
+        assert harness.resume_conversation_calls == [
+            (workspace.resolve(), "hermes-backend-thread-1")
         ]
     finally:
         if not release_task.done():
@@ -7803,7 +8087,7 @@ async def test_pma_message_create_streams_progress_before_terminal_reply(
     monkeypatch.setattr(
         discord_message_turns_module,
         "get_registered_agents",
-        lambda: {
+        lambda context=None: {
             "codex": AgentDescriptor(
                 id="codex",
                 name="Codex",
@@ -7976,7 +8260,7 @@ async def test_pma_message_create_routes_repeated_messages_through_managed_threa
     monkeypatch.setattr(
         discord_message_turns_module,
         "get_registered_agents",
-        lambda: {
+        lambda context=None: {
             "codex": AgentDescriptor(
                 id="codex",
                 name="Codex",
@@ -8166,7 +8450,7 @@ async def test_pma_message_create_image_attachment_routes_through_managed_thread
     monkeypatch.setattr(
         discord_message_turns_module,
         "get_registered_agents",
-        lambda: {
+        lambda context=None: {
             "codex": AgentDescriptor(
                 id="codex",
                 name="Codex",
@@ -8230,6 +8514,8 @@ async def test_message_create_enqueues_outbox_when_channel_send_fails(
         reasoning_effort: Optional[str],
         session_key: str,
         orchestrator_channel_key: str,
+        source_message_id: Optional[str] = None,
+        managed_thread_surface_key: Optional[str] = None,
     ) -> str:
         return "queued reply"
 
@@ -8259,6 +8545,7 @@ async def test_discord_managed_thread_queue_worker_sends_placeholder_for_empty_r
     class _Service:
         def __init__(self) -> None:
             self._spawned_tasks: list[asyncio.Task[Any]] = []
+            self._config = SimpleNamespace(root=".")
 
         def _spawn_task(self, coro: Any) -> asyncio.Task[Any]:
             task = asyncio.create_task(coro)
@@ -8296,24 +8583,14 @@ async def test_discord_managed_thread_queue_worker_sends_placeholder_for_empty_r
             return queued_started
         return None
 
-    async def _fake_finalize(
-        service: object,
-        *,
-        orchestration_service: object,
+    async def _fake_run_started_execution(
+        self: object,
         started: object,
-        channel_id: str,
-        public_execution_error: str,
-        timeout_error: str,
-        interrupted_error: str,
+        *,
+        hooks: object = None,
+        runtime_event_state: object = None,
     ) -> dict[str, object]:
-        _ = (
-            service,
-            orchestration_service,
-            channel_id,
-            public_execution_error,
-            timeout_error,
-            interrupted_error,
-        )
+        _ = self, hooks, runtime_event_state
         assert started is queued_started
         return {
             "status": "ok",
@@ -8327,20 +8604,36 @@ async def test_discord_managed_thread_queue_worker_sends_placeholder_for_empty_r
         _fake_begin_next,
     )
     monkeypatch.setattr(
-        discord_message_turns_module,
-        "_finalize_discord_thread_execution",
-        _fake_finalize,
+        discord_message_turns_module.ManagedThreadTurnCoordinator,
+        "run_started_execution",
+        _fake_run_started_execution,
     )
 
     service = _Service()
-    discord_message_turns_module._ensure_discord_thread_queue_worker(
-        service,
-        orchestration_service=_OrchestrationServiceStub(),
+    orchestration_service = _OrchestrationServiceStub()
+    coordinator = (
+        discord_message_turns_module._build_discord_managed_thread_coordinator(
+            service=service,
+            orchestration_service=orchestration_service,
+            channel_id="channel-1",
+            public_execution_error="Runtime thread failed",
+            timeout_error="Runtime thread timed out",
+            interrupted_error="Runtime thread interrupted",
+        )
+    )
+    coordinator.ensure_queue_worker(
+        task_map=discord_message_turns_module._get_discord_thread_queue_task_map(
+            service
+        ),
         managed_thread_id="managed-thread-1",
-        channel_id="channel-1",
-        public_execution_error="Runtime thread failed",
-        timeout_error="Runtime thread timed out",
-        interrupted_error="Runtime thread interrupted",
+        spawn_task=service._spawn_task,
+        hooks=discord_message_turns_module._build_discord_queue_worker_hooks(
+            service,
+            channel_id="channel-1",
+            managed_thread_id="managed-thread-1",
+            public_execution_error="Runtime thread failed",
+        ),
+        begin_next_execution=discord_message_turns_module.begin_next_queued_runtime_thread_execution,
     )
 
     await asyncio.gather(*service._spawned_tasks)
@@ -8365,6 +8658,7 @@ async def test_discord_managed_thread_queue_worker_formats_local_file_links(
     class _Service:
         def __init__(self) -> None:
             self._spawned_tasks: list[asyncio.Task[Any]] = []
+            self._config = SimpleNamespace(root=".")
 
         def _spawn_task(self, coro: Any) -> asyncio.Task[Any]:
             task = asyncio.create_task(coro)
@@ -8402,24 +8696,14 @@ async def test_discord_managed_thread_queue_worker_formats_local_file_links(
             return queued_started
         return None
 
-    async def _fake_finalize(
-        service: object,
-        *,
-        orchestration_service: object,
+    async def _fake_run_started_execution(
+        self: object,
         started: object,
-        channel_id: str,
-        public_execution_error: str,
-        timeout_error: str,
-        interrupted_error: str,
+        *,
+        hooks: object = None,
+        runtime_event_state: object = None,
     ) -> dict[str, object]:
-        _ = (
-            service,
-            orchestration_service,
-            channel_id,
-            public_execution_error,
-            timeout_error,
-            interrupted_error,
-        )
+        _ = self, hooks, runtime_event_state
         assert started is queued_started
         return {
             "status": "ok",
@@ -8436,20 +8720,36 @@ async def test_discord_managed_thread_queue_worker_formats_local_file_links(
         _fake_begin_next,
     )
     monkeypatch.setattr(
-        discord_message_turns_module,
-        "_finalize_discord_thread_execution",
-        _fake_finalize,
+        discord_message_turns_module.ManagedThreadTurnCoordinator,
+        "run_started_execution",
+        _fake_run_started_execution,
     )
 
     service = _Service()
-    discord_message_turns_module._ensure_discord_thread_queue_worker(
-        service,
-        orchestration_service=_OrchestrationServiceStub(),
+    orchestration_service = _OrchestrationServiceStub()
+    coordinator = (
+        discord_message_turns_module._build_discord_managed_thread_coordinator(
+            service=service,
+            orchestration_service=orchestration_service,
+            channel_id="channel-1",
+            public_execution_error="Runtime thread failed",
+            timeout_error="Runtime thread timed out",
+            interrupted_error="Runtime thread interrupted",
+        )
+    )
+    coordinator.ensure_queue_worker(
+        task_map=discord_message_turns_module._get_discord_thread_queue_task_map(
+            service
+        ),
         managed_thread_id="managed-thread-1",
-        channel_id="channel-1",
-        public_execution_error="Runtime thread failed",
-        timeout_error="Runtime thread timed out",
-        interrupted_error="Runtime thread interrupted",
+        spawn_task=service._spawn_task,
+        hooks=discord_message_turns_module._build_discord_queue_worker_hooks(
+            service,
+            channel_id="channel-1",
+            managed_thread_id="managed-thread-1",
+            public_execution_error="Runtime thread failed",
+        ),
+        begin_next_execution=discord_message_turns_module.begin_next_queued_runtime_thread_execution,
     )
 
     await asyncio.gather(*service._spawned_tasks)
@@ -8469,7 +8769,7 @@ async def test_discord_managed_thread_queue_worker_formats_local_file_links(
 
 
 @pytest.mark.anyio
-async def test_finalize_discord_thread_execution_prefers_started_execution_error(
+async def test_discord_managed_thread_coordinator_prefers_started_execution_error(
     tmp_path: Path,
 ) -> None:
     seed_hub_files(tmp_path, force=True)
@@ -8526,20 +8826,76 @@ async def test_finalize_discord_thread_execution_prefers_started_execution_error
         harness=object(),
     )
 
-    result = await discord_message_turns_module._finalize_discord_thread_execution(
-        service,
-        orchestration_service=_OrchestrationServiceStub(),
-        started=started,
-        channel_id="channel-1",
-        public_execution_error="Discord PMA turn failed",
-        timeout_error="Discord PMA turn timed out",
-        interrupted_error="Discord PMA turn interrupted",
+    orchestration_service = _OrchestrationServiceStub()
+    coordinator = (
+        discord_message_turns_module._build_discord_managed_thread_coordinator(
+            service=service,
+            orchestration_service=orchestration_service,
+            channel_id="channel-1",
+            public_execution_error="Discord PMA turn failed",
+            timeout_error="Discord PMA turn timed out",
+            interrupted_error="Discord PMA turn interrupted",
+        )
+    )
+
+    result = await coordinator.run_started_execution(
+        started,
+        runtime_event_state=discord_message_turns_module.RuntimeThreadRunEventState(),
     )
 
     assert result["status"] == "error"
     assert "ACP subprocess emitted invalid JSON" in str(result["error"])
     assert captured_result["status"] == "error"
     assert "ACP subprocess emitted invalid JSON" in str(captured_result["error"])
+
+
+@pytest.mark.anyio
+async def test_discord_managed_thread_coordinator_uses_started_execution_preview(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, Any] = {}
+
+    async def _fake_finalize(**kwargs: Any) -> dict[str, Any]:
+        seen["turn_preview"] = kwargs["turn_preview"]
+        return {"status": "ok", "managed_turn_id": "turn-1"}
+
+    monkeypatch.setattr(
+        managed_thread_turns_module,
+        "finalize_managed_thread_execution",
+        _fake_finalize,
+    )
+
+    coordinator = (
+        discord_message_turns_module._build_discord_managed_thread_coordinator(
+            service=SimpleNamespace(
+                _config=SimpleNamespace(root=tmp_path),
+                _logger=logging.getLogger("test"),
+            ),
+            orchestration_service=SimpleNamespace(),
+            channel_id="channel-1",
+            public_execution_error="Discord PMA turn failed",
+            timeout_error="Discord PMA turn timed out",
+            interrupted_error="Discord PMA turn interrupted",
+        )
+    )
+
+    started = SimpleNamespace(
+        thread=SimpleNamespace(thread_target_id="managed-thread-1"),
+        execution=SimpleNamespace(execution_id="turn-1"),
+        request=SimpleNamespace(
+            message_text="A later queued Discord prompt that should win."
+        ),
+        workspace_root=tmp_path,
+        harness=object(),
+    )
+
+    await coordinator.run_started_execution(started)
+
+    assert seen["turn_preview"] == discord_message_turns_module.truncate_for_discord(
+        "A later queued Discord prompt that should win.",
+        max_len=120,
+    )
 
 
 @pytest.mark.anyio
@@ -8576,6 +8932,8 @@ async def test_car_review_single_chunk_deletes_preview_and_sends_chunk_when_flus
         reasoning_effort: Optional[str],
         session_key: str,
         orchestrator_channel_key: str,
+        source_message_id: Optional[str] = None,
+        managed_thread_surface_key: Optional[str] = None,
     ) -> DiscordMessageTurnResult:
         _ = (
             workspace_root,
@@ -8702,6 +9060,8 @@ async def test_car_session_compact_reuses_preview_without_part_numbering(
         reasoning_effort: Optional[str],
         session_key: str,
         orchestrator_channel_key: str,
+        source_message_id: Optional[str] = None,
+        managed_thread_surface_key: Optional[str] = None,
     ) -> DiscordMessageTurnResult:
         _ = (
             workspace_root,
@@ -8893,6 +9253,8 @@ async def test_car_session_compact_places_continue_button_on_last_chunk_without_
         reasoning_effort: Optional[str],
         session_key: str,
         orchestrator_channel_key: str,
+        source_message_id: Optional[str] = None,
+        managed_thread_surface_key: Optional[str] = None,
     ) -> DiscordMessageTurnResult:
         _ = (
             workspace_root,
