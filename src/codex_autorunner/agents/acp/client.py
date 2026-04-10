@@ -74,6 +74,24 @@ _ACP_STDOUT_NOISE_PREFIXES = (
 )
 _ACP_STDOUT_BRACKETED_STATUS_RE = re.compile(r"^\[[^\]\s]{1,32}\]\s+(?![\[{])\S")
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_SESSION_TURN_ID_FALLBACK_METHODS = frozenset(
+    {
+        "session/update",
+        "session/request_permission",
+        "session.status",
+        "session/status",
+        "session.idle",
+        "prompt/output",
+        "prompt/delta",
+        "prompt/progress",
+        "prompt/message",
+        "turn/progress",
+        "turn/message",
+        "turn/completed",
+        "turn/failed",
+        "turn/cancelled",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -272,6 +290,7 @@ class ACPClient:
         self._closing = False
         self._turn_counter = 0
         self._session_active_turns: dict[str, str] = {}
+        self._pending_prompt_start_sessions: dict[str, str] = {}
         self._background_tasks: set[asyncio.Task[Any]] = set()
 
     @property
@@ -349,6 +368,10 @@ class ACPClient:
         future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
         self._pending_methods[request_id] = method
+        if method == "prompt/start":
+            session_id = _normalize_optional_text((params or {}).get("sessionId"))
+            if session_id:
+                self._pending_prompt_start_sessions[request_id] = session_id
         try:
             await self._write_message(
                 {
@@ -370,6 +393,7 @@ class ACPClient:
         finally:
             self._pending.pop(request_id, None)
             self._pending_methods.pop(request_id, None)
+            self._pending_prompt_start_sessions.pop(request_id, None)
 
     async def notify(
         self, method: str, params: Optional[dict[str, Any]] = None
@@ -655,6 +679,13 @@ class ACPClient:
                 error = self._response_error(method, error_payload)
                 future.set_exception(error)
                 return
+            if self._pending_methods.get(request_id) == "prompt/start":
+                self._prime_prompt_state_from_start_result(
+                    message.get("result"),
+                    fallback_session_id=self._pending_prompt_start_sessions.get(
+                        request_id
+                    ),
+                )
             future.set_result(message.get("result"))
             return
 
@@ -761,6 +792,22 @@ class ACPClient:
                 state.replay_task = task
                 task.add_done_callback(self._log_background_task_result)
         return state
+
+    def _prime_prompt_state_from_start_result(
+        self,
+        payload: Any,
+        *,
+        fallback_session_id: Optional[str] = None,
+    ) -> None:
+        try:
+            prompt = ACPPromptDescriptor.from_result(
+                payload,
+                session_id=fallback_session_id,
+            )
+        except ValueError:
+            return
+        self._session_active_turns[prompt.session_id] = prompt.turn_id
+        self._ensure_prompt_state(prompt.session_id, prompt.turn_id)
 
     async def _replay_orphan_prompt_events(
         self,
@@ -950,7 +997,7 @@ class ACPClient:
 
     def _message_with_mapped_turn_id(self, message: dict[str, Any]) -> dict[str, Any]:
         method = _normalize_optional_text(message.get("method"))
-        if method not in {"session/update", "session/request_permission"}:
+        if method not in _SESSION_TURN_ID_FALLBACK_METHODS:
             return message
         params = _coerce_mapping(message.get("params"))
         if _normalize_optional_text(params.get("turnId") or params.get("turn_id")):
