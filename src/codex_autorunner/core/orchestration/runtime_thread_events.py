@@ -405,17 +405,13 @@ def normalize_runtime_thread_message(
         update = _extract_session_update(params)
         update_kind = _extract_session_update_kind(update)
         if update_kind == "agent_message_chunk":
-            session_update_content = _extract_session_update_content(update)
             return _assistant_stream_events(
-                session_update_content,
+                _extract_session_update_message_params(update),
                 state,
                 timestamp=event_timestamp,
             )
         if update_kind == "agent_thought_chunk":
-            session_update_content = _extract_session_update_content(update)
-            progress_message = _extract_acp_progress_message(
-                session_update_content
-            ) or _extract_output_delta(session_update_content)
+            progress_message = _extract_session_update_text(update)
             if not progress_message:
                 return []
             return [
@@ -926,8 +922,63 @@ def _extract_session_update_kind(update: dict[str, Any]) -> str:
     return ""
 
 
-def _extract_session_update_content(update: dict[str, Any]) -> dict[str, Any]:
-    return _coerce_dict(update.get("content"))
+def _extract_session_update_message_params(update: dict[str, Any]) -> dict[str, Any]:
+    content = update.get("content")
+    if isinstance(content, dict):
+        params = dict(content)
+        message = update.get("message")
+        if isinstance(message, str) and message.strip() and "message" not in params:
+            params["message"] = message
+        return params
+    return {
+        "content": content,
+        "message": update.get("message"),
+    }
+
+
+def _extract_session_update_text(update: dict[str, Any]) -> str:
+    content = update.get("content")
+    if isinstance(content, str) and content.strip():
+        return content
+    if isinstance(content, dict):
+        for key in ("text", "message", "status"):
+            value = content.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+        progress_message = _extract_acp_progress_message(content)
+        if progress_message:
+            return progress_message
+        output_delta = _extract_output_delta(content)
+        if output_delta:
+            return output_delta
+    if isinstance(content, list):
+        text_parts: list[str] = []
+        for entry in content:
+            if isinstance(entry, str) and entry:
+                text_parts.append(entry)
+                continue
+            if not isinstance(entry, dict):
+                continue
+            entry_type = entry.get("type")
+            if isinstance(entry_type, str) and entry_type not in (
+                "text",
+                "output_text",
+                "message",
+            ):
+                continue
+            entry_text = ""
+            message_text = entry.get("message")
+            if isinstance(message_text, str) and message_text:
+                entry_text = message_text
+            if not entry_text:
+                entry_text = _extract_output_delta(entry)
+            if not entry_text:
+                entry_text = _extract_acp_progress_message(entry)
+            if entry_text:
+                text_parts.append(entry_text)
+        if text_parts:
+            return "".join(text_parts)
+    return _extract_acp_progress_message(update)
 
 
 def _extract_acp_progress_message(params: dict[str, Any]) -> str:

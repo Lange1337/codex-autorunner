@@ -417,6 +417,123 @@ async def test_normalize_runtime_thread_raw_event_handles_official_session_updat
     assert state.token_usage == {"total_tokens": 42}
 
 
+async def test_normalize_runtime_thread_raw_event_preserves_session_update_object_shapes() -> (
+    None
+):
+    state = RuntimeThreadRunEventState()
+
+    progress = await normalize_runtime_thread_raw_event(
+        {
+            "message": {
+                "method": "session/update",
+                "params": {
+                    "sessionId": "session-1",
+                    "turnId": "turn-1",
+                    "update": {
+                        "sessionUpdate": "agent_thought_chunk",
+                        "content": {"status": "thinking"},
+                    },
+                },
+            }
+        },
+        state,
+    )
+    output = await normalize_runtime_thread_raw_event(
+        {
+            "message": {
+                "method": "session/update",
+                "params": {
+                    "sessionId": "session-1",
+                    "turnId": "turn-1",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"delta": "hello"},
+                    },
+                },
+            }
+        },
+        state,
+    )
+    output_with_output_key = await normalize_runtime_thread_raw_event(
+        {
+            "message": {
+                "method": "session/update",
+                "params": {
+                    "sessionId": "session-1",
+                    "turnId": "turn-1",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"output": " world"},
+                    },
+                },
+            }
+        },
+        state,
+    )
+
+    assert len(progress) == 1
+    assert isinstance(progress[0], RunNotice)
+    assert progress[0].message == "thinking"
+    assert len(output) == 1
+    assert isinstance(output[0], OutputDelta)
+    assert output[0].content == "hello"
+    assert len(output_with_output_key) == 1
+    assert isinstance(output_with_output_key[0], OutputDelta)
+    assert output_with_output_key[0].content == " world"
+
+
+async def test_normalize_runtime_thread_raw_event_handles_official_session_update_content_parts() -> (
+    None
+):
+    state = RuntimeThreadRunEventState()
+
+    thinking = await normalize_runtime_thread_raw_event(
+        {
+            "message": {
+                "method": "session/update",
+                "params": {
+                    "sessionId": "session-1",
+                    "turnId": "turn-1",
+                    "update": {
+                        "sessionUpdate": "agent_thought_chunk",
+                        "content": [
+                            {"type": "text", "text": "thinking"},
+                            {"type": "message", "message": " more"},
+                        ],
+                    },
+                },
+            }
+        },
+        state,
+    )
+    output = await normalize_runtime_thread_raw_event(
+        {
+            "message": {
+                "method": "session/update",
+                "params": {
+                    "sessionId": "session-1",
+                    "turnId": "turn-1",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": [
+                            {"type": "text", "text": "hello"},
+                            {"type": "output_text", "text": " world"},
+                        ],
+                    },
+                },
+            }
+        },
+        state,
+    )
+
+    assert len(thinking) == 1
+    assert isinstance(thinking[0], RunNotice)
+    assert thinking[0].message == "thinking more"
+    assert len(output) == 1
+    assert isinstance(output[0], OutputDelta)
+    assert output[0].content == "hello world"
+
+
 async def test_recover_post_completion_outcome_uses_streamed_output_after_completion() -> (
     None
 ):
