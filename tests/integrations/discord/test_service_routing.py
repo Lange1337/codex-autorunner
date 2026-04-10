@@ -3053,6 +3053,90 @@ async def test_component_interaction_queue_interrupt_send_promotes_and_interrupt
 
 
 @pytest.mark.anyio
+async def test_queued_notice_keeps_interrupt_when_message_turn_active(
+    tmp_path: Path,
+) -> None:
+    store = DiscordStateStore(tmp_path / "discord_state.sqlite3")
+    await store.initialize()
+    rest = _FakeRest()
+    service = DiscordBotService(
+        _config(tmp_path, allow_user_ids=frozenset({"user-1"})),
+        logger=logging.getLogger("test"),
+        rest_client=rest,
+        gateway_client=_FakeGateway([]),
+        state_store=store,
+        outbox_manager=_FakeOutboxManager(),
+    )
+
+    try:
+        conversation_id = service._dispatcher_conversation_id(
+            channel_id="channel-1",
+            guild_id="guild-1",
+        )
+
+        service._command_runner.describe_ingressed_busy = (  # type: ignore[method-assign]
+            lambda _conversation_id: "/car newt"
+        )
+
+        async def _queue_status(_conversation_id: str) -> dict[str, Any]:
+            assert _conversation_id == conversation_id
+            return {"active": True}
+
+        service._dispatcher.queue_status = _queue_status  # type: ignore[method-assign]
+
+        content, allow_interrupt = await service._queued_notice_config_for_conversation(
+            conversation_id
+        )
+
+        assert content == "Queued behind /car newt; will run when it finishes."
+        assert allow_interrupt is True
+    finally:
+        await store.close()
+
+
+@pytest.mark.anyio
+async def test_queued_notice_hides_interrupt_when_only_ingressed_busy(
+    tmp_path: Path,
+) -> None:
+    store = DiscordStateStore(tmp_path / "discord_state.sqlite3")
+    await store.initialize()
+    rest = _FakeRest()
+    service = DiscordBotService(
+        _config(tmp_path, allow_user_ids=frozenset({"user-1"})),
+        logger=logging.getLogger("test"),
+        rest_client=rest,
+        gateway_client=_FakeGateway([]),
+        state_store=store,
+        outbox_manager=_FakeOutboxManager(),
+    )
+
+    try:
+        conversation_id = service._dispatcher_conversation_id(
+            channel_id="channel-1",
+            guild_id="guild-1",
+        )
+
+        service._command_runner.describe_ingressed_busy = (  # type: ignore[method-assign]
+            lambda _conversation_id: "/car newt"
+        )
+
+        async def _queue_status(_conversation_id: str) -> dict[str, Any]:
+            assert _conversation_id == conversation_id
+            return {"active": False}
+
+        service._dispatcher.queue_status = _queue_status  # type: ignore[method-assign]
+
+        content, allow_interrupt = await service._queued_notice_config_for_conversation(
+            conversation_id
+        )
+
+        assert content == "Queued behind /car newt; will run when it finishes."
+        assert allow_interrupt is False
+    finally:
+        await store.close()
+
+
+@pytest.mark.anyio
 async def test_service_malformed_direct_payload_returns_parse_error(
     tmp_path: Path,
 ) -> None:
@@ -6388,11 +6472,20 @@ async def test_message_turn_waits_for_ingressed_slash_command_to_finish(
 
         assert observed == ["newt:start"]
         assert message_turn_started.is_set() is False
-        assert any(
-            "Queued behind /car newt; will run when it finishes."
-            in item["payload"].get("content", "")
-            for item in rest.channel_messages
+        queued_notice = next(
+            (
+                item["payload"]
+                for item in rest.channel_messages
+                if "Queued behind /car newt; will run when it finishes."
+                in item["payload"].get("content", "")
+            ),
+            None,
         )
+        assert queued_notice is not None
+        assert [
+            button["custom_id"]
+            for button in queued_notice["components"][0]["components"]
+        ] == ["queue_cancel:m-1"]
 
         release_newt.set()
 
@@ -6517,11 +6610,20 @@ async def test_run_forever_drains_message_queued_behind_ingressed_slash_command(
     try:
         await asyncio.wait_for(service.run_forever(), timeout=5)
         assert observed == ["newt:start", "newt:end", "message:please continue"]
-        assert any(
-            "Queued behind /car newt; will run when it finishes."
-            in item["payload"].get("content", "")
-            for item in rest.channel_messages
+        queued_notice = next(
+            (
+                item["payload"]
+                for item in rest.channel_messages
+                if "Queued behind /car newt; will run when it finishes."
+                in item["payload"].get("content", "")
+            ),
+            None,
         )
+        assert queued_notice is not None
+        assert [
+            button["custom_id"]
+            for button in queued_notice["components"][0]["components"]
+        ] == ["queue_cancel:m-1"]
         assert any(
             "message reply" in item["payload"].get("content", "")
             for item in rest.channel_messages

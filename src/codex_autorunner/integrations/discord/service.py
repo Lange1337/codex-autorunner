@@ -1020,16 +1020,23 @@ class DiscordBotService:
             record_id=f"queue-notice-delete:{channel_id}:{source_message_id}",
         )
 
-    def _queued_notice_content_for_conversation(
+    async def _queued_notice_config_for_conversation(
         self, conversation_id: str
-    ) -> Optional[str]:
+    ) -> tuple[Optional[str], bool]:
         describe_busy = getattr(self._command_runner, "describe_ingressed_busy", None)
         if not callable(describe_busy):
-            return None
+            return None, True
         command_label = describe_busy(conversation_id)
         if not isinstance(command_label, str) or not command_label.strip():
-            return None
-        return f"Queued behind {command_label}; will run when it finishes."
+            return None, True
+        queue_status = await self._dispatcher.queue_status(conversation_id)
+        has_active_message_turn = bool(
+            queue_status.get("active") if isinstance(queue_status, dict) else False
+        )
+        return (
+            f"Queued behind {command_label}; will run when it finishes.",
+            has_active_message_turn,
+        )
 
     async def _maybe_send_queued_notice(
         self, event: ChatEvent, dispatch_result: DispatchResult
@@ -1041,13 +1048,16 @@ class DiscordBotService:
         if not await self._can_start_message_turn_in_channel(event):
             return
         channel_id = dispatch_result.context.chat_id
-        notice_content = self._queued_notice_content_for_conversation(
-            dispatch_result.context.conversation_id
+        notice_content, allow_interrupt = (
+            await self._queued_notice_config_for_conversation(
+                dispatch_result.context.conversation_id
+            )
         )
         source_message_id = event.message.message_id
         queued_notice_payload = build_discord_queue_notice_message(
             source_message_id=source_message_id,
             content=notice_content,
+            allow_interrupt=allow_interrupt,
         )
         try:
             response = await self._send_channel_message(
@@ -1065,6 +1075,7 @@ class DiscordBotService:
                 build_discord_queue_notice_message(
                     source_message_id=None,
                     content=notice_content,
+                    allow_interrupt=allow_interrupt,
                 ).to_payload(),
                 record_id=f"queue-notice:{channel_id}:{dispatch_result.context.update_id}",
             )
