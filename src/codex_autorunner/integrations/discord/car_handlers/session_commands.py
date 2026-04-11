@@ -1317,6 +1317,8 @@ async def handle_car_interrupt(
     *,
     channel_id: str,
     active_turn_text: str = "Stopping current turn...",
+    cancel_queued: bool = True,
+    allow_promoted_no_active_success: bool = False,
     thread_target_id: Optional[str] = None,
     execution_id: Optional[str] = None,
     progress_reuse_source_message_id: Optional[str] = None,
@@ -1482,9 +1484,15 @@ async def handle_car_interrupt(
         )
         return
     try:
-        stop_outcome = await orchestration_service.stop_thread(
-            current_thread.thread_target_id
-        )
+        if cancel_queued:
+            stop_outcome = await orchestration_service.stop_thread(
+                current_thread.thread_target_id
+            )
+        else:
+            stop_outcome = await orchestration_service.stop_thread(
+                current_thread.thread_target_id,
+                cancel_queued=False,
+            )
         interrupted_active = bool(getattr(stop_outcome, "interrupted_active", False))
         recovered_lost_backend = bool(
             getattr(stop_outcome, "recovered_lost_backend", False)
@@ -1521,6 +1529,15 @@ async def handle_car_interrupt(
             and not recovered_lost_backend
             and not cancelled_queued
         ):
+            if allow_promoted_no_active_success:
+                text = format_discord_message("Queued request moved to the front.")
+                await service.send_or_respond_ephemeral(
+                    interaction_id=interaction_id,
+                    interaction_token=interaction_token,
+                    deferred=deferred,
+                    text=text,
+                )
+                return
             get_execution = getattr(orchestration_service, "get_execution", None)
             get_latest_execution = getattr(
                 orchestration_service, "get_latest_execution", None
