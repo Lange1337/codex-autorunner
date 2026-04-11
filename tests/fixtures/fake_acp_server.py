@@ -31,12 +31,14 @@ class FakeACPServer:
         self._running = True
         self._next_session = 1
         self._next_turn = 1
+        self._next_official_turn = 1
         self._next_permission = 1
         self._sessions: dict[str, dict[str, Any]] = {}
         self._cancel_events: dict[str, threading.Event] = {}
         self._session_cancel_events: dict[str, threading.Event] = {}
         self._permission_waiters: dict[str, threading.Event] = {}
         self._permission_results: dict[str, dict[str, Any]] = {}
+        self._last_official_prompt_params: dict[str, Any] | None = None
 
     def send(self, payload: dict[str, Any]) -> None:
         _write_line(self._lock, payload)
@@ -246,6 +248,7 @@ class FakeACPServer:
         *,
         request_id: Any,
         session_id: str,
+        turn_id: str,
         prompt: str,
     ) -> None:
         cancel_event = self._session_cancel_events[session_id]
@@ -348,7 +351,10 @@ class FakeACPServer:
             while not cancel_event.wait(0.02):
                 pass
             cancel_event.clear()
-            self._send_result(request_id, {"stopReason": "cancelled"})
+            self._send_result(
+                request_id,
+                {"stopReason": "cancelled", "userMessageId": turn_id},
+            )
             return
         time.sleep(0.05)
         self.send(
@@ -365,8 +371,144 @@ class FakeACPServer:
         )
         if self._scenario == "official_prompt_hang":
             return
+        if self._scenario == "official_cancelled_before_return":
+            self.send(
+                {
+                    "method": "prompt/cancelled",
+                    "params": {
+                        "sessionId": session_id,
+                        "turnId": turn_id,
+                        "status": "cancelled",
+                        "message": "request cancelled",
+                    },
+                }
+            )
+            return
+        if self._scenario == "official_failed_before_return":
+            self.send(
+                {
+                    "method": "prompt/failed",
+                    "params": {
+                        "sessionId": session_id,
+                        "turnId": turn_id,
+                        "status": "failed",
+                        "message": "permission denied",
+                    },
+                }
+            )
+            return
+        if self._scenario == "official_terminal_before_return":
+            self.send(
+                {
+                    "method": "prompt/completed",
+                    "params": {
+                        "sessionId": session_id,
+                        "turnId": turn_id,
+                        "status": "completed",
+                        "finalOutput": "fixture reply",
+                    },
+                }
+            )
+            time.sleep(0.05)
+            cancel_event.clear()
+            self._send_result(
+                request_id,
+                {"stopReason": "end_turn", "userMessageId": turn_id},
+            )
+            return
+        if self._scenario == "official_terminal_without_turn_id":
+            self.send(
+                {
+                    "method": "prompt/completed",
+                    "params": {
+                        "sessionId": session_id,
+                        "status": "completed",
+                        "finalOutput": "fixture reply",
+                    },
+                }
+            )
+            time.sleep(0.05)
+            cancel_event.clear()
+            self._send_result(
+                request_id,
+                {"stopReason": "end_turn", "userMessageId": turn_id},
+            )
+            return
+        if self._scenario == "official_session_status_idle_before_return":
+            self.send(
+                {
+                    "method": "session.status",
+                    "params": {
+                        "sessionId": session_id,
+                        "status": {"type": "idle"},
+                    },
+                }
+            )
+            time.sleep(0.05)
+            cancel_event.clear()
+            self._send_result(
+                request_id,
+                {"stopReason": "end_turn", "userMessageId": turn_id},
+            )
+            return
+        if self._scenario == "official_request_return_after_terminal":
+            self.send(
+                {
+                    "method": "prompt/completed",
+                    "params": {
+                        "sessionId": session_id,
+                        "turnId": turn_id,
+                        "status": "completed",
+                        "finalOutput": "fixture reply",
+                    },
+                }
+            )
+            time.sleep(0.2)
+            cancel_event.clear()
+            self._send_result(
+                request_id,
+                {"stopReason": "end_turn", "userMessageId": turn_id},
+            )
+            return
+        if self._scenario == "official_server_assigned_turn_id_before_return":
+            server_turn_id = f"server-turn-{self._next_official_turn}"
+            self._next_official_turn += 1
+            self.send(
+                {
+                    "method": "prompt/completed",
+                    "params": {
+                        "sessionId": session_id,
+                        "turnId": server_turn_id,
+                        "status": "completed",
+                        "finalOutput": "fixture reply",
+                    },
+                }
+            )
+            time.sleep(0.05)
+            cancel_event.clear()
+            self._send_result(
+                request_id,
+                {"stopReason": "end_turn", "userMessageId": server_turn_id},
+            )
+            return
+        if self._scenario == "official_terminal_without_request_return":
+            self.send(
+                {
+                    "method": "prompt/completed",
+                    "params": {
+                        "sessionId": session_id,
+                        "turnId": turn_id,
+                        "status": "completed",
+                        "finalOutput": "fixture reply",
+                    },
+                }
+            )
+            return
         cancel_event.clear()
-        self._send_result(request_id, {"stopReason": "end_turn"})
+        self._send_result(
+            request_id,
+            {"stopReason": "end_turn", "userMessageId": turn_id},
+        )
 
     def _handle_request(self, message: dict[str, Any]) -> None:
         request_id = message.get("id")
@@ -415,6 +557,7 @@ class FakeACPServer:
                 {
                     "initialized": self._initialized,
                     "initializedNotification": self._initialized_notification,
+                    "lastOfficialPromptParams": self._last_official_prompt_params,
                 },
             )
             return
@@ -466,6 +609,11 @@ class FakeACPServer:
             if session_id not in self._sessions:
                 self._send_error(request_id, -32004, "session not found")
                 return
+            self._last_official_prompt_params = dict(params)
+            turn_id = str(params.get("messageId") or "").strip()
+            if not turn_id:
+                turn_id = f"turn-{self._next_official_turn}"
+                self._next_official_turn += 1
             prompt_items = params.get("prompt")
             prompt_text = ""
             if isinstance(prompt_items, list):
@@ -479,6 +627,7 @@ class FakeACPServer:
                 kwargs={
                     "request_id": request_id,
                     "session_id": session_id,
+                    "turn_id": turn_id,
                     "prompt": prompt_text,
                 },
                 daemon=True,

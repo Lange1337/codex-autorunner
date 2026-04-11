@@ -8,10 +8,14 @@ from os.path import basename
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Mapping, Optional, Sequence
 
+from ...core.acp_lifecycle import (
+    should_close_turn_buffer as _should_close_acp_turn_buffer,
+)
 from ...core.config import HubConfig, RepoConfig
 from ...core.logging_utils import log_event
 from ...core.orchestration.turn_event_buffer import TurnEventBuffer
 from ...core.text_utils import _normalize_optional_text
+from ...core.time_utils import now_iso
 from ...core.utils import resolve_executable
 from ...workspace import canonical_workspace_root
 from ..acp import (
@@ -28,9 +32,6 @@ _logger = logging.getLogger(__name__)
 HERMES_RUNTIME_ID = "hermes"
 HERMES_ACP_COMMAND = "acp"
 HERMES_APPROVAL_TIMEOUT_SECONDS = 300.0
-_HERMES_IDLE_TERMINAL_METHODS = frozenset(
-    {"session.idle", "session.status", "session/status"}
-)
 
 
 class HermesSupervisorError(RuntimeError):
@@ -57,6 +58,7 @@ class _HermesTurnState:
     event_buffer: TurnEventBuffer = field(default_factory=TurnEventBuffer)
     last_event_method: Optional[str] = None
     last_session_update_kind: Optional[str] = None
+    last_progress_at: Optional[str] = None
 
 
 class HermesSupervisor:
@@ -204,7 +206,7 @@ class HermesSupervisor:
                 await self._append_raw_event(
                     state,
                     dict(raw_notification),
-                    terminal=isinstance(event, ACPTurnTerminalEvent),
+                    terminal=_should_close_turn_buffer(event),
                 )
         log_event(
             self._logger,
@@ -247,7 +249,9 @@ class HermesSupervisor:
                 timeout_seconds=timeout,
                 elapsed_ms=_elapsed_ms(started_at),
                 last_event_method=state.last_event_method,
+                last_runtime_method=state.last_event_method,
                 last_session_update_kind=state.last_session_update_kind,
+                last_progress_at=state.last_progress_at,
             )
             raise
         await self._sync_prompt_snapshot_into_event_buffer(workspace_root, state)
@@ -265,7 +269,9 @@ class HermesSupervisor:
             elapsed_ms=_elapsed_ms(started_at),
             raw_event_count=len(raw_events),
             last_event_method=state.last_event_method,
+            last_runtime_method=state.last_event_method,
             last_session_update_kind=state.last_session_update_kind,
+            last_progress_at=state.last_progress_at,
             error_message=result.error_message,
         )
         return TerminalTurnResult(
@@ -410,6 +416,7 @@ class HermesSupervisor:
         terminal: bool = False,
     ) -> None:
         state.last_event_method = str(payload.get("method") or "").strip() or None
+        state.last_progress_at = now_iso()
         params = payload.get("params")
         if (
             isinstance(params, dict)
@@ -440,13 +447,10 @@ class HermesSupervisor:
             payload = dict(raw_notification)
             if payload in existing_events:
                 continue
-            terminal = isinstance(event, ACPTurnTerminalEvent) and event.method not in (
-                _HERMES_IDLE_TERMINAL_METHODS
-            )
             await self._append_raw_event(
                 state,
                 payload,
-                terminal=terminal,
+                terminal=_should_close_turn_buffer(event),
             )
             existing_events.append(payload)
 
@@ -482,13 +486,10 @@ class HermesSupervisor:
         state = await self._wait_for_turn_state(workspace_root, turn_id)
         if state is None:
             return
-        terminal = isinstance(event, ACPTurnTerminalEvent) and event.method not in (
-            _HERMES_IDLE_TERMINAL_METHODS
-        )
         await self._append_raw_event(
             state,
             dict(raw_notification),
-            terminal=terminal,
+            terminal=_should_close_turn_buffer(event),
         )
 
     async def _handle_permission_request(
@@ -672,6 +673,12 @@ def _build_surface_approval_request(
         "method": method,
         "params": params,
     }
+
+
+def _should_close_turn_buffer(event: Any) -> bool:
+    if not isinstance(event, ACPTurnTerminalEvent):
+        return False
+    return _should_close_acp_turn_buffer(event.method, event.payload)
 
 
 def _workspace_key(workspace_root: Path) -> str:

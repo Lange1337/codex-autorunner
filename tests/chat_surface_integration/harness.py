@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sys
 from dataclasses import dataclass, field
@@ -17,10 +18,16 @@ from codex_autorunner.integrations.discord.config import (
     DiscordBotShellConfig,
     DiscordCommandRegistration,
 )
+from codex_autorunner.integrations.discord.message_turns import (
+    build_discord_thread_orchestration_service,
+)
 from codex_autorunner.integrations.discord.service import DiscordBotService
 from codex_autorunner.integrations.discord.state import DiscordStateStore
 from codex_autorunner.integrations.telegram.adapter import TelegramMessage
 from codex_autorunner.integrations.telegram.config import TelegramBotConfig
+from codex_autorunner.integrations.telegram.handlers.commands.execution import (
+    _build_telegram_thread_orchestration_service,
+)
 from codex_autorunner.integrations.telegram.service import TelegramBotService
 
 DEFAULT_DISCORD_CHANNEL_ID = "channel-1"
@@ -31,6 +38,22 @@ DEFAULT_TELEGRAM_USER_ID = 456
 FIXTURES_DIR = Path(__file__).resolve().parents[1] / "fixtures"
 FAKE_ACP_FIXTURE_PATH = FIXTURES_DIR / "fake_acp_server.py"
 APP_SERVER_FIXTURE_PATH = FIXTURES_DIR / "app_server_fixture.py"
+
+
+class StructuredLogCapture(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(level=logging.INFO)
+        self.records: list[dict[str, Any]] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        message = record.getMessage()
+        try:
+            payload = json.loads(message)
+        except (TypeError, ValueError):
+            payload = {"message": message}
+        if not isinstance(payload, dict):
+            payload = {"message": str(payload)}
+        self.records.append(payload)
 
 
 def hermes_fixture_command(scenario: str) -> list[str]:
@@ -102,12 +125,27 @@ def patch_hermes_runtime(monkeypatch: Any, runtime: HermesFixtureRuntime) -> Non
 
 
 class FakeDiscordRest:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        fail_delete_message_ids: Optional[set[str]] = None,
+    ) -> None:
         self.channel_messages: list[dict[str, Any]] = []
         self.edited_channel_messages: list[dict[str, Any]] = []
         self.deleted_channel_messages: list[dict[str, Any]] = []
         self.typing_calls: list[str] = []
         self.message_ops: list[dict[str, Any]] = []
+        self.fail_delete_message_ids = set(fail_delete_message_ids or set())
+        self.log_records: list[dict[str, Any]] = []
+        self.surface_key: Optional[str] = None
+        self.thread_target_id: Optional[str] = None
+        self.execution_id: Optional[str] = None
+        self.execution_status: Optional[str] = None
+        self.execution_error: Optional[str] = None
+        self.preview_message_id: Optional[str] = None
+        self.preview_deleted: bool = False
+        self.terminal_progress_label: Optional[str] = None
+        self.background_tasks_drained: bool = False
 
     async def create_channel_message(
         self, *, channel_id: str, payload: dict[str, Any]
@@ -147,6 +185,8 @@ class FakeDiscordRest:
         return {"id": message_id}
 
     async def delete_channel_message(self, *, channel_id: str, message_id: str) -> None:
+        if message_id in self.fail_delete_message_ids:
+            raise RuntimeError(f"delete failed for {message_id}")
         self.deleted_channel_messages.append(
             {"channel_id": channel_id, "message_id": message_id}
         )
@@ -252,8 +292,15 @@ class DiscordSurfaceHarness:
     timeout_seconds: float = 2.0
     store: Optional[DiscordStateStore] = field(default=None, init=False)
     rest: Optional[FakeDiscordRest] = field(default=None, init=False)
+    service: Optional[DiscordBotService] = field(default=None, init=False)
+    _log_capture: Optional[StructuredLogCapture] = field(default=None, init=False)
 
-    async def setup(self, *, agent: str = "hermes") -> None:
+    async def setup(
+        self,
+        *,
+        agent: str = "hermes",
+        approval_mode: Optional[str] = None,
+    ) -> None:
         seed_hub_files(self.root, force=True)
         workspace = self.root / "workspace"
         workspace.mkdir(parents=True, exist_ok=True)
@@ -273,14 +320,35 @@ class DiscordSurfaceHarness:
             channel_id=DEFAULT_DISCORD_CHANNEL_ID,
             agent=agent,
         )
+        if isinstance(approval_mode, str) and approval_mode.strip():
+            await self.store.update_approval_mode(
+                channel_id=DEFAULT_DISCORD_CHANNEL_ID,
+                mode=approval_mode,
+            )
 
-    async def run_message(self, text: str) -> FakeDiscordRest:
+    def orchestration_service(self) -> Any:
+        if self.service is None:
+            raise RuntimeError("DiscordSurfaceHarness has no active service")
+        return build_discord_thread_orchestration_service(self.service)
+
+    async def _run_message_inner(
+        self,
+        text: str,
+        *,
+        rest_client: Optional[FakeDiscordRest] = None,
+    ) -> FakeDiscordRest:
         if self.store is None:
             raise RuntimeError("DiscordSurfaceHarness.setup() must run first")
-        self.rest = FakeDiscordRest()
-        service = DiscordBotService(
+        self.rest = rest_client or FakeDiscordRest()
+        logger = logging.getLogger(self.logger_name)
+        logger.handlers = []
+        logger.setLevel(logging.INFO)
+        logger.propagate = True
+        self._log_capture = StructuredLogCapture()
+        logger.addHandler(self._log_capture)
+        self.service = DiscordBotService(
             make_discord_config(self.root),
-            logger=logging.getLogger(self.logger_name),
+            logger=logger,
             rest_client=self.rest,
             gateway_client=FakeDiscordGateway(
                 [("MESSAGE_CREATE", build_discord_message_create(text))]
@@ -288,21 +356,150 @@ class DiscordSurfaceHarness:
             state_store=self.store,
             outbox_manager=FakeDiscordOutboxManager(),
         )
-        await asyncio.wait_for(service.run_forever(), timeout=self.timeout_seconds)
+        await asyncio.wait_for(
+            self.service.run_forever(),
+            timeout=self.timeout_seconds,
+        )
+        self._apply_discord_runtime_metadata(self.rest)
         return self.rest
+
+    def start_message(
+        self,
+        text: str,
+        *,
+        rest_client: Optional[FakeDiscordRest] = None,
+    ) -> asyncio.Task[FakeDiscordRest]:
+        return asyncio.create_task(
+            self._run_message_inner(text, rest_client=rest_client)
+        )
+
+    async def run_message(
+        self,
+        text: str,
+        *,
+        rest_client: Optional[FakeDiscordRest] = None,
+    ) -> FakeDiscordRest:
+        return await self._run_message_inner(text, rest_client=rest_client)
+
+    def _apply_discord_runtime_metadata(self, rest: FakeDiscordRest) -> None:
+        service = self.service
+        if service is None:
+            raise RuntimeError("DiscordSurfaceHarness has no active service")
+        self.rest.log_records = list(self._log_capture.records)
+        self.rest.background_tasks_drained = not bool(service._background_tasks)
+        self.rest.surface_key = DEFAULT_DISCORD_CHANNEL_ID
+        orchestration_service = build_discord_thread_orchestration_service(service)
+        binding = orchestration_service.get_binding(
+            surface_kind="discord",
+            surface_key=DEFAULT_DISCORD_CHANNEL_ID,
+        )
+        thread_target_id = (
+            str(getattr(binding, "thread_target_id", "") or "").strip() or None
+        )
+        rest.thread_target_id = thread_target_id
+        if thread_target_id:
+            execution = orchestration_service.get_latest_execution(thread_target_id)
+            if execution is not None:
+                rest.execution_id = (
+                    str(getattr(execution, "execution_id", "") or "").strip() or None
+                )
+                rest.execution_status = (
+                    str(getattr(execution, "status", "") or "").strip() or None
+                )
+                rest.execution_error = (
+                    str(getattr(execution, "error", "") or "").strip() or None
+                )
+        if rest.message_ops:
+            preview_message_id = str(rest.message_ops[0].get("message_id") or "")
+            rest.preview_message_id = preview_message_id or None
+            rest.preview_deleted = any(
+                op["op"] == "delete"
+                and str(op.get("message_id") or "") == preview_message_id
+                for op in rest.message_ops
+            )
+            terminal_edit = next(
+                (
+                    op
+                    for op in reversed(rest.message_ops)
+                    if op["op"] == "edit"
+                    and str(op.get("message_id") or "") == preview_message_id
+                ),
+                None,
+            )
+            if terminal_edit is not None:
+                content = str(terminal_edit["payload"].get("content", "")).lower()
+                if "done" in content:
+                    rest.terminal_progress_label = "done"
+                elif "failed" in content:
+                    rest.terminal_progress_label = "failed"
+                elif "working" in content:
+                    rest.terminal_progress_label = "working"
+
+    async def wait_for_running_execution(
+        self,
+        *,
+        timeout_seconds: float = 2.0,
+    ) -> tuple[str, str]:
+        deadline = asyncio.get_running_loop().time() + max(timeout_seconds, 0.0)
+        while True:
+            service = self.service
+            if service is not None:
+                orchestration_service = build_discord_thread_orchestration_service(
+                    service
+                )
+                binding = orchestration_service.get_binding(
+                    surface_kind="discord",
+                    surface_key=DEFAULT_DISCORD_CHANNEL_ID,
+                )
+                thread_target_id = (
+                    str(getattr(binding, "thread_target_id", "") or "").strip() or None
+                )
+                if thread_target_id:
+                    execution = orchestration_service.get_latest_execution(
+                        thread_target_id
+                    )
+                    if execution is not None:
+                        status = str(getattr(execution, "status", "") or "").strip()
+                        execution_id = str(
+                            getattr(execution, "execution_id", "") or ""
+                        ).strip()
+                        if status == "running" and execution_id:
+                            return thread_target_id, execution_id
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError(
+                    "DiscordSurfaceHarness did not expose a running turn"
+                )
+            await asyncio.sleep(0.01)
 
     async def close(self) -> None:
         if self.store is not None:
             await self.store.close()
             self.store = None
+        self.service = None
+        if self._log_capture is not None:
+            logging.getLogger(self.logger_name).removeHandler(self._log_capture)
+            self._log_capture = None
 
 
 class FakeTelegramBot:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        fail_delete_message_ids: Optional[set[int]] = None,
+    ) -> None:
         self.messages: list[dict[str, Any]] = []
         self.edited_messages: list[dict[str, Any]] = []
         self.documents: list[dict[str, Any]] = []
         self.deleted_messages: list[dict[str, Any]] = []
+        self.log_records: list[dict[str, Any]] = []
+        self.surface_key: Optional[str] = None
+        self.thread_target_id: Optional[str] = None
+        self.execution_id: Optional[str] = None
+        self.execution_status: Optional[str] = None
+        self.execution_error: Optional[str] = None
+        self.placeholder_message_id: Optional[int] = None
+        self.placeholder_deleted: bool = False
+        self.fail_delete_message_ids = set(fail_delete_message_ids or set())
 
     async def send_message(
         self,
@@ -412,6 +609,8 @@ class FakeTelegramBot:
         *,
         message_thread_id: Optional[int] = None,
     ) -> bool:
+        if message_id in self.fail_delete_message_ids:
+            raise RuntimeError(f"delete failed for {message_id}")
         self.deleted_messages.append(
             {
                 "chat_id": chat_id,
@@ -475,18 +674,26 @@ class TelegramSurfaceHarness:
     timeout_seconds: float = 2.0
     service: Optional[TelegramBotService] = field(default=None, init=False)
     bot: Optional[FakeTelegramBot] = field(default=None, init=False)
+    _log_capture: Optional[StructuredLogCapture] = field(default=None, init=False)
 
     async def setup(
         self,
         *,
         agent: str = "hermes",
         thread_id: int = DEFAULT_TELEGRAM_THREAD_ID,
+        approval_mode: Optional[str] = None,
     ) -> None:
         self.service = TelegramBotService(
             make_telegram_config(self.root),
             hub_root=self.root,
         )
-        self.service._logger = logging.getLogger(self.logger_name)
+        logger = logging.getLogger(self.logger_name)
+        logger.handlers = []
+        logger.setLevel(logging.INFO)
+        logger.propagate = True
+        self._log_capture = StructuredLogCapture()
+        logger.addHandler(self._log_capture)
+        self.service._logger = logger
         self.bot = FakeTelegramBot()
         self.service._bot = self.bot
         await self.service._router.ensure_topic(DEFAULT_TELEGRAM_CHAT_ID, thread_id)
@@ -495,14 +702,31 @@ class TelegramSurfaceHarness:
             thread_id,
             lambda record: _configure_telegram_pma_topic(record, agent=agent),
         )
+        if isinstance(approval_mode, str) and approval_mode.strip():
+            await self.service._router.set_approval_mode(
+                DEFAULT_TELEGRAM_CHAT_ID,
+                thread_id,
+                approval_mode,
+            )
 
-    async def run_message(
+    def orchestration_service(self) -> Any:
+        if self.service is None:
+            raise RuntimeError("TelegramSurfaceHarness has no active service")
+        return _build_telegram_thread_orchestration_service(self.service)
+
+    async def _run_message_inner(
         self,
         text: str,
         *,
         thread_id: int = DEFAULT_TELEGRAM_THREAD_ID,
+        bot_client: Optional[FakeTelegramBot] = None,
     ) -> FakeTelegramBot:
-        if self.service is None or self.bot is None:
+        if self.service is None:
+            raise RuntimeError("TelegramSurfaceHarness.setup() must run first")
+        if bot_client is not None:
+            self.bot = bot_client
+            self.service._bot = bot_client
+        if self.bot is None:
             raise RuntimeError("TelegramSurfaceHarness.setup() must run first")
         await asyncio.wait_for(
             self.service._handle_message_inner(
@@ -514,13 +738,121 @@ class TelegramSurfaceHarness:
             drain_telegram_spawned_tasks(self.service),
             timeout=self.timeout_seconds,
         )
+        self._apply_telegram_runtime_metadata(self.bot, thread_id=thread_id)
         return self.bot
+
+    def start_message(
+        self,
+        text: str,
+        *,
+        thread_id: int = DEFAULT_TELEGRAM_THREAD_ID,
+        bot_client: Optional[FakeTelegramBot] = None,
+    ) -> asyncio.Task[FakeTelegramBot]:
+        return asyncio.create_task(
+            self._run_message_inner(
+                text,
+                thread_id=thread_id,
+                bot_client=bot_client,
+            )
+        )
+
+    async def run_message(
+        self,
+        text: str,
+        *,
+        thread_id: int = DEFAULT_TELEGRAM_THREAD_ID,
+        bot_client: Optional[FakeTelegramBot] = None,
+    ) -> FakeTelegramBot:
+        return await self._run_message_inner(
+            text,
+            thread_id=thread_id,
+            bot_client=bot_client,
+        )
+
+    def _apply_telegram_runtime_metadata(
+        self,
+        bot: FakeTelegramBot,
+        *,
+        thread_id: int,
+    ) -> None:
+        service = self.service
+        if service is None:
+            raise RuntimeError("TelegramSurfaceHarness has no active service")
+        bot.log_records = list(self._log_capture.records)
+        bot.surface_key = f"{DEFAULT_TELEGRAM_CHAT_ID}:{thread_id}"
+        orchestration_service = _build_telegram_thread_orchestration_service(service)
+        binding = orchestration_service.get_binding(
+            surface_kind="telegram",
+            surface_key=bot.surface_key,
+        )
+        thread_target_id = (
+            str(getattr(binding, "thread_target_id", "") or "").strip() or None
+        )
+        bot.thread_target_id = thread_target_id
+        if thread_target_id:
+            execution = orchestration_service.get_latest_execution(thread_target_id)
+            if execution is not None:
+                bot.execution_id = (
+                    str(getattr(execution, "execution_id", "") or "").strip() or None
+                )
+                bot.execution_status = (
+                    str(getattr(execution, "status", "") or "").strip() or None
+                )
+                bot.execution_error = (
+                    str(getattr(execution, "error", "") or "").strip() or None
+                )
+        if bot.messages:
+            bot.placeholder_message_id = 1
+            bot.placeholder_deleted = any(
+                item.get("message_id") == 1 for item in bot.deleted_messages
+            )
+
+    async def wait_for_running_execution(
+        self,
+        *,
+        thread_id: int = DEFAULT_TELEGRAM_THREAD_ID,
+        timeout_seconds: float = 2.0,
+    ) -> tuple[str, str]:
+        deadline = asyncio.get_running_loop().time() + max(timeout_seconds, 0.0)
+        surface_key = f"{DEFAULT_TELEGRAM_CHAT_ID}:{thread_id}"
+        while True:
+            service = self.service
+            if service is not None:
+                orchestration_service = _build_telegram_thread_orchestration_service(
+                    service
+                )
+                binding = orchestration_service.get_binding(
+                    surface_kind="telegram",
+                    surface_key=surface_key,
+                )
+                thread_target_id = (
+                    str(getattr(binding, "thread_target_id", "") or "").strip() or None
+                )
+                if thread_target_id:
+                    execution = orchestration_service.get_latest_execution(
+                        thread_target_id
+                    )
+                    if execution is not None:
+                        status = str(getattr(execution, "status", "") or "").strip()
+                        execution_id = str(
+                            getattr(execution, "execution_id", "") or ""
+                        ).strip()
+                        if status == "running" and execution_id:
+                            return thread_target_id, execution_id
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError(
+                    "TelegramSurfaceHarness did not expose a running turn"
+                )
+            await asyncio.sleep(0.01)
 
     async def close(self) -> None:
         if self.service is not None:
             await self.service._app_server_supervisor.close_all()
             self.service = None
         self.bot = None
+        if self._log_capture is not None:
+            logging.getLogger(self.logger_name).removeHandler(self._log_capture)
+            self._log_capture = None
 
 
 def _configure_telegram_pma_topic(record: Any, *, agent: str) -> None:

@@ -65,15 +65,13 @@ from ..chat.managed_thread_progress import (
     apply_run_event_to_progress_tracker,
 )
 from ..chat.managed_thread_turns import (
+    ManagedThreadCoordinatorHooks,
     ManagedThreadErrorMessages,
-    ManagedThreadExecutionHooks,
     ManagedThreadFinalizationResult,
     ManagedThreadQueuedExecutionStarter,
-    ManagedThreadQueueWorkerHooks,
     ManagedThreadSurfaceInfo,
     ManagedThreadTargetRequest,
     ManagedThreadTurnCoordinator,
-    coerce_managed_thread_finalization_result,
     complete_managed_thread_execution,
 )
 from ..chat.managed_thread_turns import (
@@ -81,6 +79,11 @@ from ..chat.managed_thread_turns import (
 )
 from ..chat.managed_thread_turns import (
     resolve_managed_thread_target as _shared_resolve_managed_thread_target,
+)
+from ..chat.managed_turn_runner import (
+    ManagedSurfaceQueueConfig,
+    ManagedSurfaceRunnerConfig,
+    run_managed_surface_turn,
 )
 from ..chat.progress_primitives import TurnProgressTracker, render_progress_text
 from ..chat.turn_metrics import (
@@ -105,6 +108,8 @@ DISCORD_MANAGED_THREAD_SUBMISSION_TIMEOUT_SECONDS = 45.0
 DISCORD_PMA_PROGRESS_MAX_ACTIONS = 12
 DISCORD_PMA_PROGRESS_MIN_EDIT_INTERVAL_SECONDS = 1.0
 DISCORD_PMA_PROGRESS_HEARTBEAT_INTERVAL_SECONDS = 2.0
+_DISCORD_PROGRESS_LIVE_STATES = frozenset({"pending", "active"})
+_DISCORD_PROGRESS_RECONCILABLE_STATES = frozenset({"pending", "active", "retiring"})
 
 
 class DiscordTurnStartupFailure(RuntimeError):
@@ -115,11 +120,13 @@ class DiscordTurnStartupFailure(RuntimeError):
 class DiscordMessageTurnResult:
     final_message: str
     preview_message_id: Optional[str] = None
+    execution_id: Optional[str] = None
     intermediate_message: Optional[str] = None
     token_usage: Optional[dict[str, Any]] = None
     elapsed_seconds: Optional[float] = None
     send_final_message: bool = True
     deferred_delivery: bool = False
+    preserve_progress_lease: bool = False
 
 
 @dataclass(frozen=True)
@@ -140,6 +147,80 @@ class _DiscordOrchestrationState:
     progress_reuse_requests: dict[str, _DiscordProgressReuseRequest]
     reusable_progress_messages: dict[str, _DiscordReusableProgressMessage]
     thread_queue_tasks: dict[str, asyncio.Task[Any]]
+
+
+@dataclass
+class _DiscordTurnExecutionSupervision:
+    service: Any
+    channel_id: str
+    task_context: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self._set_text_field("channel_id", self.channel_id)
+
+    def _set_text_field(self, key: str, value: Optional[str]) -> None:
+        normalized = str(value or "").strip()
+        if normalized:
+            self.task_context[key] = normalized
+            return
+        self.task_context.pop(key, None)
+
+    def _set_bool_field(self, key: str, value: bool) -> None:
+        if value:
+            self.task_context[key] = True
+            return
+        self.task_context.pop(key, None)
+
+    def bind_task(self, task: asyncio.Task[Any]) -> asyncio.Task[Any]:
+        cast(Any, task)._discord_progress_task_context = self.task_context
+        return task
+
+    def set_managed_thread_id(self, managed_thread_id: Optional[str]) -> None:
+        self._set_text_field("managed_thread_id", managed_thread_id)
+
+    def set_execution_id(self, execution_id: Optional[str]) -> None:
+        self._set_text_field("execution_id", execution_id)
+
+    def set_lease_id(self, lease_id: Optional[str]) -> None:
+        self._set_text_field("lease_id", lease_id)
+
+    def set_message_id(self, message_id: Optional[str]) -> None:
+        self._set_text_field("message_id", message_id)
+
+    def set_failure_note(self, failure_note: Optional[str]) -> None:
+        self._set_text_field("failure_note", failure_note)
+
+    def set_shutdown_note(self, shutdown_note: Optional[str]) -> None:
+        self._set_text_field("shutdown_note", shutdown_note)
+
+    def set_orphaned(self, orphaned: bool) -> None:
+        self._set_bool_field("orphaned", orphaned)
+
+    def clear_progress_tracking(self, *, keep_execution_id: bool = True) -> None:
+        self.task_context.pop("lease_id", None)
+        self.task_context.pop("message_id", None)
+        if not keep_execution_id:
+            self.task_context.pop("execution_id", None)
+
+    async def reconcile_failure(
+        self,
+        *,
+        failure_note: Optional[str] = None,
+        allow_channel_fallback: bool = True,
+    ) -> int:
+        context = dict(self.task_context)
+        if isinstance(failure_note, str) and failure_note.strip():
+            context["failure_note"] = failure_note.strip()
+        reconciler = getattr(self.service, "_reconcile_background_task_failure", None)
+        if not callable(reconciler):
+            return 0
+        return int(
+            await reconciler(
+                context,
+                allow_channel_fallback=allow_channel_fallback,
+            )
+            or 0
+        )
 
 
 @dataclass(frozen=True)
@@ -316,6 +397,427 @@ def _stash_discord_reusable_progress_message(
             message_id=normalized_message_id,
         )
     )
+
+
+def _execution_field(record: Any, field: str) -> Optional[str]:
+    if isinstance(record, dict):
+        value = record.get(field)
+    else:
+        value = getattr(record, field, None)
+    normalized = str(value or "").strip()
+    return normalized or None
+
+
+def _progress_task_context(
+    *,
+    managed_thread_id: Optional[str] = None,
+    execution_id: Optional[str] = None,
+    lease_id: Optional[str] = None,
+    channel_id: Optional[str] = None,
+    message_id: Optional[str] = None,
+    failure_note: Optional[str] = None,
+    shutdown_note: Optional[str] = None,
+    orphaned: bool = False,
+) -> dict[str, Any]:
+    context: dict[str, Any] = {}
+    if isinstance(managed_thread_id, str) and managed_thread_id.strip():
+        context["managed_thread_id"] = managed_thread_id.strip()
+    if isinstance(execution_id, str) and execution_id.strip():
+        context["execution_id"] = execution_id.strip()
+    if isinstance(lease_id, str) and lease_id.strip():
+        context["lease_id"] = lease_id.strip()
+    if isinstance(channel_id, str) and channel_id.strip():
+        context["channel_id"] = channel_id.strip()
+    if isinstance(message_id, str) and message_id.strip():
+        context["message_id"] = message_id.strip()
+    if isinstance(failure_note, str) and failure_note.strip():
+        context["failure_note"] = failure_note.strip()
+    if isinstance(shutdown_note, str) and shutdown_note.strip():
+        context["shutdown_note"] = shutdown_note.strip()
+    if orphaned:
+        context["orphaned"] = True
+    return context
+
+
+def bind_discord_progress_task_context(
+    task: asyncio.Task[Any],
+    *,
+    managed_thread_id: Optional[str] = None,
+    execution_id: Optional[str] = None,
+    lease_id: Optional[str] = None,
+    channel_id: Optional[str] = None,
+    message_id: Optional[str] = None,
+    failure_note: Optional[str] = None,
+    shutdown_note: Optional[str] = None,
+    orphaned: bool = False,
+) -> asyncio.Task[Any]:
+    context = _progress_task_context(
+        managed_thread_id=managed_thread_id,
+        execution_id=execution_id,
+        lease_id=lease_id,
+        channel_id=channel_id,
+        message_id=message_id,
+        failure_note=failure_note,
+        shutdown_note=shutdown_note,
+        orphaned=orphaned,
+    )
+    if context:
+        cast(Any, task)._discord_progress_task_context = context
+    return task
+
+
+async def _upsert_discord_progress_lease(
+    service: Any,
+    *,
+    lease_id: str,
+    managed_thread_id: str,
+    execution_id: Optional[str],
+    channel_id: str,
+    message_id: str,
+    source_message_id: Optional[str],
+    state: str,
+    progress_label: Optional[str],
+) -> Any:
+    upsert = getattr(service._store, "upsert_turn_progress_lease", None)
+    if not callable(upsert):
+        return None
+    return await upsert(
+        lease_id=lease_id,
+        managed_thread_id=managed_thread_id,
+        execution_id=execution_id,
+        channel_id=channel_id,
+        message_id=message_id,
+        source_message_id=source_message_id,
+        state=state,
+        progress_label=progress_label,
+    )
+
+
+async def _get_discord_progress_lease(service: Any, *, lease_id: str) -> Any:
+    getter = getattr(service._store, "get_turn_progress_lease", None)
+    if not callable(getter):
+        return None
+    return await getter(lease_id=lease_id)
+
+
+async def _list_discord_progress_leases(
+    service: Any,
+    *,
+    managed_thread_id: Optional[str] = None,
+    execution_id: Optional[str] = None,
+    channel_id: Optional[str] = None,
+    message_id: Optional[str] = None,
+) -> list[Any]:
+    lister = getattr(service._store, "list_turn_progress_leases", None)
+    if not callable(lister):
+        return []
+    return list(
+        await lister(
+            managed_thread_id=managed_thread_id,
+            execution_id=execution_id,
+            channel_id=channel_id,
+            message_id=message_id,
+        )
+        or []
+    )
+
+
+async def _update_discord_progress_lease(
+    service: Any,
+    *,
+    lease_id: str,
+    execution_id: Optional[str] | object = ...,
+    state: Optional[str] | object = ...,
+    progress_label: Optional[str] | object = ...,
+) -> Any:
+    updater = getattr(service._store, "update_turn_progress_lease", None)
+    if not callable(updater):
+        return None
+    kwargs: dict[str, Any] = {"lease_id": lease_id}
+    if execution_id is not ...:
+        kwargs["execution_id"] = execution_id
+    if state is not ...:
+        kwargs["state"] = state
+    if progress_label is not ...:
+        kwargs["progress_label"] = progress_label
+    return await updater(**kwargs)
+
+
+async def _delete_discord_progress_lease(service: Any, *, lease_id: str) -> None:
+    deleter = getattr(service._store, "delete_turn_progress_lease", None)
+    if not callable(deleter):
+        return
+    await deleter(lease_id=lease_id)
+
+
+async def _retire_discord_progress_message(
+    service: Any,
+    *,
+    channel_id: str,
+    message_id: str,
+    note: str,
+) -> None:
+    normalized_channel_id = str(channel_id or "").strip()
+    normalized_message_id = str(message_id or "").strip()
+    normalized_note = str(note or "").strip()
+    if not normalized_channel_id or not normalized_message_id or not normalized_note:
+        return
+    content = normalized_note
+    fetch_message = getattr(service._rest, "get_channel_message", None)
+    if callable(fetch_message):
+        try:
+            fetched = await fetch_message(
+                channel_id=normalized_channel_id,
+                message_id=normalized_message_id,
+            )
+        except (
+            DiscordTransientError,
+            RuntimeError,
+            ConnectionError,
+            OSError,
+            ValueError,
+            TypeError,
+            AttributeError,
+        ):
+            fetched = {}
+        existing_content = str(fetched.get("content") or "").strip()
+        if existing_content:
+            lowered_existing = existing_content.lower()
+            lowered_note = normalized_note.lower()
+            if lowered_note not in lowered_existing:
+                content = f"{existing_content.rstrip()}\n\n{normalized_note}"
+            else:
+                content = existing_content
+    try:
+        await service._rest.edit_channel_message(
+            channel_id=normalized_channel_id,
+            message_id=normalized_message_id,
+            payload={
+                "content": truncate_for_discord(
+                    content,
+                    max_len=max(int(service._config.max_message_length), 32),
+                ),
+                "components": [],
+            },
+        )
+    except (DiscordTransientError, RuntimeError, ConnectionError, OSError):
+        return
+
+
+def _orphaned_progress_note(*, startup: bool) -> str:
+    if startup:
+        return (
+            "Status: this progress message lost its Discord worker during restart. "
+            "Please retry if you still need a response."
+        )
+    return (
+        "Status: this progress message lost its Discord worker and is no longer live. "
+        "Please retry if needed."
+    )
+
+
+def _shutdown_progress_note() -> str:
+    return (
+        "Status: this progress message was interrupted during Discord shutdown and "
+        "is no longer live. Please retry if needed."
+    )
+
+
+def _resolve_discord_progress_reconcile_note(
+    *,
+    referenced_execution_id: Optional[str],
+    latest_execution: Any,
+    running_execution: Any,
+    resolved_execution: Any,
+    thread_missing: bool,
+    failure_note: Optional[str],
+    orphaned: bool,
+    startup: bool,
+) -> Optional[str]:
+    if isinstance(failure_note, str) and failure_note.strip():
+        return failure_note.strip()
+    if thread_missing:
+        return (
+            "Status: this progress message no longer maps to an active managed thread."
+        )
+    if orphaned:
+        return _orphaned_progress_note(startup=startup)
+    if referenced_execution_id is None:
+        return "Status: this turn failed before execution started."
+    latest_execution_id = _execution_field(latest_execution, "execution_id")
+    if latest_execution_id and latest_execution_id != referenced_execution_id:
+        return "Status: this progress message belongs to an older turn. A newer turn is active."
+    resolved_status = (_execution_field(resolved_execution, "status") or "").lower()
+    if resolved_status == "ok":
+        return "Status: this turn already completed."
+    if resolved_status == "interrupted":
+        return "Status: this turn was already stopped."
+    if resolved_status == "error":
+        return "Status: this turn already failed."
+    if resolved_status == "queued":
+        return "Status: this turn is queued and no longer has an active cancel surface."
+    if resolved_status == "running":
+        running_execution_id = _execution_field(running_execution, "execution_id")
+        if running_execution_id == referenced_execution_id:
+            return None
+    return "Status: this turn is no longer active."
+
+
+async def reconcile_discord_turn_progress_leases(
+    service: Any,
+    *,
+    lease_id: Optional[str] = None,
+    managed_thread_id: Optional[str] = None,
+    execution_id: Optional[str] = None,
+    channel_id: Optional[str] = None,
+    message_id: Optional[str] = None,
+    failure_note: Optional[str] = None,
+    orphaned: bool = False,
+    startup: bool = False,
+) -> int:
+    leases: list[Any]
+    if isinstance(lease_id, str) and lease_id.strip():
+        lease = await _get_discord_progress_lease(service, lease_id=lease_id)
+        leases = [lease] if lease is not None else []
+    else:
+        leases = await _list_discord_progress_leases(
+            service,
+            managed_thread_id=managed_thread_id,
+            execution_id=execution_id,
+            channel_id=channel_id,
+            message_id=message_id,
+        )
+    if not leases:
+        return 0
+
+    reconciled = 0
+    orchestration_service = build_discord_thread_orchestration_service(service)
+    get_thread_target = getattr(orchestration_service, "get_thread_target", None)
+    get_latest_execution = getattr(orchestration_service, "get_latest_execution", None)
+    get_running_execution = getattr(
+        orchestration_service,
+        "get_running_execution",
+        None,
+    )
+    get_execution = getattr(orchestration_service, "get_execution", None)
+
+    for lease in leases:
+        current_lease_id = _execution_field(lease, "lease_id")
+        current_thread_id = _execution_field(lease, "managed_thread_id")
+        current_execution_id = _execution_field(lease, "execution_id")
+        current_channel_id = _execution_field(lease, "channel_id")
+        current_message_id = _execution_field(lease, "message_id")
+        if (
+            not current_lease_id
+            or not current_thread_id
+            or not current_channel_id
+            or not current_message_id
+        ):
+            continue
+        current_state = (_execution_field(lease, "state") or "").lower()
+        if current_state and current_state not in _DISCORD_PROGRESS_RECONCILABLE_STATES:
+            continue
+
+        thread_missing = False
+        resolved_thread = None
+        if callable(get_thread_target):
+            try:
+                resolved_thread = get_thread_target(current_thread_id)
+            except (RuntimeError, ValueError, TypeError, AttributeError, KeyError):
+                resolved_thread = None
+        if resolved_thread is None:
+            thread_missing = True
+
+        latest_execution_record = None
+        if callable(get_latest_execution) and not thread_missing:
+            with contextlib.suppress(
+                RuntimeError, ValueError, TypeError, AttributeError, KeyError
+            ):
+                latest_execution_record = get_latest_execution(current_thread_id)
+        running_execution_record = None
+        if callable(get_running_execution) and not thread_missing:
+            with contextlib.suppress(
+                RuntimeError, ValueError, TypeError, AttributeError, KeyError
+            ):
+                running_execution_record = get_running_execution(current_thread_id)
+        resolved_execution_record = None
+        if (
+            callable(get_execution)
+            and not thread_missing
+            and current_execution_id is not None
+        ):
+            with contextlib.suppress(
+                RuntimeError, ValueError, TypeError, AttributeError, KeyError
+            ):
+                resolved_execution_record = get_execution(
+                    current_thread_id,
+                    current_execution_id,
+                )
+        if resolved_execution_record is None:
+            resolved_execution_record = latest_execution_record
+
+        note = _resolve_discord_progress_reconcile_note(
+            referenced_execution_id=current_execution_id,
+            latest_execution=latest_execution_record,
+            running_execution=running_execution_record,
+            resolved_execution=resolved_execution_record,
+            thread_missing=thread_missing,
+            failure_note=failure_note,
+            orphaned=orphaned,
+            startup=startup,
+        )
+        if note is None:
+            await _update_discord_progress_lease(
+                service,
+                lease_id=current_lease_id,
+                state="active",
+            )
+            continue
+        await _update_discord_progress_lease(
+            service,
+            lease_id=current_lease_id,
+            state="retiring",
+        )
+        await _retire_discord_progress_message(
+            service,
+            channel_id=current_channel_id,
+            message_id=current_message_id,
+            note=note,
+        )
+        await _delete_discord_progress_lease(service, lease_id=current_lease_id)
+        reconciled += 1
+    return reconciled
+
+
+async def clear_discord_turn_progress_leases(
+    service: Any,
+    *,
+    lease_id: Optional[str] = None,
+    managed_thread_id: Optional[str] = None,
+    execution_id: Optional[str] = None,
+    channel_id: Optional[str] = None,
+    message_id: Optional[str] = None,
+) -> int:
+    leases: list[Any]
+    if isinstance(lease_id, str) and lease_id.strip():
+        lease = await _get_discord_progress_lease(service, lease_id=lease_id)
+        leases = [lease] if lease is not None else []
+    else:
+        leases = await _list_discord_progress_leases(
+            service,
+            managed_thread_id=managed_thread_id,
+            execution_id=execution_id,
+            channel_id=channel_id,
+            message_id=message_id,
+        )
+    cleared = 0
+    for lease in leases:
+        current_lease_id = _execution_field(lease, "lease_id")
+        if not current_lease_id:
+            continue
+        await _delete_discord_progress_lease(service, lease_id=current_lease_id)
+        cleared += 1
+    return cleared
 
 
 def _maybe_inject_discord_filebox_hint(
@@ -678,8 +1180,22 @@ async def _submit_discord_thread_message(
         pma_enabled=request.pma_enabled,
     )
     thread_target_id: Optional[str] = None
+    execution_id: Optional[str] = None
+    supervision = _DiscordTurnExecutionSupervision(
+        service=dispatch.service,
+        channel_id=dispatch.channel_id,
+    )
+    supervision.set_orphaned(True)
+    supervision.set_failure_note(
+        "Turn failed: background task terminated unexpectedly."
+    )
+    supervision.set_shutdown_note(_shutdown_progress_note())
 
-    async def _cleanup_background_failure(exc: Exception) -> None:
+    async def _cleanup_background_failure(
+        exc: Exception,
+        *,
+        during_delivery: bool = False,
+    ) -> None:
         public_error, timeout_error, interrupted_error = (
             _discord_surface_error_messages(pma_enabled=dispatch.effective_pma_enabled)
         )
@@ -696,6 +1212,10 @@ async def _submit_discord_thread_message(
             channel_id=dispatch.channel_id,
             conversation_id=dispatch.context.conversation_id,
             workspace_root=str(dispatch.workspace_root),
+            preview_message_id=_execution_field(supervision.task_context, "message_id"),
+            execution_id=_execution_field(supervision.task_context, "execution_id"),
+            background_task_owner="discord.turn.background_delivery",
+            delivery_failed=during_delivery,
             agent=dispatch.agent,
             exc=exc,
         )
@@ -704,23 +1224,42 @@ async def _submit_discord_thread_message(
                 dispatch.service,
                 thread_target_id=thread_target_id,
             )
-        if progress_message_id:
-            await dispatch.service._delete_channel_message_safe(
-                channel_id=dispatch.channel_id,
-                message_id=progress_message_id,
+        reconciliation_note = (
+            "Status: this turn finished, but Discord failed before the final "
+            "reply was delivered. Please retry if needed."
+            if during_delivery
+            else f"Turn failed: {failure_message}"
+        )
+        reconciled = await supervision.reconcile_failure(
+            failure_note=reconciliation_note,
+            allow_channel_fallback=False,
+        )
+        if reconciled == 0:
+            progress_message_id = _execution_field(
+                supervision.task_context, "message_id"
+            )
+            if progress_message_id:
+                await dispatch.service._delete_channel_message_safe(
+                    channel_id=dispatch.channel_id,
+                    message_id=progress_message_id,
+                    record_id=(
+                        "turn:background_cleanup:"
+                        f"{dispatch.session_key}:{uuid.uuid4().hex[:8]}"
+                    ),
+                )
+            fallback_text = (
+                "Turn finished, but final reply delivery failed. Please retry."
+                if during_delivery
+                else f"Turn failed: {failure_message}"
+            )
+            await dispatch.service._send_channel_message_safe(
+                dispatch.channel_id,
+                {"content": fallback_text},
                 record_id=(
-                    "turn:background_cleanup:"
-                    f"{dispatch.session_key}:{uuid.uuid4().hex[:8]}"
+                    f"turn:background_failure:{dispatch.session_key}:"
+                    f"{uuid.uuid4().hex[:8]}"
                 ),
             )
-        await dispatch.service._send_channel_message_safe(
-            dispatch.channel_id,
-            {"content": f"Turn failed: {failure_message}"},
-            record_id=(
-                f"turn:background_failure:{dispatch.session_key}:"
-                f"{uuid.uuid4().hex[:8]}"
-            ),
-        )
 
     async def _send_initial_progress_placeholder() -> Optional[str]:
         initial_content = "Received. Preparing turn..."
@@ -782,24 +1321,37 @@ async def _submit_discord_thread_message(
         return thread_target_id or None
 
     async def _run_in_background() -> None:
+        nonlocal execution_id
         try:
             turn_result = await _execute_discord_thread_message(
                 request,
                 dispatch=dispatch,
                 initial_progress_message_id=progress_message_id,
                 managed_thread_surface_key=managed_thread_surface_key,
+                supervision=supervision,
             )
-            await _deliver_discord_turn_result(
-                dispatch,
-                workspace_root=request.workspace_root,
-                turn_result=turn_result,
-            )
+            if isinstance(turn_result, DiscordMessageTurnResult):
+                execution_id = turn_result.execution_id
+                supervision.set_execution_id(execution_id)
+                if turn_result.deferred_delivery:
+                    return
+            try:
+                await _deliver_discord_turn_result(
+                    dispatch,
+                    workspace_root=request.workspace_root,
+                    turn_result=turn_result,
+                    supervision=supervision,
+                )
+            except Exception as exc:
+                await _cleanup_background_failure(exc, during_delivery=True)
+                return
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # intentional: background task must clean up visibly
             await _cleanup_background_failure(exc)
 
     progress_message_id = await _send_initial_progress_placeholder()
+    supervision.set_message_id(progress_message_id)
     try:
         if (
             progress_message_id is not None
@@ -807,6 +1359,7 @@ async def _submit_discord_thread_message(
             and dispatch.event.message.message_id
         ):
             thread_target_id = await _resolve_managed_thread_id()
+            supervision.set_managed_thread_id(thread_target_id)
             if thread_target_id:
                 _stash_discord_reusable_progress_message(
                     dispatch.service,
@@ -815,11 +1368,12 @@ async def _submit_discord_thread_message(
                     channel_id=dispatch.channel_id,
                     message_id=progress_message_id,
                 )
-        _spawn_discord_background_task(
+        background_task = _spawn_discord_background_task(
             dispatch.service,
             _run_in_background(),
             await_on_shutdown=True,
         )
+        supervision.bind_task(background_task)
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -837,6 +1391,7 @@ async def _execute_discord_thread_message(
     dispatch: _DiscordMessageTurnDispatch,
     initial_progress_message_id: Optional[str] = None,
     managed_thread_surface_key: Optional[str] = None,
+    supervision: Optional[_DiscordTurnExecutionSupervision] = None,
 ) -> DiscordMessageTurnResult:
     request_workspace_root = request.workspace_root
     prompt_text = dispatch.turn_text
@@ -1000,13 +1555,24 @@ async def _execute_discord_thread_message(
         run_turn_kwargs["managed_thread_surface_key"] = (
             resolved_managed_thread_surface_key
         )
+    if supervision is not None:
+        run_turn_kwargs["supervision"] = supervision
     if turn_input_items:
         run_turn_kwargs["input_items"] = turn_input_items
     try:
-        return cast(
-            DiscordMessageTurnResult,
-            await dispatch.service._run_agent_turn_for_message(**run_turn_kwargs),
-        )
+        try:
+            return cast(
+                DiscordMessageTurnResult,
+                await dispatch.service._run_agent_turn_for_message(**run_turn_kwargs),
+            )
+        except TypeError as exc:
+            if "supervision" not in str(exc):
+                raise
+            run_turn_kwargs.pop("supervision", None)
+            return cast(
+                DiscordMessageTurnResult,
+                await dispatch.service._run_agent_turn_for_message(**run_turn_kwargs),
+            )
     except DiscordTurnStartupFailure as exc:
         dispatch.log_event_fn(
             dispatch.service._logger,
@@ -1092,13 +1658,16 @@ async def _deliver_discord_turn_result(
     *,
     workspace_root: Path,
     turn_result: Any,
+    supervision: Optional[_DiscordTurnExecutionSupervision] = None,
 ) -> None:
     if isinstance(turn_result, DiscordMessageTurnResult):
         if turn_result.deferred_delivery:
             return
         response_text = turn_result.final_message
         preview_message_id = turn_result.preview_message_id
+        execution_id = turn_result.execution_id
         send_final_message = turn_result.send_final_message
+        preserve_progress_lease = turn_result.preserve_progress_lease
         intermediate_text = (
             turn_result.intermediate_message.strip()
             if isinstance(turn_result.intermediate_message, str)
@@ -1115,7 +1684,18 @@ async def _deliver_discord_turn_result(
     else:
         response_text = str(turn_result or "")
         preview_message_id = None
+        execution_id = None
         send_final_message = True
+        preserve_progress_lease = False
+
+    if supervision is not None:
+        supervision.set_message_id(preview_message_id)
+        supervision.set_execution_id(execution_id)
+        if send_final_message:
+            supervision.set_failure_note(
+                "Status: this turn finished, but Discord failed before the final "
+                "reply was delivered. Please retry if needed."
+            )
 
     log_event(
         dispatch.service._logger,
@@ -1124,20 +1704,50 @@ async def _deliver_discord_turn_result(
         channel_id=dispatch.channel_id,
         session_key=dispatch.session_key,
         preview_message_id=preview_message_id,
+        execution_id=execution_id,
+        background_task_owner="discord.turn.delivery",
         send_final_message=send_final_message,
         response_chars=len(response_text or ""),
         workspace_root=str(workspace_root),
         agent=dispatch.agent,
     )
 
+    preview_message_deleted = False
     if isinstance(preview_message_id, str) and preview_message_id:
-        await dispatch.service._delete_channel_message_safe(
+        preview_message_deleted = await dispatch.service._delete_channel_message_safe(
             channel_id=dispatch.channel_id,
             message_id=preview_message_id,
             record_id=(
                 f"turn:delete_progress:{dispatch.session_key}:{uuid.uuid4().hex[:8]}"
             ),
         )
+        if preview_message_deleted:
+            for lease in await _list_discord_progress_leases(
+                dispatch.service,
+                channel_id=dispatch.channel_id,
+                message_id=preview_message_id,
+            ):
+                current_lease_id = _execution_field(lease, "lease_id")
+                if current_lease_id:
+                    await _delete_discord_progress_lease(
+                        dispatch.service,
+                        lease_id=current_lease_id,
+                    )
+            if supervision is not None:
+                supervision.clear_progress_tracking()
+    elif isinstance(execution_id, str) and execution_id and not preserve_progress_lease:
+        for lease in await _list_discord_progress_leases(
+            dispatch.service,
+            execution_id=execution_id,
+        ):
+            current_lease_id = _execution_field(lease, "lease_id")
+            if current_lease_id:
+                await _delete_discord_progress_lease(
+                    dispatch.service,
+                    lease_id=current_lease_id,
+                )
+        if supervision is not None:
+            supervision.set_lease_id(None)
     if send_final_message:
         await _send_discord_turn_section(
             dispatch.service,
@@ -1164,6 +1774,9 @@ async def _deliver_discord_turn_result(
             "discord.turn.delivery_cleanup_failed",
             channel_id=dispatch.channel_id,
             session_key=dispatch.session_key,
+            preview_message_id=preview_message_id,
+            execution_id=execution_id,
+            background_task_owner="discord.turn.delivery",
             workspace_root=str(workspace_root),
             send_final_message=send_final_message,
             agent=dispatch.agent,
@@ -1175,8 +1788,10 @@ async def _deliver_discord_turn_result(
         "discord.turn.delivery_finished",
         channel_id=dispatch.channel_id,
         session_key=dispatch.session_key,
-        preview_message_deleted=isinstance(preview_message_id, str)
-        and bool(preview_message_id),
+        preview_message_id=preview_message_id,
+        execution_id=execution_id,
+        background_task_owner="discord.turn.delivery",
+        preview_message_deleted=preview_message_deleted,
         send_final_message=send_final_message,
         response_chars=len(response_text or ""),
         flushed_outbox_files=send_final_message,
@@ -1546,13 +2161,13 @@ def _get_discord_thread_queue_task_map(service: Any) -> dict[str, asyncio.Task[A
     return _discord_orchestration_state(service).thread_queue_tasks
 
 
-def _build_discord_queue_worker_hooks(
+def _build_discord_runner_hooks(
     service: Any,
     *,
     channel_id: str,
     managed_thread_id: str,
     public_execution_error: str,
-) -> ManagedThreadQueueWorkerHooks:
+) -> ManagedThreadCoordinatorHooks:
     async def _run_with_discord_typing_indicator(work: Any) -> None:
         run_with_typing = getattr(service, "_run_with_typing_indicator", None)
         if callable(run_with_typing):
@@ -1597,14 +2212,27 @@ def _build_discord_queue_worker_hooks(
             ),
         )
 
-    return ManagedThreadQueueWorkerHooks(
+    return ManagedThreadCoordinatorHooks(
+        on_execution_started=_on_execution_started,
+        on_execution_finished=_on_execution_finished,
         deliver_result=_deliver_result,
         run_with_indicator=_run_with_discord_typing_indicator,
-        execution_hooks=ManagedThreadExecutionHooks(
-            on_execution_started=_on_execution_started,
-            on_execution_finished=_on_execution_finished,
-        ),
     )
+
+
+def _build_discord_queue_worker_hooks(
+    service: Any,
+    *,
+    channel_id: str,
+    managed_thread_id: str,
+    public_execution_error: str,
+) -> Any:
+    return _build_discord_runner_hooks(
+        service,
+        channel_id=channel_id,
+        managed_thread_id=managed_thread_id,
+        public_execution_error=public_execution_error,
+    ).queue_worker_hooks()
 
 
 async def _run_discord_orchestrated_turn_for_message(
@@ -1631,6 +2259,7 @@ async def _run_discord_orchestrated_turn_for_message(
     max_actions: int,
     min_edit_interval_seconds: float,
     heartbeat_interval_seconds: float,
+    supervision: Optional[_DiscordTurnExecutionSupervision] = None,
 ) -> DiscordMessageTurnResult:
     _ = session_key
     channel_id = (
@@ -1672,6 +2301,8 @@ async def _run_discord_orchestrated_turn_for_message(
     )
     max_progress_len = max(int(service._config.max_message_length), 32)
     managed_thread_id = thread.thread_target_id
+    if supervision is not None:
+        supervision.set_managed_thread_id(managed_thread_id)
     coordinator = _build_discord_managed_thread_coordinator(
         service=service,
         orchestration_service=orchestration_service,
@@ -1693,6 +2324,7 @@ async def _run_discord_orchestrated_turn_for_message(
     progress_last_updated = 0.0
     progress_heartbeat_task: Optional[asyncio.Task[None]] = None
     progress_execution_id: Optional[str] = None
+    progress_lease_id = uuid.uuid4().hex
     runtime_state = ProgressRuntimeState()
     active_progress_labels = {"working", "queued", "running", "review"}
     reusable_progress_message_id = _claim_discord_reusable_progress_message(
@@ -1700,6 +2332,55 @@ async def _run_discord_orchestrated_turn_for_message(
         thread_target_id=managed_thread_id,
         source_message_id=source_message_id,
     )
+
+    async def _load_progress_lease() -> Any:
+        return await _get_discord_progress_lease(service, lease_id=progress_lease_id)
+
+    async def _progress_lease_allows_heartbeat() -> bool:
+        lease = await _load_progress_lease()
+        lease_state = (_execution_field(lease, "state") or "").lower()
+        return bool(lease is not None and lease_state in _DISCORD_PROGRESS_LIVE_STATES)
+
+    async def _register_progress_lease(
+        *,
+        state: str,
+        execution_id: Optional[str] = None,
+    ) -> None:
+        if not progress_message_id:
+            return
+        await _upsert_discord_progress_lease(
+            service,
+            lease_id=progress_lease_id,
+            managed_thread_id=managed_thread_id,
+            execution_id=execution_id,
+            channel_id=channel_id,
+            message_id=progress_message_id,
+            source_message_id=source_message_id,
+            state=state,
+            progress_label=tracker.label,
+        )
+        if supervision is not None:
+            supervision.set_lease_id(progress_lease_id)
+            supervision.set_message_id(progress_message_id)
+            supervision.set_execution_id(execution_id)
+
+    async def _set_progress_lease_state(
+        *,
+        state: str,
+        execution_id: Optional[str] | object = ...,
+    ) -> None:
+        await _update_discord_progress_lease(
+            service,
+            lease_id=progress_lease_id,
+            execution_id=execution_id,
+            state=state,
+            progress_label=tracker.label,
+        )
+
+    async def _delete_progress_lease() -> None:
+        await _delete_discord_progress_lease(service, lease_id=progress_lease_id)
+        if supervision is not None:
+            supervision.set_lease_id(None)
 
     async def _edit_progress(
         *,
@@ -1753,10 +2434,19 @@ async def _run_discord_orchestrated_turn_for_message(
             return
         progress_rendered = content
         progress_last_updated = now
+        await _update_discord_progress_lease(
+            service,
+            lease_id=progress_lease_id,
+            progress_label=tracker.label,
+        )
 
     async def _progress_heartbeat() -> None:
         while True:
+            if not await _progress_lease_allows_heartbeat():
+                return
             await asyncio.sleep(heartbeat_interval_seconds)
+            if not await _progress_lease_allows_heartbeat():
+                return
             await _edit_progress()
 
     async def _stop_progress_heartbeat() -> None:
@@ -1790,30 +2480,20 @@ async def _run_discord_orchestrated_turn_for_message(
             sandbox_policy=sandbox_policy,
         )
 
-    def ensure_queue_worker() -> None:
-        coordinator.ensure_queue_worker(
-            task_map=_get_discord_thread_queue_task_map(service),
-            managed_thread_id=managed_thread_id,
-            spawn_task=lambda coro: _spawn_discord_background_task(
-                service, coro, await_on_shutdown=True
-            ),
-            hooks=_build_discord_queue_worker_hooks(
-                service,
-                channel_id=channel_id,
-                managed_thread_id=managed_thread_id,
-                public_execution_error=public_execution_error,
-            ),
-            begin_next_execution=cast(
-                ManagedThreadQueuedExecutionStarter,
-                _begin_next_execution,
-            ),
-        )
-
     try:
         if reusable_progress_message_id:
             progress_message_id = reusable_progress_message_id
+            if supervision is not None:
+                supervision.set_message_id(progress_message_id)
+            await _register_progress_lease(state="pending")
             await _edit_progress(force=True)
-            progress_heartbeat_task = asyncio.create_task(_progress_heartbeat())
+            progress_heartbeat_task = bind_discord_progress_task_context(
+                asyncio.create_task(_progress_heartbeat()),
+                managed_thread_id=managed_thread_id,
+                lease_id=progress_lease_id,
+                channel_id=channel_id,
+                message_id=progress_message_id,
+            )
         else:
             initial_rendered = render_progress_text(
                 tracker,
@@ -1840,9 +2520,18 @@ async def _run_discord_orchestrated_turn_for_message(
             message_id = response.get("id")
             if isinstance(message_id, str) and message_id:
                 progress_message_id = message_id
+                if supervision is not None:
+                    supervision.set_message_id(progress_message_id)
                 progress_rendered = initial_content
                 progress_last_updated = time.monotonic()
-                progress_heartbeat_task = asyncio.create_task(_progress_heartbeat())
+                await _register_progress_lease(state="pending")
+                progress_heartbeat_task = bind_discord_progress_task_context(
+                    asyncio.create_task(_progress_heartbeat()),
+                    managed_thread_id=managed_thread_id,
+                    lease_id=progress_lease_id,
+                    channel_id=channel_id,
+                    message_id=progress_message_id,
+                )
     except (DiscordTransientError, RuntimeError, ConnectionError, OSError):
         service._logger.warning(
             "Discord progress placeholder send failed for channel=%s",
@@ -1851,103 +2540,144 @@ async def _run_discord_orchestrated_turn_for_message(
         )
         progress_message_id = None
 
-    try:
-        submission = await asyncio.wait_for(
-            coordinator.submit_execution(
-                MessageRequest(
-                    target_id=thread.thread_target_id,
-                    target_kind="thread",
-                    message_text=prompt_text,
-                    busy_policy="queue",
-                    model=model_override,
-                    reasoning=reasoning_effort,
-                    approval_mode=approval_mode,
-                    input_items=execution_input_items,
-                    metadata={
-                        "runtime_prompt": execution_prompt,
-                        "execution_error_message": public_execution_error,
-                    },
-                ),
-                client_request_id=f"discord:{channel_id}:{uuid.uuid4().hex[:12]}",
-                sandbox_policy=sandbox_policy,
-                begin_execution=_begin_execution,
-            ),
-            timeout=DISCORD_MANAGED_THREAD_SUBMISSION_TIMEOUT_SECONDS,
+    runner_hooks = _build_discord_runner_hooks(
+        service,
+        channel_id=channel_id,
+        managed_thread_id=managed_thread_id,
+        public_execution_error=public_execution_error,
+    )
+    queue_worker_hooks = _build_discord_queue_worker_hooks(
+        service,
+        channel_id=channel_id,
+        managed_thread_id=managed_thread_id,
+        public_execution_error=public_execution_error,
+    )
+    runner_hooks = ManagedThreadCoordinatorHooks(
+        on_execution_started=runner_hooks.on_execution_started,
+        on_execution_finished=runner_hooks.on_execution_finished,
+        on_progress_event=lambda run_event: _apply_discord_progress_run_event(
+            tracker,
+            run_event,
+            runtime_state=runtime_state,
+            edit_progress=_edit_progress,
+        ),
+        deliver_result=queue_worker_hooks.deliver_result,
+        run_with_indicator=queue_worker_hooks.run_with_indicator,
+    )
+    progress_backend_turn_id: Optional[str] = None
+
+    async def _after_submission(submission: Any) -> None:
+        nonlocal progress_execution_id
+        nonlocal progress_backend_turn_id
+        started_execution = submission.started_execution
+        progress_execution_id = (
+            str(getattr(started_execution.execution, "execution_id", "") or "").strip()
+            or None
         )
-    except asyncio.TimeoutError as exc:
+        progress_backend_turn_id = (
+            str(getattr(started_execution.execution, "backend_id", "") or "").strip()
+            or None
+        )
+        if supervision is not None:
+            supervision.set_execution_id(progress_execution_id)
+        await _set_progress_lease_state(
+            execution_id=progress_execution_id,
+            state="active",
+        )
+        if progress_message_id:
+            try:
+                await _edit_progress(force=True)
+            except (RuntimeError, ConnectionError, OSError):
+                _logger.debug(
+                    "Discord progress cancel-button refresh failed for channel=%s",
+                    channel_id,
+                    exc_info=True,
+                )
+
+    async def _on_submission_error(exc: BaseException) -> DiscordMessageTurnResult:
+        if isinstance(exc, asyncio.TimeoutError):
+            log_event(
+                service._logger,
+                logging.ERROR,
+                "discord.turn.submission_timeout",
+                channel_id=channel_id,
+                thread_target_id=managed_thread_id,
+                timeout_seconds=DISCORD_MANAGED_THREAD_SUBMISSION_TIMEOUT_SECONDS,
+                pma_enabled=pma_enabled,
+                workspace_root=str(workspace_root),
+                agent=logical_agent,
+            )
+            tracker.set_label("failed")
+            tracker.note_error("Turn failed to start in time. Please retry.")
+            if progress_message_id:
+                await _edit_progress(force=True, remove_components=True)
+                await _set_progress_lease_state(state="retiring")
+                await _delete_progress_lease()
+            else:
+                await service._send_channel_message_safe(
+                    channel_id,
+                    {"content": ("Turn failed to start in time. Please retry.")},
+                    record_id=(
+                        f"discord:runtime-submit-timeout:{managed_thread_id}:"
+                        f"{uuid.uuid4().hex[:8]}"
+                    ),
+                )
+            raise DiscordTurnStartupFailure(
+                "Turn failed to start in time. Please retry."
+            ) from exc
+        if isinstance(
+            exc,
+            (RuntimeError, ConnectionError, OSError, ValueError, TypeError),
+        ):
+            if progress_message_id:
+                await service._delete_channel_message_safe(
+                    channel_id,
+                    progress_message_id,
+                    record_id=(
+                        f"discord:runtime-begin-failed:{managed_thread_id}:"
+                        f"{uuid.uuid4().hex[:8]}"
+                    ),
+                )
+                await _delete_progress_lease()
+                if supervision is not None:
+                    supervision.set_message_id(None)
+            raise exc
+        raise exc
+
+    async def _on_after_submission_error(submission: Any, exc: Exception) -> None:
+        started_execution = getattr(submission, "started_execution", None)
+        execution = getattr(started_execution, "execution", None)
         log_event(
             service._logger,
-            logging.ERROR,
-            "discord.turn.submission_timeout",
+            logging.WARNING,
+            "discord.turn.managed_thread_post_submit_failed",
             channel_id=channel_id,
-            thread_target_id=managed_thread_id,
-            timeout_seconds=DISCORD_MANAGED_THREAD_SUBMISSION_TIMEOUT_SECONDS,
-            pma_enabled=pma_enabled,
-            workspace_root=str(workspace_root),
+            managed_thread_id=managed_thread_id,
+            execution_id=(
+                str(getattr(execution, "execution_id", "") or "").strip() or None
+            ),
+            backend_turn_id=(
+                str(getattr(execution, "backend_id", "") or "").strip() or None
+            ),
+            queued=bool(getattr(submission, "queued", False)),
+            progress_message_id=progress_message_id,
+            exc=exc,
             agent=logical_agent,
         )
-        await _stop_progress_heartbeat()
-        tracker.set_label("failed")
-        tracker.note_error("Turn failed to start in time. Please retry.")
-        if progress_message_id:
-            await _edit_progress(
-                force=True,
-                remove_components=True,
-            )
-        else:
-            await service._send_channel_message_safe(
-                channel_id,
-                {"content": ("Turn failed to start in time. Please retry.")},
-                record_id=(
-                    f"discord:runtime-submit-timeout:{managed_thread_id}:"
-                    f"{uuid.uuid4().hex[:8]}"
-                ),
-            )
-        raise DiscordTurnStartupFailure(
-            "Turn failed to start in time. Please retry."
-        ) from exc
-    except (RuntimeError, ConnectionError, OSError, ValueError, TypeError):
-        await _stop_progress_heartbeat()
-        if progress_message_id:
-            await service._delete_channel_message_safe(
-                channel_id,
-                progress_message_id,
-                record_id=(
-                    f"discord:runtime-begin-failed:{managed_thread_id}:"
-                    f"{uuid.uuid4().hex[:8]}"
-                ),
-            )
-        raise
-    started_execution = submission.started_execution
 
-    progress_execution_id = (
-        str(getattr(started_execution.execution, "execution_id", "") or "").strip()
-        or None
-    )
-    if progress_message_id:
-        try:
-            await _edit_progress(force=True)
-        except (RuntimeError, ConnectionError, OSError):
-            _logger.debug(
-                "Discord progress cancel-button refresh failed for channel=%s",
-                channel_id,
-                exc_info=True,
-            )
-
-    if submission.queued:
+    async def _on_queued(_flow: Any) -> DiscordMessageTurnResult:
         log_event(
             service._logger,
             logging.INFO,
             "discord.turn.managed_thread_submission",
             channel_id=channel_id,
             managed_thread_id=managed_thread_id,
-            execution_id=getattr(started_execution.execution, "execution_id", None),
-            backend_turn_id=getattr(started_execution.execution, "backend_id", None),
+            execution_id=progress_execution_id,
+            backend_turn_id=progress_backend_turn_id,
             queued=True,
             progress_message_id=progress_message_id,
             agent=logical_agent,
         )
-        await _stop_progress_heartbeat()
         tracker.set_label("queued")
         try:
             if progress_message_id:
@@ -1958,131 +2688,167 @@ async def _run_discord_orchestrated_turn_for_message(
                 channel_id,
                 exc_info=True,
             )
-        ensure_queue_worker()
         return DiscordMessageTurnResult(
-            final_message="Queued (waiting for available worker...)"
+            final_message="Queued (waiting for available worker...)",
+            execution_id=progress_execution_id,
+            preserve_progress_lease=True,
         )
-    log_event(
-        service._logger,
-        logging.INFO,
-        "discord.turn.managed_thread_submission",
-        channel_id=channel_id,
-        managed_thread_id=managed_thread_id,
-        execution_id=getattr(started_execution.execution, "execution_id", None),
-        backend_turn_id=getattr(started_execution.execution, "backend_id", None),
-        queued=False,
-        progress_message_id=progress_message_id,
-        agent=logical_agent,
-    )
 
-    try:
-        finalized_flow = await complete_managed_thread_execution(
-            coordinator,
-            submission,
-            ensure_queue_worker=ensure_queue_worker,
-            direct_hooks=ManagedThreadExecutionHooks(
-                on_execution_started=(
-                    lambda active_execution: (
-                        service._register_discord_turn_approval_context(
-                            started_execution=active_execution,
-                            channel_id=channel_id,
-                        )
-                    )
-                ),
-                on_execution_finished=(
-                    lambda active_execution: (
-                        service._clear_discord_turn_approval_context(
-                            started_execution=active_execution
-                        )
-                    )
-                ),
-                on_progress_event=lambda run_event: _apply_discord_progress_run_event(
-                    tracker,
-                    run_event,
-                    runtime_state=runtime_state,
-                    edit_progress=_edit_progress,
-                ),
-            ),
-            runtime_event_state=RuntimeThreadRunEventState(),
+    async def _on_finalized(
+        _flow: Any,
+        finalized: ManagedThreadFinalizationResult,
+    ) -> DiscordMessageTurnResult:
+        log_event(
+            service._logger,
+            logging.INFO,
+            "discord.turn.managed_thread_submission",
+            channel_id=channel_id,
+            managed_thread_id=managed_thread_id,
+            execution_id=progress_execution_id,
+            backend_turn_id=progress_backend_turn_id,
+            queued=False,
+            progress_message_id=progress_message_id,
+            agent=logical_agent,
         )
-    finally:
-        await _stop_progress_heartbeat()
-
-    finalized = coerce_managed_thread_finalization_result(finalized_flow.finalized)
-    assert finalized is not None
-    log_event(
-        service._logger,
-        logging.INFO,
-        "discord.turn.managed_thread_finalized",
-        channel_id=channel_id,
-        managed_thread_id=managed_thread_id,
-        status=finalized.status,
-        backend_thread_id=finalized.backend_thread_id,
-        preview_message_id=progress_message_id,
-        assistant_chars=len(str(finalized.assistant_text or "")),
-        token_usage_present=isinstance(finalized.token_usage, dict),
-        elapsed_ms=max(int((time.monotonic() - tracker.started_at) * 1000), 0),
-        agent=logical_agent,
-    )
-    if finalized.status != "ok":
-        if finalized.status == "interrupted":
-            reuse_request = _peek_discord_progress_reuse_request(
-                service,
-                thread_target_id=managed_thread_id,
-            )
-            if reuse_request is not None:
-                acknowledgement_delivered = False
-                if progress_message_id:
-                    acknowledgement_delivered = (
-                        await _acknowledge_discord_progress_reuse(
-                            service,
-                            channel_id=channel_id,
-                            message_id=progress_message_id,
-                            acknowledgement=reuse_request.acknowledgement,
+        log_event(
+            service._logger,
+            logging.INFO,
+            "discord.turn.managed_thread_finalized",
+            channel_id=channel_id,
+            managed_thread_id=managed_thread_id,
+            execution_id=progress_execution_id,
+            status=finalized.status,
+            backend_thread_id=finalized.backend_thread_id,
+            preview_message_id=progress_message_id,
+            background_task_owner="discord.turn.background_delivery",
+            assistant_chars=len(str(finalized.assistant_text or "")),
+            token_usage_present=isinstance(finalized.token_usage, dict),
+            elapsed_ms=max(int((time.monotonic() - tracker.started_at) * 1000), 0),
+            agent=logical_agent,
+        )
+        if finalized.status != "ok":
+            if finalized.status == "interrupted":
+                reuse_request = _peek_discord_progress_reuse_request(
+                    service,
+                    thread_target_id=managed_thread_id,
+                )
+                if reuse_request is not None:
+                    acknowledgement_delivered = False
+                    if progress_message_id:
+                        acknowledgement_delivered = (
+                            await _acknowledge_discord_progress_reuse(
+                                service,
+                                channel_id=channel_id,
+                                message_id=progress_message_id,
+                                acknowledgement=reuse_request.acknowledgement,
+                            )
                         )
-                    )
-                    if acknowledgement_delivered:
-                        _stash_discord_reusable_progress_message(
+                        if acknowledgement_delivered:
+                            _stash_discord_reusable_progress_message(
+                                service,
+                                thread_target_id=managed_thread_id,
+                                source_message_id=reuse_request.source_message_id,
+                                channel_id=channel_id,
+                                message_id=progress_message_id,
+                            )
+                    if not acknowledgement_delivered:
+                        clear_discord_turn_progress_reuse(
                             service,
                             thread_target_id=managed_thread_id,
-                            source_message_id=reuse_request.source_message_id,
-                            channel_id=channel_id,
-                            message_id=progress_message_id,
                         )
-                if not acknowledgement_delivered:
-                    clear_discord_turn_progress_reuse(
-                        service,
-                        thread_target_id=managed_thread_id,
+                    return DiscordMessageTurnResult(
+                        final_message=sanitize_discord_outbound_text(
+                            reuse_request.acknowledgement
+                        ),
+                        execution_id=progress_execution_id,
+                        send_final_message=not acknowledgement_delivered,
                     )
-                return DiscordMessageTurnResult(
-                    final_message=sanitize_discord_outbound_text(
-                        reuse_request.acknowledgement
-                    ),
-                    send_final_message=not acknowledgement_delivered,
-                )
-        raise RuntimeError(str(finalized.error or public_execution_error))
-    summary_snapshot = render_progress_text(
-        tracker,
-        max_length=max_progress_len,
-        now=time.monotonic(),
-        render_mode="live",
-    )
-    intermediate_message = (
-        summary_snapshot.splitlines()[0].strip() if summary_snapshot else ""
-    )
-    if not intermediate_message:
-        intermediate_message = render_progress_text(
-            tracker,
-            max_length=max_progress_len,
-            now=time.monotonic(),
-            render_mode="final",
+            raise RuntimeError(str(finalized.error or public_execution_error))
+        summary_snapshot = ""
+        if (
+            isinstance(finalized.assistant_text, str)
+            and finalized.assistant_text.strip()
+        ):
+            summary_snapshot = render_progress_text(
+                tracker,
+                max_length=max_progress_len,
+                now=time.monotonic(),
+                render_mode="live",
+            )
+        intermediate_message = (
+            summary_snapshot.splitlines()[0].strip() if summary_snapshot else ""
         )
-    return DiscordMessageTurnResult(
-        final_message=finalized.assistant_text,
-        preview_message_id=progress_message_id,
-        intermediate_message=intermediate_message,
-        token_usage=finalized.token_usage,
-        elapsed_seconds=max(0.0, time.monotonic() - tracker.started_at),
+        if not intermediate_message:
+            intermediate_message = tracker.latest_output_text().strip()
+        if not intermediate_message:
+            intermediate_message = render_progress_text(
+                tracker,
+                max_length=max_progress_len,
+                now=time.monotonic(),
+                render_mode="final",
+            )
+        return DiscordMessageTurnResult(
+            final_message=finalized.assistant_text,
+            preview_message_id=progress_message_id,
+            execution_id=progress_execution_id,
+            intermediate_message=intermediate_message,
+            token_usage=finalized.token_usage,
+            elapsed_seconds=max(0.0, time.monotonic() - tracker.started_at),
+        )
+
+    async def _after_completion(_flow: Any) -> None:
+        await _stop_progress_heartbeat()
+
+    return await run_managed_surface_turn(
+        MessageRequest(
+            target_id=thread.thread_target_id,
+            target_kind="thread",
+            message_text=prompt_text,
+            busy_policy="queue",
+            model=model_override,
+            reasoning=reasoning_effort,
+            approval_mode=approval_mode,
+            input_items=execution_input_items,
+            metadata={
+                "runtime_prompt": execution_prompt,
+                "execution_error_message": public_execution_error,
+            },
+        ),
+        config=ManagedSurfaceRunnerConfig(
+            coordinator=coordinator,
+            client_request_id=f"discord:{channel_id}:{uuid.uuid4().hex[:12]}",
+            sandbox_policy=sandbox_policy,
+            hooks=runner_hooks,
+            queue=ManagedSurfaceQueueConfig(
+                task_map=_get_discord_thread_queue_task_map(service),
+                managed_thread_id=managed_thread_id,
+                spawn_task=lambda coro: bind_discord_progress_task_context(
+                    _spawn_discord_background_task(
+                        service, coro, await_on_shutdown=True
+                    ),
+                    managed_thread_id=managed_thread_id,
+                    failure_note=(
+                        "Status: this progress message lost its queue worker and is "
+                        "no longer live. Please retry if needed."
+                    ),
+                    orphaned=True,
+                ),
+                begin_next_execution=cast(
+                    ManagedThreadQueuedExecutionStarter,
+                    _begin_next_execution,
+                ),
+            ),
+            begin_execution=_begin_execution,
+            complete_execution=complete_managed_thread_execution,
+            submission_timeout_seconds=DISCORD_MANAGED_THREAD_SUBMISSION_TIMEOUT_SECONDS,
+            runtime_event_state=RuntimeThreadRunEventState(),
+            after_submission=_after_submission,
+            on_submission_error=_on_submission_error,
+            on_after_submission_error=_on_after_submission_error,
+            on_queued=_on_queued,
+            on_finalized=_on_finalized,
+            after_completion=_after_completion,
+        ),
     )
 
 
@@ -2140,6 +2906,7 @@ async def run_managed_thread_turn_for_message(
     session_key: str,
     orchestrator_channel_key: str,
     managed_thread_surface_key: Optional[str] = None,
+    supervision: Optional[_DiscordTurnExecutionSupervision] = None,
 ) -> DiscordMessageTurnResult:
     execution_prompt = (
         f"{format_pma_discoverability_preamble(hub_root=service._config.root)}"
@@ -2176,4 +2943,5 @@ async def run_managed_thread_turn_for_message(
         max_actions=DISCORD_PMA_PROGRESS_MAX_ACTIONS,
         min_edit_interval_seconds=DISCORD_PMA_PROGRESS_MIN_EDIT_INTERVAL_SECONDS,
         heartbeat_interval_seconds=DISCORD_PMA_PROGRESS_HEARTBEAT_INTERVAL_SECONDS,
+        supervision=supervision,
     )

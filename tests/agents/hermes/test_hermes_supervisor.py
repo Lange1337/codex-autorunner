@@ -6,14 +6,17 @@ import sys
 from pathlib import Path
 
 import pytest
+from tests.acp_lifecycle_corpus import load_acp_lifecycle_corpus
 
 from codex_autorunner.agents.acp.errors import (
     ACPInitializationError,
     ACPProcessCrashedError,
 )
+from codex_autorunner.agents.acp.events import normalize_notification
 from codex_autorunner.agents.hermes.supervisor import (
     HermesSupervisor,
     HermesSupervisorError,
+    _should_close_turn_buffer,
     build_hermes_supervisor_from_config,
     hermes_runtime_preflight,
 )
@@ -146,6 +149,58 @@ async def test_hermes_supervisor_maps_session_scoped_updates_to_active_turn(
         )
     finally:
         await supervisor.close_all()
+
+
+@pytest.mark.slow
+@pytest.mark.asyncio
+async def test_hermes_supervisor_can_complete_from_idle_status_before_prompt_return(
+    tmp_path: Path,
+) -> None:
+    supervisor = HermesSupervisor(
+        fixture_command("official_session_status_idle_before_return")
+    )
+    try:
+        await supervisor.ensure_ready(tmp_path)
+        session = await supervisor.create_session(tmp_path, title="Official mapping")
+        turn_id = await supervisor.start_turn(
+            tmp_path,
+            session.session_id,
+            "hello from hermes",
+        )
+        result = await asyncio.wait_for(
+            supervisor.wait_for_turn(tmp_path, session.session_id, turn_id),
+            timeout=2.0,
+        )
+        events = await _collect_events(
+            supervisor, tmp_path, session.session_id, turn_id
+        )
+
+        assert result.status == "completed"
+        assert result.assistant_text == "fixture reply"
+        assert [event.get("method") for event in events] == [
+            "prompt/started",
+            "session/update",
+            "session/update",
+            "session.status",
+        ]
+        assert all(
+            event.get("params", {}).get("turnId") == turn_id
+            for event in events[1:]
+            if isinstance(event.get("params"), dict)
+        )
+    finally:
+        await supervisor.close_all()
+
+
+def test_hermes_supervisor_shared_lifecycle_fixture_buffer_closing() -> None:
+    for case in load_acp_lifecycle_corpus():
+        raw = dict(case["raw"])
+        expected = dict(case["expected"])
+        event = normalize_notification(raw)
+
+        if event.kind != "turn_terminal":
+            continue
+        assert _should_close_turn_buffer(event) is expected["closes_turn_buffer"]
 
 
 def test_hermes_runtime_preflight_accepts_plain_acp_help(

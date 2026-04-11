@@ -24,6 +24,7 @@ from ...core.orchestration.runtime_threads import (
     RUNTIME_THREAD_TIMEOUT_ERROR,
     RuntimeThreadExecution,
     RuntimeThreadOutcome,
+    RuntimeTurnTerminalStateMachine,
     await_runtime_thread_outcome,
     begin_next_queued_runtime_thread_execution,
     begin_runtime_thread_execution,
@@ -43,6 +44,7 @@ from ...core.ports.run_event import (
     TokenUsage,
     ToolCall,
 )
+from ...core.time_utils import now_iso
 from .runtime_thread_errors import resolve_runtime_thread_error_detail
 
 ProgressEventHandler = Callable[[Any], Awaitable[None]]
@@ -990,6 +992,10 @@ def _note_runtime_event_state(
     event_state: RuntimeThreadRunEventState,
     run_event: Any,
 ) -> None:
+    event_state.note_runtime_progress(
+        type(run_event).__name__,
+        timestamp=now_iso(),
+    )
     if isinstance(run_event, OutputDelta):
         if run_event.delta_type == RUN_EVENT_DELTA_TYPE_ASSISTANT_STREAM:
             event_state.note_stream_text(str(run_event.content or ""))
@@ -1020,6 +1026,15 @@ async def _normalize_runtime_progress_event(
         _note_runtime_event_state(event_state, raw_event)
         return [raw_event]
     return await normalize_runtime_thread_raw_event(raw_event, event_state)
+
+
+def _managed_thread_runtime_trace_fields(
+    event_state: RuntimeThreadRunEventState,
+) -> dict[str, Any]:
+    return {
+        "last_runtime_method": event_state.last_runtime_method,
+        "last_progress_at": event_state.last_progress_at,
+    }
 
 
 def _surface_metadata(
@@ -1072,12 +1087,14 @@ def _managed_thread_completion_source(
     *,
     recovered_after_completion: bool,
 ) -> str:
-    if recovered_after_completion:
+    if recovered_after_completion and outcome.completion_source == "prompt_return":
         return "post_completion_recovery"
     if outcome.status == "interrupted":
         return "interrupt"
     if str(outcome.error or "").strip() == RUNTIME_THREAD_TIMEOUT_ERROR:
         return "timeout"
+    if outcome.completion_source:
+        return outcome.completion_source
     return "prompt_return"
 
 
@@ -1174,6 +1191,10 @@ async def finalize_managed_thread_execution(
 
     stream_backend_thread_id = current_backend_thread_id
     stream_backend_turn_id = str(started.execution.backend_id or "").strip()
+    terminal_state = RuntimeTurnTerminalStateMachine(
+        backend_thread_id=current_backend_thread_id,
+        backend_turn_id=started.execution.backend_id,
+    )
     if not stream_backend_turn_id:
         stream_backend_turn_id = str(started.execution.execution_id or "").strip()
         logger.warning(
@@ -1215,6 +1236,7 @@ async def finalize_managed_thread_execution(
                     stream_backend_turn_id,
                 ):
                     raw_events_received += 1
+                    terminal_state.note_raw_event(raw_event)
                     run_events = await _normalize_runtime_progress_event(
                         raw_event,
                         event_state,
@@ -1252,6 +1274,7 @@ async def finalize_managed_thread_execution(
                                 event_state_best_assistant_chars=len(
                                     event_state.best_assistant_text()
                                 ),
+                                **_managed_thread_runtime_trace_fields(event_state),
                                 content_summary=content_summary,
                             )
                     timeline_events.extend(run_events)
@@ -1307,6 +1330,7 @@ async def finalize_managed_thread_execution(
                     run_events_dispatched=run_events_dispatched,
                     empty_session_update_events=empty_session_update_events,
                     empty_session_update_kinds=empty_session_update_kinds,
+                    **_managed_thread_runtime_trace_fields(event_state),
                 )
 
         stream_task = asyncio.create_task(_pump_runtime_events())
@@ -1334,6 +1358,8 @@ async def finalize_managed_thread_execution(
                 interrupt_event=None,
                 timeout_seconds=errors.timeout_seconds,
                 execution_error_message=errors.public_execution_error,
+                terminal_state=terminal_state,
+                observe_progress_events=False,
             )
     except (
         RuntimeError,
@@ -1388,6 +1414,7 @@ async def finalize_managed_thread_execution(
                 surface=surface,
             ),
             original_error=outcome.error,
+            **_managed_thread_runtime_trace_fields(event_state),
         )
         outcome = recovered_outcome
 
@@ -1540,6 +1567,7 @@ async def finalize_managed_thread_execution(
                 finalized_status=finalized_status or None,
                 detail=detail,
                 event_error=event_state.last_error_message,
+                **_managed_thread_runtime_trace_fields(event_state),
             )
             return _build_finalization_result(
                 status="error",
@@ -1571,6 +1599,7 @@ async def finalize_managed_thread_execution(
             assistant_chars=len(resolved_assistant_text),
             event_error=event_state.last_error_message,
             token_usage=event_state.token_usage,
+            **_managed_thread_runtime_trace_fields(event_state),
         )
         return _build_finalization_result(
             status="ok",
@@ -1606,6 +1635,7 @@ async def finalize_managed_thread_execution(
             detail=errors.interrupted_error,
             event_error=event_state.last_error_message,
             token_usage=event_state.token_usage,
+            **_managed_thread_runtime_trace_fields(event_state),
         )
         return _build_finalization_result(
             status="interrupted",
@@ -1653,6 +1683,7 @@ async def finalize_managed_thread_execution(
         outcome_error=outcome.error,
         event_error=event_state.last_error_message,
         token_usage=event_state.token_usage,
+        **_managed_thread_runtime_trace_fields(event_state),
     )
     return _build_finalization_result(
         status="error",

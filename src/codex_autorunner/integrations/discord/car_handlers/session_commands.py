@@ -33,6 +33,7 @@ from ..interaction_runtime import (
     send_runtime_components_ephemeral,
 )
 from ..message_turns import (
+    clear_discord_turn_progress_leases,
     clear_discord_turn_progress_reuse,
     request_discord_turn_progress_reuse,
 )
@@ -1406,6 +1407,11 @@ async def handle_car_interrupt(
                 resolved_execution=None,
                 thread_missing=True,
             )
+            await clear_discord_turn_progress_leases(
+                service,
+                managed_thread_id=normalized_thread_target_id,
+                execution_id=normalized_execution_id,
+            )
             await _retire_stale_progress_message(
                 service,
                 channel_id=channel_id,
@@ -1455,6 +1461,11 @@ async def handle_car_interrupt(
         clear_discord_turn_progress_reuse(
             service,
             thread_target_id=normalized_thread_target_id or "",
+        )
+        await clear_discord_turn_progress_leases(
+            service,
+            managed_thread_id=normalized_thread_target_id,
+            execution_id=normalized_execution_id,
         )
         await _retire_stale_progress_message(
             service,
@@ -1535,6 +1546,11 @@ async def handle_car_interrupt(
                 resolved_execution=resolved_execution,
                 thread_missing=False,
             )
+            await clear_discord_turn_progress_leases(
+                service,
+                managed_thread_id=current_thread.thread_target_id,
+                execution_id=normalized_execution_id,
+            )
             await _retire_stale_progress_message(
                 service,
                 channel_id=channel_id,
@@ -1560,6 +1576,18 @@ async def handle_car_interrupt(
             clear_discord_turn_progress_reuse(
                 service,
                 thread_target_id=current_thread.thread_target_id,
+            )
+        elif source_message_id:
+            note = _interrupt_resolution_note(
+                referenced_execution_id=normalized_execution_id,
+                running_execution=running_execution,
+                resolved_execution=execution_record,
+                thread_missing=False,
+            )
+            await clear_discord_turn_progress_leases(
+                service,
+                managed_thread_id=current_thread.thread_target_id,
+                execution_id=normalized_execution_id,
             )
         if recovered_lost_backend:
             await _retire_stale_progress_message(

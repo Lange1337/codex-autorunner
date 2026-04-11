@@ -10,6 +10,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Optional, Sequence
 
+from ...core.acp_lifecycle import (
+    coerce_mapping as _coerce_mapping,
+)
+from ...core.acp_lifecycle import (
+    session_update_content_summary as _session_update_content_summary,
+)
+from ...core.acp_lifecycle import (
+    should_map_missing_turn_id as _should_map_missing_turn_id,
+)
 from ...core.logging_utils import log_event
 from ...core.text_utils import _normalize_optional_text
 from .errors import (
@@ -75,14 +84,6 @@ _ACP_STDOUT_NOISE_PREFIXES = (
 )
 _ACP_STDOUT_BRACKETED_STATUS_RE = re.compile(r"^\[[^\]\s]{1,32}\]\s+(?![\[{])\S")
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
-# Hermes official ACP omits turn ids on these session-scoped updates, so CAR
-# binds them onto the active local turn for that session.
-_SESSION_TURN_ID_FALLBACK_METHODS = frozenset(
-    {
-        "session/update",
-        "session/request_permission",
-    }
-)
 
 
 @dataclass(frozen=True)
@@ -107,18 +108,14 @@ class _PromptState:
     replay_task: Optional[asyncio.Task[None]] = None
     request_task: Optional[asyncio.Task[Any]] = None
     request_started_at: Optional[float] = None
+    completion_source: Optional[str] = None
+    last_runtime_method: Optional[str] = None
     last_session_update_kind: Optional[str] = None
     last_session_update_excerpt: Optional[str] = None
     last_session_update_content_kind: Optional[str] = None
     last_session_update_part_types: tuple[str, ...] = ()
     last_session_update_text_length: Optional[int] = None
     last_session_update_at: Optional[float] = None
-
-
-def _coerce_mapping(value: Any) -> dict[str, Any]:
-    if isinstance(value, dict):
-        return dict(value)
-    return {}
 
 
 def _text_excerpt(value: Any, *, limit: int = 120) -> Optional[str]:
@@ -130,55 +127,6 @@ def _text_excerpt(value: Any, *, limit: int = 120) -> Optional[str]:
     if len(normalized) <= limit:
         return normalized
     return normalized[: limit - 3] + "..."
-
-
-def _extract_text_content(value: Any) -> str:
-    if isinstance(value, str):
-        return value
-    if isinstance(value, dict):
-        for key in ("text", "message"):
-            candidate = value.get(key)
-            if isinstance(candidate, str) and candidate:
-                return candidate
-        return _extract_text_content(value.get("content"))
-    if isinstance(value, list):
-        text_parts: list[str] = []
-        for item in value:
-            if isinstance(item, str) and item:
-                text_parts.append(item)
-                continue
-            if not isinstance(item, dict):
-                continue
-            item_type = _normalize_optional_text(item.get("type"))
-            if item_type and item_type not in {"text", "output_text", "message"}:
-                continue
-            text = _extract_text_content(item)
-            if text:
-                text_parts.append(text)
-        return "".join(text_parts)
-    return ""
-
-
-def _session_update_content_summary(update: dict[str, Any]) -> dict[str, Any]:
-    content = update.get("content")
-    part_types: list[str] = []
-    if isinstance(content, list):
-        for item in content:
-            if not isinstance(item, dict):
-                continue
-            item_type = _normalize_optional_text(item.get("type"))
-            if item_type:
-                part_types.append(item_type)
-    extracted_text = _extract_text_content(content)
-    if not extracted_text:
-        fallback_message = update.get("message")
-        if isinstance(fallback_message, str):
-            extracted_text = fallback_message
-    return {
-        "content_kind": type(content).__name__ if content is not None else "missing",
-        "content_part_types": tuple(part_types),
-        "text": extracted_text,
-    }
 
 
 def _stringify(value: Any) -> str:
@@ -867,6 +815,31 @@ class ACPClient:
                 task.add_done_callback(self._log_background_task_result)
         return state
 
+    async def _register_prompt_turn_alias(
+        self,
+        state: _PromptState,
+        alias_turn_id: Optional[str],
+    ) -> None:
+        normalized_alias = _normalize_optional_text(alias_turn_id)
+        if not normalized_alias or normalized_alias == state.turn_id:
+            return
+        existing = self._prompts.get(normalized_alias)
+        if existing is not None and existing is not state:
+            raise ACPProtocolError(
+                f"Official ACP turn alias '{normalized_alias}' collides with another prompt"
+            )
+        self._prompts[normalized_alias] = state
+        orphan_events = self._orphan_events.pop(normalized_alias, [])
+        if orphan_events:
+            await self._replay_orphan_prompt_events(state, orphan_events)
+        self._log_trace_event(
+            "acp.prompt.turn_alias_registered",
+            session_id=state.session_id,
+            turn_id=state.turn_id,
+            aliased_turn_id=normalized_alias,
+            **self._prompt_trace_fields(state),
+        )
+
     async def _replay_orphan_prompt_events(
         self,
         state: _PromptState,
@@ -894,12 +867,26 @@ class ACPClient:
         self,
         state: _PromptState,
         event: ACPTurnTerminalEvent,
+        *,
+        completion_source: Optional[str] = None,
     ) -> None:
         if state.closed:
             return
+        resolved_completion_source = completion_source or "terminal_event"
         state.closed = True
+        state.completion_source = resolved_completion_source
         if self._session_active_turns.get(state.session_id) == state.turn_id:
             self._session_active_turns.pop(state.session_id, None)
+        self._log_trace_event(
+            "acp.prompt.terminal_recorded",
+            session_id=state.session_id,
+            turn_id=state.turn_id,
+            status=event.status,
+            completion_source=resolved_completion_source,
+            error_message=event.error_message,
+            elapsed_ms=self._elapsed_ms(state.request_started_at),
+            **self._prompt_trace_fields(state),
+        )
         if not state.future.done():
             final_output = event.final_output or state.final_output
             state.future.set_result(
@@ -956,6 +943,26 @@ class ACPClient:
         if not isinstance(event, ACPTurnTerminalEvent):
             return
         await self._finalize_prompt_with_event(state, event)
+
+    async def _record_prompt_terminal_event(
+        self,
+        state: _PromptState,
+        event: ACPTurnTerminalEvent,
+        *,
+        completion_source: str,
+    ) -> None:
+        if state.closed:
+            return
+        self._note_prompt_trace_event(state, event)
+        state.events.append(event)
+        if event.final_output:
+            state.final_output = event.final_output
+        await state.queue.put(event)
+        await self._finalize_prompt_with_event(
+            state,
+            event,
+            completion_source=completion_source,
+        )
 
     async def _start_prompt_official(
         self,
@@ -1018,6 +1025,7 @@ class ACPClient:
                 )
             params: dict[str, Any] = {
                 "sessionId": state.session_id,
+                "messageId": state.turn_id,
                 "prompt": [{"type": "text", "text": prompt}],
             }
             if metadata:
@@ -1027,6 +1035,18 @@ class ACPClient:
                 params,
             )
         except (ACPError, asyncio.TimeoutError) as exc:
+            if state.closed:
+                self._log_trace_event(
+                    "acp.prompt.request_failed_reconciled",
+                    session_id=state.session_id,
+                    turn_id=state.turn_id,
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                    completion_source=state.completion_source or "terminal_event",
+                    elapsed_ms=self._elapsed_ms(state.request_started_at),
+                    **self._prompt_trace_fields(state),
+                )
+                return
             self._session_active_turns.pop(state.session_id, None)
             self._log_trace_event(
                 "acp.prompt.request_failed",
@@ -1042,10 +1062,13 @@ class ACPClient:
             await state.queue.put(_QUEUE_SENTINEL)
             return
         result_payload = _coerce_mapping(result)
+        response_turn_id = self._official_prompt_response_turn_id(result_payload)
+        await self._register_prompt_turn_alias(state, response_turn_id)
         self._log_trace_event(
             "acp.prompt.request_returned",
             session_id=state.session_id,
             turn_id=state.turn_id,
+            response_turn_id=response_turn_id,
             status=self._official_prompt_terminal_status(result_payload),
             stop_reason=_normalize_optional_text(
                 result_payload.get("stopReason") or result_payload.get("stop_reason")
@@ -1054,20 +1077,42 @@ class ACPClient:
             elapsed_ms=self._elapsed_ms(state.request_started_at),
             **self._prompt_trace_fields(state),
         )
-        await self._record_prompt_event(
+        if state.closed:
+            self._log_trace_event(
+                "acp.prompt.request_reconciled",
+                session_id=state.session_id,
+                turn_id=state.turn_id,
+                response_turn_id=response_turn_id,
+                status=self._official_prompt_terminal_status(result_payload),
+                stop_reason=_normalize_optional_text(
+                    result_payload.get("stopReason")
+                    or result_payload.get("stop_reason")
+                ),
+                completion_source=state.completion_source or "terminal_event",
+                elapsed_ms=self._elapsed_ms(state.request_started_at),
+                **self._prompt_trace_fields(state),
+            )
+            return
+        terminal_event = normalize_notification(
+            {
+                "method": self._official_prompt_terminal_method(result),
+                "params": {
+                    "sessionId": state.session_id,
+                    "turnId": state.turn_id,
+                    "status": self._official_prompt_terminal_status(result),
+                    "finalOutput": state.final_output,
+                    "message": self._official_prompt_terminal_error(result),
+                },
+            }
+        )
+        if not isinstance(terminal_event, ACPTurnTerminalEvent):
+            raise ACPProtocolError(
+                "Official ACP prompt return did not normalize terminally"
+            )
+        await self._record_prompt_terminal_event(
             state,
-            normalize_notification(
-                {
-                    "method": self._official_prompt_terminal_method(result),
-                    "params": {
-                        "sessionId": state.session_id,
-                        "turnId": state.turn_id,
-                        "status": self._official_prompt_terminal_status(result),
-                        "finalOutput": state.final_output,
-                        "message": self._official_prompt_terminal_error(result),
-                    },
-                }
-            ),
+            terminal_event,
+            completion_source="prompt_return",
         )
 
     def _official_prompt_terminal_method(self, payload: Any) -> str:
@@ -1077,6 +1122,15 @@ class ACPClient:
         if status == "failed":
             return "prompt/failed"
         return "prompt/completed"
+
+    def _official_prompt_response_turn_id(self, payload: Any) -> Optional[str]:
+        result = _coerce_mapping(payload)
+        return _normalize_optional_text(
+            result.get("userMessageId")
+            or result.get("user_message_id")
+            or result.get("turnId")
+            or result.get("turn_id")
+        )
 
     def _official_prompt_terminal_status(self, payload: Any) -> str:
         result = _coerce_mapping(payload)
@@ -1102,8 +1156,6 @@ class ACPClient:
 
     def _message_with_mapped_turn_id(self, message: dict[str, Any]) -> dict[str, Any]:
         method = _normalize_optional_text(message.get("method"))
-        if method not in _SESSION_TURN_ID_FALLBACK_METHODS:
-            return message
         params = _coerce_mapping(message.get("params"))
         if _normalize_optional_text(params.get("turnId") or params.get("turn_id")):
             return message
@@ -1111,6 +1163,8 @@ class ACPClient:
             params.get("sessionId") or params.get("session_id")
         )
         if not session_id:
+            return message
+        if not _should_map_missing_turn_id(method or "", params):
             return message
         turn_id = self._session_active_turns.get(session_id)
         if not turn_id:
@@ -1146,6 +1200,7 @@ class ACPClient:
 
     def _prompt_trace_fields(self, state: _PromptState) -> dict[str, Any]:
         return {
+            "last_runtime_method": state.last_runtime_method,
             "last_session_update_kind": state.last_session_update_kind,
             "last_session_update_excerpt": state.last_session_update_excerpt,
             "last_session_update_content_kind": state.last_session_update_content_kind,
@@ -1157,6 +1212,7 @@ class ACPClient:
         }
 
     def _note_prompt_trace_event(self, state: _PromptState, event: ACPEvent) -> None:
+        state.last_runtime_method = _normalize_optional_text(event.method)
         if event.method != "session/update":
             return
         update = _coerce_mapping(event.payload.get("update"))

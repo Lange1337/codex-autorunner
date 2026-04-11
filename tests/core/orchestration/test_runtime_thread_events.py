@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.acp_lifecycle_corpus import load_acp_lifecycle_corpus
+
 from codex_autorunner.core.orchestration.runtime_thread_events import (
     RuntimeThreadRunEventState,
     normalize_runtime_thread_raw_event,
@@ -18,6 +20,50 @@ from codex_autorunner.core.ports.run_event import (
     ToolResult,
 )
 from codex_autorunner.core.sse import format_sse
+
+
+async def test_normalize_runtime_thread_raw_event_shared_lifecycle_corpus() -> None:
+    for case in load_acp_lifecycle_corpus():
+        state = RuntimeThreadRunEventState()
+        raw = dict(case["raw"])
+        expected = dict(case["expected"])
+
+        events = await normalize_runtime_thread_raw_event(raw, state)
+
+        if expected["normalized_kind"] == "turn_terminal":
+            if expected["runtime_terminal_status"] == "ok":
+                assert state.completed_seen is True
+                if expected["assistant_text"] and raw["method"] in {
+                    "prompt/completed",
+                    "turn/completed",
+                }:
+                    assert state.best_assistant_text() == expected["assistant_text"]
+            elif expected["runtime_terminal_status"] == "error":
+                assert isinstance(events[0], Failed)
+                assert events[0].error_message == expected["error_message"]
+                assert state.last_error_message == expected["error_message"]
+        elif expected["normalized_kind"] == "output_delta":
+            assert isinstance(events[0], OutputDelta)
+            assert events[0].content == expected["output_delta"]
+            assert state.best_assistant_text() == expected["output_delta"]
+        elif expected["normalized_kind"] == "progress":
+            if (
+                raw["method"] == "session.status"
+                and expected["session_status"] == "idle"
+            ):
+                assert events == []
+                assert state.completed_seen is True
+            else:
+                assert isinstance(events[0], RunNotice)
+                expected_message = (
+                    f"agent {expected['progress_message']}"
+                    if raw["method"] == "session.status"
+                    else expected["progress_message"]
+                )
+                assert events[0].message == expected_message
+        elif expected["normalized_kind"] == "permission_requested":
+            assert isinstance(events[0], ApprovalRequested)
+            assert events[0].request_id == expected["permission_request_id"]
 
 
 async def test_normalize_runtime_thread_raw_event_handles_codex_app_server_updates() -> (
@@ -100,6 +146,8 @@ async def test_normalize_runtime_thread_raw_event_handles_codex_app_server_updat
     assert isinstance(output[0], OutputDelta)
     assert output[0].content == "partial reply"
     assert state.best_assistant_text() == "partial reply"
+    assert state.last_runtime_method == "item/agentMessage/delta"
+    assert isinstance(state.last_progress_at, str)
 
 
 async def test_normalize_runtime_thread_raw_event_surfaces_generic_error_notifications() -> (
@@ -123,6 +171,8 @@ async def test_normalize_runtime_thread_raw_event_surfaces_generic_error_notific
     assert isinstance(output[0], Failed)
     assert output[0].error_message == "Auth required"
     assert state.last_error_message == "Auth required"
+    assert state.last_runtime_method == "error"
+    assert isinstance(state.last_progress_at, str)
 
 
 async def test_normalize_runtime_thread_raw_event_marks_only_successful_turn_completed() -> (
@@ -174,6 +224,8 @@ async def test_normalize_runtime_thread_raw_event_emits_progress_for_session_sta
     assert working[0].kind == "progress"
     assert working[0].message == "agent running"
     assert working_state.completed_seen is False
+    assert working_state.last_runtime_method == "session.status"
+    assert isinstance(working_state.last_progress_at, str)
 
     idle_like_state = RuntimeThreadRunEventState()
     idle_like = await normalize_runtime_thread_raw_event(
@@ -1224,6 +1276,36 @@ async def test_normalize_runtime_thread_raw_event_reads_top_level_info_for_role_
     assert isinstance(resolved[0], OutputDelta)
     assert resolved[0].content == "hello"
     assert state.best_assistant_text() == "hello"
+
+
+async def test_normalize_runtime_thread_raw_event_reads_agent_message_item_on_message_completed() -> (
+    None
+):
+    state = RuntimeThreadRunEventState()
+
+    resolved = await normalize_runtime_thread_raw_event(
+        format_sse(
+            "app-server",
+            {
+                "message": {
+                    "method": "message.completed",
+                    "params": {
+                        "info": {"id": "assistant-item", "role": "assistant"},
+                        "item": {
+                            "type": "agentMessage",
+                            "text": "final reply from item",
+                        },
+                    },
+                }
+            },
+        ),
+        state,
+    )
+
+    assert len(resolved) == 1
+    assert isinstance(resolved[0], OutputDelta)
+    assert resolved[0].content == "final reply from item"
+    assert state.best_assistant_text() == "final reply from item"
 
 
 async def test_message_delta_with_reasoning_part_type_is_dropped() -> None:

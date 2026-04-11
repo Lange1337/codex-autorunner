@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 
 import pytest
+from tests.acp_lifecycle_corpus import load_acp_lifecycle_corpus
 
 from codex_autorunner.agents.acp import (
     ACPClient,
@@ -45,6 +47,25 @@ def test_client_maps_session_scoped_official_events_without_turn_id(
     assert message["params"]["turnId"] == "turn-2"
 
 
+@pytest.mark.parametrize(
+    ("case"),
+    load_acp_lifecycle_corpus(),
+    ids=[case["name"] for case in load_acp_lifecycle_corpus()],
+)
+def test_client_maps_shared_lifecycle_fixtures_without_turn_id(
+    case: dict[str, object],
+) -> None:
+    client = ACPClient(fixture_command("official"))
+    client._session_active_turns["session-1"] = "turn-2"
+    message = dict(case["raw"])  # type: ignore[index]
+    expected = dict(case["expected"])  # type: ignore[index]
+
+    mapped = client._message_with_mapped_turn_id(message)
+
+    expected_turn_id = "turn-2" if expected["uses_turn_id_fallback"] else None
+    assert mapped.get("params", {}).get("turnId") == expected_turn_id
+
+
 @pytest.mark.asyncio
 async def test_client_initialize_and_session_roundtrip(tmp_path: Path) -> None:
     client = ACPClient(fixture_command("official"), cwd=tmp_path)
@@ -58,10 +79,9 @@ async def test_client_initialize_and_session_roundtrip(tmp_path: Path) -> None:
         listed = await client.list_sessions()
 
         assert initialize.server_name == "fake-hermes"
-        assert status == {
-            "initialized": True,
-            "initializedNotification": True,
-        }
+        assert status["initialized"] is True
+        assert status["initializedNotification"] is True
+        assert status["lastOfficialPromptParams"] is None
         assert created.session_id == loaded.session_id
         assert [session.session_id for session in listed] == [created.session_id]
     finally:
@@ -200,6 +220,195 @@ async def test_client_official_prompt_hang_tracks_last_session_update_state(
 
 
 @pytest.mark.asyncio
+async def test_client_official_terminal_event_can_complete_before_request_returns(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = ACPClient(
+        fixture_command("official_terminal_before_return"),
+        cwd=tmp_path,
+    )
+    try:
+        caplog.set_level("INFO")
+        created = await client.create_session(cwd=str(tmp_path))
+        handle = await client.start_prompt(created.session_id, "Reply with exactly OK.")
+        result = await asyncio.wait_for(handle.wait(), timeout=0.4)
+        state = client._prompts[handle.turn_id]
+        assert state.request_task is not None
+        await asyncio.wait_for(state.request_task, timeout=0.4)
+        payloads = [json.loads(record.getMessage()) for record in caplog.records]
+
+        assert result.status == "completed"
+        assert result.final_output == "fixture reply"
+        assert [event.kind for event in handle.snapshot_events()] == [
+            "turn_started",
+            "progress",
+            "output_delta",
+            "turn_terminal",
+        ]
+        assert any(
+            payload.get("event") == "acp.prompt.terminal_recorded"
+            and payload.get("completion_source") == "terminal_event"
+            for payload in payloads
+        )
+        assert any(
+            payload.get("event") == "acp.prompt.request_returned"
+            and payload.get("completion_source") == "prompt_return"
+            for payload in payloads
+        )
+        assert any(
+            payload.get("last_runtime_method") == "prompt/completed"
+            for payload in payloads
+        )
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_client_official_terminal_without_turn_id_can_complete_before_request_returns(
+    tmp_path: Path,
+) -> None:
+    client = ACPClient(
+        fixture_command("official_terminal_without_turn_id"),
+        cwd=tmp_path,
+    )
+    try:
+        created = await client.create_session(cwd=str(tmp_path))
+        handle = await client.start_prompt(created.session_id, "Reply with exactly OK.")
+        result = await asyncio.wait_for(handle.wait(), timeout=0.4)
+        state = client._prompts[handle.turn_id]
+
+        assert result.status == "completed"
+        assert result.final_output == "fixture reply"
+        assert state.request_task is not None
+        await asyncio.wait_for(state.request_task, timeout=0.4)
+        assert [event.kind for event in handle.snapshot_events()] == [
+            "turn_started",
+            "progress",
+            "output_delta",
+            "turn_terminal",
+        ]
+        assert handle.snapshot_events()[-1].turn_id == handle.turn_id
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_client_official_session_status_idle_can_complete_before_request_returns(
+    tmp_path: Path,
+) -> None:
+    client = ACPClient(
+        fixture_command("official_session_status_idle_before_return"),
+        cwd=tmp_path,
+    )
+    try:
+        created = await client.create_session(cwd=str(tmp_path))
+        handle = await client.start_prompt(created.session_id, "Reply with exactly OK.")
+        result = await asyncio.wait_for(handle.wait(), timeout=0.4)
+        state = client._prompts[handle.turn_id]
+
+        assert result.status == "completed"
+        assert result.final_output == "fixture reply"
+        assert state.request_task is not None
+        await asyncio.wait_for(state.request_task, timeout=0.4)
+        assert [event.method for event in handle.snapshot_events()] == [
+            "prompt/started",
+            "session/update",
+            "session/update",
+            "session.status",
+        ]
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_client_official_prompt_sends_message_id_and_replays_server_turn_alias(
+    tmp_path: Path,
+) -> None:
+    client = ACPClient(
+        fixture_command("official_server_assigned_turn_id_before_return"),
+        cwd=tmp_path,
+    )
+    try:
+        created = await client.create_session(cwd=str(tmp_path))
+        handle = await client.start_prompt(created.session_id, "Reply with exactly OK.")
+        result = await asyncio.wait_for(handle.wait(), timeout=0.4)
+        status = await client.request("fixture/status", {})
+
+        assert status["lastOfficialPromptParams"]["messageId"] == handle.turn_id
+        assert result.status == "completed"
+        assert result.final_output == "fixture reply"
+        assert any(
+            getattr(event, "kind", None) == "turn_terminal"
+            and getattr(event, "turn_id", None) == "server-turn-1"
+            for event in handle.snapshot_events()
+        )
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_client_official_request_can_return_after_terminal_event(
+    tmp_path: Path,
+) -> None:
+    client = ACPClient(
+        fixture_command("official_request_return_after_terminal"),
+        cwd=tmp_path,
+    )
+    try:
+        created = await client.create_session(cwd=str(tmp_path))
+        handle = await client.start_prompt(created.session_id, "Reply with exactly OK.")
+        result = await asyncio.wait_for(handle.wait(), timeout=0.4)
+        state = client._prompts[handle.turn_id]
+
+        assert result.status == "completed"
+        assert result.final_output == "fixture reply"
+        assert state.request_task is not None
+        assert state.request_task.done() is False
+
+        await asyncio.wait_for(state.request_task, timeout=0.5)
+        assert [event.kind for event in handle.snapshot_events()] == [
+            "turn_started",
+            "progress",
+            "output_delta",
+            "turn_terminal",
+        ]
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_client_official_terminal_event_can_complete_without_request_return(
+    tmp_path: Path,
+) -> None:
+    client = ACPClient(
+        fixture_command("official_terminal_without_request_return"),
+        cwd=tmp_path,
+    )
+    try:
+        created = await client.create_session(cwd=str(tmp_path))
+        handle = await client.start_prompt(created.session_id, "Reply with exactly OK.")
+        result = await asyncio.wait_for(handle.wait(), timeout=0.4)
+        state = client._prompts[handle.turn_id]
+
+        assert result.status == "completed"
+        assert result.final_output == "fixture reply"
+        assert state.request_task is not None
+        assert state.request_task.done() is False
+        assert any(
+            method == "session/prompt" for method in client._pending_methods.values()
+        )
+        assert [event.kind for event in handle.snapshot_events()] == [
+            "turn_started",
+            "progress",
+            "output_delta",
+            "turn_terminal",
+        ]
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
 async def test_client_logs_official_prompt_lifecycle_trace(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
@@ -221,6 +430,7 @@ async def test_client_logs_official_prompt_lifecycle_trace(
         assert f'"session_id":"{created.session_id}"' in caplog.text
         assert f'"turn_id":"{handle.turn_id}"' in caplog.text
         assert '"completion_source":"prompt_return"' in caplog.text
+        assert '"last_runtime_method":"' in caplog.text
         assert '"last_session_update_kind":"agent_message_chunk"' in caplog.text
     finally:
         await client.close()
