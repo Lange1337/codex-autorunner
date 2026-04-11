@@ -1922,6 +1922,70 @@ async def test_service_enforces_allowlist_and_denies_autocomplete_with_empty_cho
         await store.close()
 
 
+@pytest.mark.anyio
+async def test_rejected_interaction_skips_submission_order(tmp_path: Path) -> None:
+    store = DiscordStateStore(tmp_path / "discord_state.sqlite3")
+    await store.initialize()
+    rest = _FakeRest()
+    service = DiscordBotService(
+        _config(tmp_path, allow_user_ids=frozenset({"user-1"})),
+        logger=logging.getLogger("test"),
+        rest_client=rest,
+        gateway_client=_FakeGateway([]),
+        state_store=store,
+        outbox_manager=_FakeOutboxManager(),
+    )
+    skip_submission_order = MagicMock()
+    service._command_runner.skip_submission_order = (  # type: ignore[method-assign]
+        skip_submission_order
+    )
+
+    try:
+        payload = _interaction(
+            name="bind",
+            options=[{"type": 3, "name": "workspace", "value": str(tmp_path)}],
+            user_id="unauthorized",
+        )
+        payload["__car_dispatch_order"] = 7
+        await service._on_dispatch("INTERACTION_CREATE", payload)
+        skip_submission_order.assert_called_once_with(7)
+    finally:
+        await service._shutdown()
+        await store.close()
+
+
+@pytest.mark.anyio
+async def test_pre_submit_failure_skips_submission_order(tmp_path: Path) -> None:
+    store = DiscordStateStore(tmp_path / "discord_state.sqlite3")
+    await store.initialize()
+    rest = _FakeRest()
+    service = DiscordBotService(
+        _config(tmp_path, allow_user_ids=frozenset({"user-1"})),
+        logger=logging.getLogger("test"),
+        rest_client=rest,
+        gateway_client=_FakeGateway([]),
+        state_store=store,
+        outbox_manager=_FakeOutboxManager(),
+    )
+    skip_submission_order = MagicMock()
+    service._command_runner.skip_submission_order = (  # type: ignore[method-assign]
+        skip_submission_order
+    )
+    service._persist_runtime_interaction = AsyncMock(  # type: ignore[method-assign]
+        side_effect=RuntimeError("persist failed")
+    )
+
+    try:
+        payload = _interaction(name="status", options=[])
+        payload["__car_dispatch_order"] = 8
+        with pytest.raises(RuntimeError, match="persist failed"):
+            await service._on_dispatch("INTERACTION_CREATE", payload)
+        skip_submission_order.assert_called_once_with(8)
+    finally:
+        await service._shutdown()
+        await store.close()
+
+
 @pytest.mark.slow
 @pytest.mark.anyio
 async def test_service_bind_then_status_updates_and_reads_store(tmp_path: Path) -> None:
@@ -1964,10 +2028,13 @@ async def test_service_bind_then_status_updates_and_reads_store(tmp_path: Path) 
         bind_payload = rest.interaction_responses[0]["payload"]
         assert bind_payload["type"] == 5
         assert bind_payload["data"]["flags"] == 64
-        assert len(rest.followup_messages) == 2
+        assert len(rest.followup_messages) in (2, 3)
         bind_content = rest.followup_messages[0]["payload"]["content"].lower()
         assert "bound this channel" in bind_content
-        status_content = rest.followup_messages[1]["payload"]["content"].lower()
+        status_content = rest.followup_messages[-1]["payload"]["content"].lower()
+        if len(rest.followup_messages) == 3:
+            queue_wait_content = rest.followup_messages[1]["payload"]["content"].lower()
+            assert "queued behind /car bind in this channel" in queue_wait_content
         assert "channel is bound" in status_content
         assert "policy mode:" in status_content
     finally:
@@ -2032,8 +2099,11 @@ async def test_service_status_reports_effective_collaboration_policy(
         await service.run_forever()
         assert len(rest.interaction_responses) >= 1
         assert rest.interaction_responses[0]["payload"]["type"] == 5
-        assert len(rest.followup_messages) == 2
-        status_payload = rest.followup_messages[1]["payload"]["content"]
+        assert len(rest.followup_messages) in (2, 3)
+        status_payload = rest.followup_messages[-1]["payload"]["content"]
+        if len(rest.followup_messages) == 3:
+            queue_wait_content = rest.followup_messages[1]["payload"]["content"].lower()
+            assert "queued behind /car bind in this channel" in queue_wait_content
         lowered = status_payload.lower()
         assert "policy mode: active" in lowered
         assert "policy plain-text trigger: mentions" in lowered

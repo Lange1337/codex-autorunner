@@ -3957,6 +3957,11 @@ class DiscordBotService:
     async def _on_dispatch(self, event_type: str, payload: dict[str, Any]) -> None:
         if event_type == "INTERACTION_CREATE":
             dispatch_started_at = time.monotonic()
+            submission_order = (
+                payload.get("__car_dispatch_order")
+                if isinstance(payload.get("__car_dispatch_order"), int)
+                else None
+            )
             ingress_result = await self._ingress.process_raw_payload(payload)
             if not ingress_result.accepted:
                 if ingress_result.context is not None:
@@ -3996,9 +4001,11 @@ class DiscordBotService:
                             ctx.interaction_token,
                             "This Discord command is not authorized for this channel/user/guild.",
                         )
+                self._command_runner.skip_submission_order(submission_order)
                 return
             if ingress_result.context is not None:
                 ctx = ingress_result.context
+                submitted_to_runner = False
                 try:
                     envelope = await self._build_runtime_interaction_envelope(ctx)
                     log_event(
@@ -4081,11 +4088,15 @@ class DiscordBotService:
                         resource_keys=envelope.resource_keys,
                         conversation_id=envelope.conversation_id,
                         queue_wait_ack_policy=envelope.queue_wait_ack_policy,
+                        submission_order=submission_order,
                     )
+                    submitted_to_runner = True
                     # Let the admitted interaction task start before the next gateway
                     # interaction is processed so deferred command ordering stays stable.
                     await asyncio.sleep(0)
                 finally:
+                    if not submitted_to_runner:
+                        self._command_runner.skip_submission_order(submission_order)
                     await self._release_interaction_ingress(ctx.interaction_id)
             return
         if event_type == "MESSAGE_CREATE":
