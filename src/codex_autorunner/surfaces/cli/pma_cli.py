@@ -769,6 +769,8 @@ class _ManagedThreadSendResponse:
     detail: str
     error: str
     next_step: str
+    notification_mode: str
+    notification_lane: str
 
     @classmethod
     def from_http(
@@ -790,6 +792,17 @@ class _ManagedThreadSendResponse:
             detail=str(payload.get("detail") or "").strip(),
             error=str(payload.get("error") or "").strip(),
             next_step=str(payload.get("next_step") or "").strip(),
+            notification_mode=str(
+                ((payload.get("notification") or {}).get("mode") or "")
+            ).strip(),
+            notification_lane=str(
+                (
+                    ((payload.get("notification") or {}).get("subscription") or {}).get(
+                        "lane_id"
+                    )
+                    or ""
+                )
+            ).strip(),
         )
 
     @property
@@ -808,6 +821,10 @@ class _ManagedThreadSendResponse:
             line += f" active_managed_turn_id={self.active_managed_turn_id}"
         if self.queue_depth is not None:
             line += f" queue_depth={self.queue_depth}"
+        if self.notification_mode:
+            line += f" wakeup={self.notification_mode}"
+            if self.notification_lane:
+                line += f" lane={self.notification_lane}"
         return line
 
     def completion_line(self) -> str:
@@ -2013,7 +2030,7 @@ def pma_thread_send(
     watch: bool = typer.Option(
         False,
         "--watch",
-        help="Follow tail/events until the turn reaches terminal state",
+        help="Opt into synchronous foreground tailing until terminal state",
     ),
     notify_on: Optional[str] = typer.Option(
         None,
@@ -2045,20 +2062,19 @@ def pma_thread_send(
     normalized_if_busy = (if_busy or "").strip().lower() or "queue"
     if normalized_if_busy not in {"queue", "interrupt", "reject"}:
         raise typer.BadParameter("if-busy must be queue, interrupt, or reject")
-    request_payload = _ManagedThreadSendRequest(
-        message=message_body,
-        busy_policy=normalized_if_busy,
-        defer_execution=should_defer,
-        model=model,
-        reasoning=reasoning,
-        notify_on=normalized_notify_on,
-        notify_lane=notify_lane,
-        notify_once=notify_once,
-    )
-
     hub_root = _resolve_hub_path(path)
     try:
         config = load_hub_config(hub_root)
+        request_payload = _ManagedThreadSendRequest(
+            message=message_body,
+            busy_policy=normalized_if_busy,
+            defer_execution=should_defer,
+            model=model,
+            reasoning=reasoning,
+            notify_on=normalized_notify_on,
+            notify_lane=notify_lane,
+            notify_once=notify_once,
+        )
         status_code, data = _request_json_with_status(
             "POST",
             _build_pma_url(config, f"/threads/{managed_thread_id}/messages"),
