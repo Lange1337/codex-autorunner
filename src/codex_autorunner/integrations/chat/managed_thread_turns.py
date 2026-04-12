@@ -13,6 +13,7 @@ from ...agents.base import (
     harness_supports_progress_event_stream,
 )
 from ...core.logging_utils import log_event
+from ...core.orchestration.cold_trace_store import ColdTraceWriter
 from ...core.orchestration.models import MessageRequest
 from ...core.orchestration.runtime_thread_events import (
     RuntimeThreadRunEventState,
@@ -29,7 +30,10 @@ from ...core.orchestration.runtime_threads import (
     begin_next_queued_runtime_thread_execution,
     begin_runtime_thread_execution,
 )
-from ...core.orchestration.turn_timeline import persist_turn_timeline
+from ...core.orchestration.turn_timeline import (
+    append_turn_events_to_cold_trace,
+    persist_turn_timeline,
+)
 from ...core.pma_thread_store import PmaThreadStore
 from ...core.pma_transcripts import PmaTranscriptStore
 from ...core.ports.run_event import (
@@ -886,8 +890,7 @@ def ensure_managed_thread_queue_worker(
                     raise
             else:
                 logger.exception(
-                    "Managed-thread queued execution failed "
-                    "(thread=%s execution=%s)",
+                    "Managed-thread queued execution failed (thread=%s execution=%s)",
                     started_execution.thread.thread_target_id,
                     started_execution.execution.execution_id,
                 )
@@ -1132,6 +1135,24 @@ async def finalize_managed_thread_execution(
     timeline_events: list[Any] = []
     live_timeline_count = 0
     live_timeline_error_logged = False
+    final_trace_manifest_id: Optional[str] = None
+
+    cold_trace_writer: Optional[ColdTraceWriter] = None
+    try:
+        cold_trace_writer = ColdTraceWriter(
+            hub_root=state_root,
+            execution_id=managed_turn_id,
+            backend_thread_id=current_backend_thread_id or None,
+            backend_turn_id=started.execution.backend_id,
+        ).open()
+    except Exception:
+        logger.warning(
+            "%s Failed to open cold trace writer (thread=%s turn=%s)",
+            surface.log_label,
+            managed_thread_id,
+            managed_turn_id,
+            exc_info=True,
+        )
 
     log_event(
         logger,
@@ -1153,6 +1174,16 @@ async def finalize_managed_thread_execution(
         nonlocal live_timeline_count
         nonlocal live_timeline_error_logged
         if not events:
+            return
+        if cold_trace_writer is None:
+            if not live_timeline_error_logged:
+                live_timeline_error_logged = True
+                logger.error(
+                    "%s Skipping live timeline persistence without a cold trace writer (thread=%s turn=%s)",
+                    surface.log_label,
+                    managed_thread_id,
+                    managed_turn_id,
+                )
             return
         try:
             persist_turn_timeline(
@@ -1176,6 +1207,7 @@ async def finalize_managed_thread_execution(
                 ),
                 events=events,
                 start_index=live_timeline_count + 1,
+                cold_trace_writer=cold_trace_writer,
             )
         except Exception:
             if not live_timeline_error_logged:
@@ -1188,6 +1220,74 @@ async def finalize_managed_thread_execution(
                 )
         else:
             live_timeline_count += len(events)
+
+    def _persist_final_timeline_with_cold_trace(
+        *,
+        metadata: dict[str, Any],
+        events: list[Any],
+    ) -> Optional[str]:
+        manifest_id = str(metadata.get("trace_manifest_id") or "").strip() or None
+        if manifest_id is None:
+            final_writer: Optional[ColdTraceWriter] = cold_trace_writer
+            if final_writer is None:
+                try:
+                    final_writer = ColdTraceWriter(
+                        hub_root=state_root,
+                        execution_id=managed_turn_id,
+                        backend_thread_id=current_backend_thread_id or None,
+                        backend_turn_id=(
+                            outcome.backend_turn_id or started.execution.backend_id
+                        ),
+                    ).open()
+                except Exception:
+                    logger.warning(
+                        "%s Failed to open final cold trace writer (thread=%s turn=%s)",
+                        surface.log_label,
+                        managed_thread_id,
+                        managed_turn_id,
+                        exc_info=True,
+                    )
+                    final_writer = None
+            if final_writer is not None:
+                try:
+                    append_turn_events_to_cold_trace(final_writer, events=events)
+                    manifest_id = final_writer.finalize().trace_id
+                except Exception:
+                    logger.warning(
+                        "%s Failed to persist final cold trace (thread=%s turn=%s)",
+                        surface.log_label,
+                        managed_thread_id,
+                        managed_turn_id,
+                        exc_info=True,
+                    )
+                finally:
+                    final_writer.close()
+
+        try:
+            persist_turn_timeline(
+                state_root,
+                execution_id=managed_turn_id,
+                target_kind="thread_target",
+                target_id=managed_thread_id,
+                repo_id=str(current_thread_row.get("repo_id") or "").strip() or None,
+                resource_kind=(
+                    str(current_thread_row.get("resource_kind") or "").strip() or None
+                ),
+                resource_id=(
+                    str(current_thread_row.get("resource_id") or "").strip() or None
+                ),
+                metadata=metadata
+                | ({"trace_manifest_id": manifest_id} if manifest_id else {}),
+                events=events,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to persist %s thread timeline (thread=%s turn=%s)",
+                surface.log_label,
+                managed_thread_id,
+                managed_turn_id,
+            )
+        return manifest_id
 
     stream_backend_thread_id = current_backend_thread_id
     stream_backend_turn_id = str(started.execution.backend_id or "").strip()
@@ -1437,35 +1537,40 @@ async def finalize_managed_thread_execution(
                 exc_info=True,
             )
 
-    try:
-        persist_turn_timeline(
-            state_root,
-            execution_id=managed_turn_id,
-            target_kind="thread_target",
-            target_id=managed_thread_id,
-            repo_id=str(current_thread_row.get("repo_id") or "").strip() or None,
-            resource_kind=(
-                str(current_thread_row.get("resource_kind") or "").strip() or None
-            ),
-            resource_id=(
-                str(current_thread_row.get("resource_id") or "").strip() or None
-            ),
-            metadata=_surface_metadata(
-                started,
-                surface,
-                backend_thread_id=current_backend_thread_id or None,
-                backend_turn_id=outcome.backend_turn_id or started.execution.backend_id,
-                status=outcome.status,
-            ),
-            events=timeline_events,
+    if cold_trace_writer is not None and live_timeline_count > 0:
+        try:
+            append_turn_events_to_cold_trace(
+                cold_trace_writer,
+                events=timeline_events[live_timeline_count:],
+            )
+            final_trace_manifest_id = cold_trace_writer.finalize().trace_id
+        except Exception:
+            logger.warning(
+                "%s Failed to finalize cold trace (thread=%s turn=%s)",
+                surface.log_label,
+                managed_thread_id,
+                managed_turn_id,
+                exc_info=True,
+            )
+        finally:
+            cold_trace_writer.close()
+            cold_trace_writer = None
+
+    final_trace_manifest_id = _persist_final_timeline_with_cold_trace(
+        metadata=_surface_metadata(
+            started,
+            surface,
+            backend_thread_id=current_backend_thread_id or None,
+            backend_turn_id=outcome.backend_turn_id or started.execution.backend_id,
+            status=outcome.status,
         )
-    except Exception:
-        logger.exception(
-            "Failed to persist %s thread timeline (thread=%s turn=%s)",
-            surface.log_label,
-            managed_thread_id,
-            managed_turn_id,
-        )
+        | (
+            {"trace_manifest_id": final_trace_manifest_id}
+            if final_trace_manifest_id
+            else {}
+        ),
+        events=timeline_events,
+    )
 
     resolved_assistant_text = (
         outcome.assistant_text or event_state.best_assistant_text()

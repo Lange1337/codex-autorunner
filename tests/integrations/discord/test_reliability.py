@@ -465,6 +465,19 @@ def _make_ctx_with_timing(
     return ctx, payload
 
 
+async def _wait_for_runner_idle(
+    runner: CommandRunner,
+    *,
+    attempts: int = 100,
+    delay_seconds: float = 0.01,
+) -> None:
+    for _ in range(attempts):
+        if runner.active_task_count == 0:
+            return
+        await asyncio.sleep(delay_seconds)
+    pytest.fail(f"runner did not become idle within {attempts * delay_seconds:.2f}s")
+
+
 @pytest.mark.anyio
 async def test_ingress_completes_within_ack_window() -> None:
     """Ingress (normalize + authz + ack) must complete well within
@@ -707,6 +720,12 @@ async def test_execution_timing_recorded_in_context() -> None:
     """After execution, the IngressContext must have execution_started_at
     and execution_finished_at set."""
     service = _FakeService()
+    handler_finished = asyncio.Event()
+
+    async def fast_handler(*args: Any, **kwargs: Any) -> None:
+        handler_finished.set()
+
+    service._handle_car_command.side_effect = fast_handler
     runner = CommandRunner(
         service,
         config=RunnerConfig(timeout_seconds=5.0),
@@ -718,7 +737,8 @@ async def test_execution_timing_recorded_in_context() -> None:
     assert ctx.timing.execution_finished_at is None
 
     runner.submit(ctx, payload)
-    await asyncio.sleep(0.05)
+    await asyncio.wait_for(handler_finished.wait(), timeout=1.0)
+    await _wait_for_runner_idle(runner)
 
     assert ctx.timing.execution_started_at is not None
     assert ctx.timing.execution_finished_at is not None
@@ -731,6 +751,12 @@ async def test_full_lifecycle_timing_chain() -> None:
     interaction_created_at <= ingress_started <= authz <= ack <= ingress_finished
     <= execution_started <= execution_finished."""
     service = _FakeService()
+    handler_finished = asyncio.Event()
+
+    async def fast_handler(*args: Any, **kwargs: Any) -> None:
+        handler_finished.set()
+
+    service._handle_car_command.side_effect = fast_handler
     runner = CommandRunner(
         service,
         config=RunnerConfig(timeout_seconds=5.0),
@@ -751,7 +777,8 @@ async def test_full_lifecycle_timing_chain() -> None:
     )
 
     runner.submit(ctx, payload)
-    await asyncio.sleep(0.05)
+    await asyncio.wait_for(handler_finished.wait(), timeout=1.0)
+    await _wait_for_runner_idle(runner)
 
     t = ctx.timing
     assert t.interaction_created_at is not None
