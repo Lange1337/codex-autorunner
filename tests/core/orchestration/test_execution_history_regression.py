@@ -840,6 +840,10 @@ class TestCompactionAndRetentionAtScale:
 
         num_old = 15
         num_new = 5
+        recent_started_at = (
+            datetime.now(timezone.utc) - timedelta(minutes=10)
+        ).replace(microsecond=0)
+        recent_finished_at = recent_started_at + timedelta(minutes=5)
         for i in range(num_old):
             eid = f"exec-old-{i:03d}"
             rows = _build_legacy_timeline_rows(
