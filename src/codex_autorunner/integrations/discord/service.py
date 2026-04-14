@@ -285,7 +285,10 @@ from .interaction_registry import (
     slash_command_route_for_path,
     slash_command_workspace_lock_policy,
 )
-from .interaction_runtime import ensure_ephemeral_response_deferred
+from .interaction_runtime import (
+    defer_and_update_runtime_component_message,
+    ensure_ephemeral_response_deferred,
+)
 from .interaction_session import (
     DiscordInteractionSession,
     InteractionSessionKind,
@@ -7572,6 +7575,7 @@ class DiscordBotService:
         channel_id: Optional[str] = None,
         guild_id: Optional[str] = None,
         user_id: Optional[str] = None,
+        component_response: bool = False,
     ) -> None:
         await self._run_effectful_handler(
             handle_flow_reply,
@@ -7582,6 +7586,7 @@ class DiscordBotService:
             channel_id=channel_id,
             guild_id=guild_id,
             user_id=user_id,
+            component_response=component_response,
         )
 
     def _write_user_reply(
@@ -8842,6 +8847,13 @@ class DiscordBotService:
         from .components import parse_cancel_turn_custom_id
 
         thread_target_id, execution_id = parse_cancel_turn_custom_id(custom_id)
+        await defer_and_update_runtime_component_message(
+            self,
+            interaction_id,
+            interaction_token,
+            "Stopping current turn...",
+            components=[],
+        )
         await self._handle_car_interrupt(
             interaction_id,
             interaction_token,
@@ -8898,6 +8910,13 @@ class DiscordBotService:
                 "Queued request is no longer pending.",
             )
             return
+        await defer_and_update_runtime_component_message(
+            self,
+            interaction_id,
+            interaction_token,
+            "Cancelling queued request...",
+            components=[],
+        )
         await clear_discord_turn_progress_leases(
             self,
             managed_thread_id=current_thread.thread_target_id,
@@ -8985,6 +9004,13 @@ class DiscordBotService:
                     "Queued request moved to the front.",
                 )
                 return
+        await defer_and_update_runtime_component_message(
+            self,
+            interaction_id,
+            interaction_token,
+            "Message received. Switching to it now...",
+            components=[],
+        )
         await self._handle_car_interrupt(
             interaction_id,
             interaction_token,
@@ -9033,6 +9059,13 @@ class DiscordBotService:
                 "Queued request is no longer pending.",
             )
             return
+        await defer_and_update_runtime_component_message(
+            self,
+            interaction_id,
+            interaction_token,
+            "Cancelling queued request...",
+            components=[],
+        )
         await self._clear_queued_notice(
             conversation_id=conversation_id,
             source_message_id=source_message_id,
@@ -9093,6 +9126,13 @@ class DiscordBotService:
                 "Queued request moved to the front.",
             )
             return
+        await defer_and_update_runtime_component_message(
+            self,
+            interaction_id,
+            interaction_token,
+            "Message received. Switching to it now...",
+            components=[],
+        )
         await self._handle_car_interrupt(
             interaction_id,
             interaction_token,
