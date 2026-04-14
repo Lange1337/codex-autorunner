@@ -653,6 +653,11 @@ def test_resolve_managed_thread_target_clears_stale_backend_for_fresh_pma_sessio
         def resume_thread_target(self, thread_target_id: str, **kwargs: Any) -> Any:
             assert thread_target_id == "thread-1"
             resume_calls.append(kwargs)
+            if kwargs.get("backend_thread_id") is not None:
+                thread.backend_thread_id = kwargs.get("backend_thread_id")
+            thread.backend_runtime_instance_id = kwargs.get(
+                "backend_runtime_instance_id"
+            )
             return SimpleNamespace(
                 thread_target_id="thread-1",
                 agent_id="codex",
@@ -683,14 +688,15 @@ def test_resolve_managed_thread_target_clears_stale_backend_for_fresh_pma_sessio
     )
 
     assert resolved_thread is not None
-    assert clear_calls == [
+    assert resume_calls == [
         {
             "backend_thread_id": None,
             "backend_runtime_instance_id": None,
         }
     ]
-    assert resume_calls == [
+    assert clear_calls == [
         {
+            "backend_thread_id": None,
             "backend_runtime_instance_id": None,
         }
     ]
