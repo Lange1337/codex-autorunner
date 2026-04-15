@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 import uuid
 from dataclasses import dataclass
@@ -9,9 +10,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional
 
-from ...core.chat_bindings import (
-    preferred_non_pma_chat_notification_sources_by_workspace,
-)
 from ...core.locks import file_lock
 from ...core.orchestration.sqlite import open_orchestration_sqlite
 from ...core.pma_thread_store import PmaThreadStore
@@ -31,8 +29,11 @@ _FAILED_CHECK_CONCLUSIONS = frozenset(
 _ACTIVE_PR_STATES = frozenset({"open", "draft"})
 _VALID_PR_STATES = frozenset({"open", "draft", "closed", "merged"})
 _ACTIVITY_PRIORITY = {"hot": 0, "warm": 1, "cold": 2}
+_VALID_ACTIVITY_TIERS = frozenset(_ACTIVITY_PRIORITY.keys())
 _HOT_THREAD_WINDOW_MINUTES = 60
 _RECENT_THREAD_WINDOW_MINUTES = 24 * 60
+_DEFAULT_NO_ACTIVITY_TIER = "cold"
+_DEFAULT_DISCOVERY_TERMINAL_LOOKBACK_MINUTES = 24 * 60
 _WARM_INTERVAL_SECONDS_FLOOR = 15 * 60
 _COLD_INTERVAL_SECONDS_FLOOR = 60 * 60
 _DEFAULT_POST_OPEN_BOOST_MINUTES = 30
@@ -47,6 +48,13 @@ _RATE_LIMIT_QUOTA_ERROR_CACHE_TTL_SECONDS = 30
 _RATE_LIMIT_RESOURCES = ("graphql", "core")
 _THREAD_BRANCH_KEYS = ("head_branch", "branch", "git_branch")
 _THREAD_CONTEXT_KEYS = ("manual_context", "scm", "scm_context", "context")
+_PR_HINT_METADATA_KEYS = ("pr_number", "pr_url", "pull_request_url", "pr_ref")
+# Bounded match for GitHub browser PR URLs (avoids loose substring checks on user text).
+_GITHUB_PR_URL_HINT_RE = re.compile(
+    r"(?:https?://github\.com/|(?<![\w.-])github\.com/)"
+    r"[^/\s]{1,200}/[^/\s]{1,200}/pull/\d+",
+    re.IGNORECASE,
+)
 _LOGGER = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -59,6 +67,10 @@ GitHubServiceFactory = Callable[[Path, Optional[dict[str, Any]]], "GitHubService
 def _normalize_lower_text(value: Any) -> Optional[str]:
     text = _normalize_text(value)
     return text.lower() if text is not None else None
+
+
+def _text_has_github_pull_request_url(value: str) -> bool:
+    return _GITHUB_PR_URL_HINT_RE.search(value) is not None
 
 
 def _utc_now() -> datetime:
@@ -103,6 +115,22 @@ def _normalize_non_negative_int(value: Any) -> Optional[int]:
     return normalized if normalized >= 0 else None
 
 
+def _pr_hint_present_in_context(context: Mapping[str, Any]) -> bool:
+    for key in _PR_HINT_METADATA_KEYS:
+        raw = context.get(key)
+        if key == "pr_number":
+            if isinstance(raw, bool):
+                continue
+            if isinstance(raw, int) and raw > 0:
+                return True
+            if _normalize_text(raw) is not None:
+                return True
+            continue
+        if _normalize_text(raw) is not None:
+            return True
+    return False
+
+
 def _thread_branch_hint(thread: Mapping[str, Any]) -> Optional[str]:
     metadata = _mapping(thread.get("metadata"))
     contexts: list[Mapping[str, Any]] = [metadata]
@@ -116,6 +144,60 @@ def _thread_branch_hint(thread: Mapping[str, Any]) -> Optional[str]:
             if branch is not None:
                 return branch
     return None
+
+
+def _thread_has_pr_open_hint(thread: Mapping[str, Any]) -> bool:
+    metadata = _mapping(thread.get("metadata"))
+    contexts: list[Mapping[str, Any]] = [metadata]
+    for key in _THREAD_CONTEXT_KEYS:
+        nested = _mapping(metadata.get(key))
+        if nested:
+            contexts.append(nested)
+    for context in contexts:
+        if _pr_hint_present_in_context(context):
+            return True
+    for key in ("status_reason", "last_message_preview"):
+        value = _normalize_lower_text(thread.get(key))
+        if value is None:
+            continue
+        if "pull request" in value or "gh pr create" in value:
+            return True
+        if _text_has_github_pull_request_url(value):
+            return True
+    return False
+
+
+def _thread_activity_timestamp(thread: Mapping[str, Any]) -> Optional[datetime]:
+    return max(
+        (
+            timestamp
+            for timestamp in (
+                _parse_optional_iso(thread.get("status_updated_at")),
+                _parse_optional_iso(thread.get("updated_at")),
+                _parse_optional_iso(thread.get("created_at")),
+            )
+            if timestamp is not None
+        ),
+        default=None,
+    )
+
+
+def _is_recent_terminal_thread_candidate(
+    thread: Mapping[str, Any],
+    *,
+    cutoff: datetime,
+) -> bool:
+    if not bool(thread.get("status_terminal")):
+        return False
+    activity_at = _thread_activity_timestamp(thread)
+    if activity_at is None or activity_at < cutoff:
+        return False
+    if _thread_has_pr_open_hint(thread):
+        return True
+    status_reason = _normalize_lower_text(thread.get("status_reason")) or ""
+    if status_reason in {"managed_turn_completed", "completed"}:
+        return _thread_branch_hint(thread) is not None
+    return False
 
 
 def _parse_optional_iso(value: Any) -> Optional[datetime]:
@@ -321,6 +403,11 @@ class GitHubPollingConfig:
     post_open_boost_interval_seconds: int = _DEFAULT_POST_OPEN_BOOST_INTERVAL_SECONDS
     discovery_interval_seconds: int = 6 * 60
     discovery_workspace_limit: int = 1
+    discovery_include_manifest_repos: bool = False
+    discovery_terminal_thread_lookback_minutes: int = (
+        _DEFAULT_DISCOVERY_TERMINAL_LOOKBACK_MINUTES
+    )
+    no_activity_tier: str = _DEFAULT_NO_ACTIVITY_TIER
 
     @classmethod
     def from_mapping(cls, raw_config: object) -> "GitHubPollingConfig":
@@ -336,6 +423,13 @@ class GitHubPollingConfig:
         )
         discovery_interval_seconds = polling.get("discovery_interval_seconds")
         discovery_workspace_limit = polling.get("discovery_workspace_limit")
+        discovery_include_manifest_repos = polling.get(
+            "discovery_include_manifest_repos"
+        )
+        discovery_terminal_thread_lookback_minutes = polling.get(
+            "discovery_terminal_thread_lookback_minutes"
+        )
+        no_activity_tier = _normalize_lower_text(polling.get("no_activity_tier"))
         return cls(
             enabled=bool(enabled) if isinstance(enabled, bool) else False,
             watch_window_minutes=(
@@ -379,6 +473,25 @@ class GitHubPollingConfig:
                     and discovery_workspace_limit > 0
                 )
                 else 1
+            ),
+            discovery_include_manifest_repos=(
+                bool(discovery_include_manifest_repos)
+                if isinstance(discovery_include_manifest_repos, bool)
+                else False
+            ),
+            discovery_terminal_thread_lookback_minutes=(
+                int(discovery_terminal_thread_lookback_minutes)
+                if (
+                    not isinstance(discovery_terminal_thread_lookback_minutes, bool)
+                    and isinstance(discovery_terminal_thread_lookback_minutes, int)
+                    and discovery_terminal_thread_lookback_minutes > 0
+                )
+                else _DEFAULT_DISCOVERY_TERMINAL_LOOKBACK_MINUTES
+            ),
+            no_activity_tier=(
+                no_activity_tier
+                if no_activity_tier in _VALID_ACTIVITY_TIERS
+                else _DEFAULT_NO_ACTIVITY_TIER
             ),
         )
 
@@ -943,6 +1056,7 @@ class GitHubScmPollingService:
                 watch=watch,
                 thread_activity_by_thread=thread_activity_by_thread,
                 workspace_activity=workspace_activity,
+                polling_config=polling_config,
             )
             scheduled_next_poll_at = _iso_after_seconds(
                 self._poll_interval_for_tier(
@@ -1051,6 +1165,7 @@ class GitHubScmPollingService:
                 watch=watch,
                 thread_activity_by_thread=thread_activity_by_thread,
                 workspace_activity=workspace_activity,
+                polling_config=polling_config,
             )
             pending_watches.append((activity_tier, watch, binding, workspace_root))
 
@@ -1210,9 +1325,17 @@ class GitHubScmPollingService:
         return counts
 
     def backfill_binding_thread_targets(self, *, limit: int = 200) -> dict[str, int]:
+        polling_config = GitHubPollingConfig.from_mapping(self._raw_config)
         return backfill_pr_binding_thread_target_ids(
             self._hub_root,
             limit=limit,
+            include_recent_terminal_threads=True,
+            terminal_thread_lookback=timedelta(
+                minutes=max(
+                    1,
+                    polling_config.discovery_terminal_thread_lookback_minutes,
+                )
+            ),
         )
 
     def _active_bindings(self, *, limit: int) -> tuple[dict[str, PrBinding], int]:
@@ -1295,6 +1418,7 @@ class GitHubScmPollingService:
         watch: Optional[ScmPollingWatch],
         thread_activity_by_thread: Mapping[str, datetime],
         workspace_activity: Mapping[str, datetime],
+        polling_config: GitHubPollingConfig,
     ) -> str:
         activity_at: Optional[datetime] = None
         if binding.thread_target_id is not None:
@@ -1308,7 +1432,7 @@ class GitHubScmPollingService:
         if activity_at is None:
             activity_at = workspace_activity.get(str(workspace_root.resolve()))
         if activity_at is None:
-            return "warm"
+            return polling_config.no_activity_tier
         if activity_at >= _utc_now() - timedelta(minutes=_HOT_THREAD_WINDOW_MINUTES):
             return "hot"
         if activity_at >= _utc_now() - timedelta(minutes=_RECENT_THREAD_WINDOW_MINUTES):
@@ -1518,9 +1642,36 @@ class GitHubScmPollingService:
             snapshot=watch.snapshot,
         )
 
+    def _active_watch_workspace_candidates(
+        self,
+        *,
+        limit: int = 1000,
+    ) -> list[tuple[str, Optional[str], Optional[str]]]:
+        with open_orchestration_sqlite(self._hub_root, durable=True) as conn:
+            rows = conn.execute(
+                """
+                SELECT workspace_root, repo_id, thread_target_id
+                  FROM orch_scm_polling_watches
+                 WHERE provider = ?
+                   AND state = 'active'
+                 ORDER BY updated_at DESC, started_at DESC, watch_id DESC
+                 LIMIT ?
+                """,
+                ("github", max(1, int(limit))),
+            ).fetchall()
+        return [
+            (
+                str(row["workspace_root"] or ""),
+                _normalize_text(row["repo_id"]),
+                _normalize_text(row["thread_target_id"]),
+            )
+            for row in rows
+        ]
+
     def _candidate_workspace_roots(
         self,
     ) -> tuple[list[Path], dict[str, list[Path]], dict[str, Path], dict[Path, str]]:
+        polling_config = GitHubPollingConfig.from_mapping(self._raw_config)
         roots: list[Path] = []
         seen_roots: set[Path] = set()
         workspaces_by_repo_id: dict[str, list[Path]] = {}
@@ -1555,28 +1706,28 @@ class GitHubScmPollingService:
             ):
                 workspace_branch_hints[resolved_root] = normalized_branch_hint
 
-        manifest_path = self._hub_root / ".codex-autorunner" / "manifest.yml"
-        if manifest_path.exists():
-            try:
-                manifest = load_manifest(manifest_path, self._hub_root)
-            except ManifestError:
-                manifest = None
-            if manifest is not None:
-                for repo in manifest.repos:
-                    if not repo.enabled:
-                        continue
-                    add_root(self._hub_root / repo.path, repo_id=repo.id)
-
+        thread_store = PmaThreadStore(self._hub_root)
+        lookback_cutoff = _utc_now() - timedelta(
+            minutes=max(1, polling_config.discovery_terminal_thread_lookback_minutes)
+        )
         try:
-            threads = PmaThreadStore(self._hub_root).list_threads(
-                status="active",
-                limit=500,
-            )
+            active_threads = thread_store.list_threads(status="active", limit=500)
         except Exception:
-            threads = []
-        for thread in threads:
+            active_threads = []
+        try:
+            terminal_thread_candidates = thread_store.list_threads(limit=500)
+        except Exception:
+            terminal_thread_candidates = []
+
+        for thread in active_threads:
             workspace_root = _normalize_text(thread.get("workspace_root"))
             if workspace_root is None:
+                continue
+            lifecycle_status = _normalize_lower_text(thread.get("lifecycle_status"))
+            include_active_thread = lifecycle_status == "active" and not bool(
+                thread.get("status_terminal")
+            )
+            if not include_active_thread:
                 continue
             add_root(
                 Path(workspace_root),
@@ -1584,17 +1735,70 @@ class GitHubScmPollingService:
                 thread_target_id=_normalize_text(thread.get("managed_thread_id")),
                 branch_hint=_thread_branch_hint(thread),
             )
-        try:
-            preferred_chat_sources = (
-                preferred_non_pma_chat_notification_sources_by_workspace(
-                    hub_root=self._hub_root,
-                    raw_config=self._raw_config,
-                )
+
+        for thread in terminal_thread_candidates:
+            workspace_root = _normalize_text(thread.get("workspace_root"))
+            if workspace_root is None:
+                continue
+            lifecycle_status = _normalize_lower_text(thread.get("lifecycle_status"))
+            if lifecycle_status == "active" and not bool(thread.get("status_terminal")):
+                continue
+            if not _is_recent_terminal_thread_candidate(
+                thread,
+                cutoff=lookback_cutoff,
+            ):
+                continue
+            add_root(
+                Path(workspace_root),
+                repo_id=_normalize_text(thread.get("repo_id")),
+                thread_target_id=_normalize_text(thread.get("managed_thread_id")),
+                branch_hint=_thread_branch_hint(thread),
             )
-        except Exception:
-            preferred_chat_sources = {}
-        for workspace_root in preferred_chat_sources:
-            add_root(Path(workspace_root))
+
+        for (
+            workspace_root,
+            repo_id,
+            thread_target_id,
+        ) in self._active_watch_workspace_candidates(limit=1000):
+            if not workspace_root:
+                continue
+            add_root(
+                Path(workspace_root),
+                repo_id=repo_id,
+                thread_target_id=thread_target_id,
+            )
+
+        active_bindings, _ = self._active_bindings(limit=2000)
+        for binding in active_bindings.values():
+            if binding.thread_target_id is None:
+                continue
+            if binding.thread_target_id in workspaces_by_thread_id:
+                continue
+            bound_thread = thread_store.get_thread(binding.thread_target_id)
+            if not isinstance(bound_thread, dict):
+                continue
+            workspace_root = _normalize_text(bound_thread.get("workspace_root"))
+            if workspace_root is None:
+                continue
+            add_root(
+                Path(workspace_root),
+                repo_id=_normalize_text(bound_thread.get("repo_id")) or binding.repo_id,
+                thread_target_id=binding.thread_target_id,
+                branch_hint=_thread_branch_hint(bound_thread) or binding.head_branch,
+            )
+
+        if polling_config.discovery_include_manifest_repos:
+            manifest_path = self._hub_root / ".codex-autorunner" / "manifest.yml"
+            if manifest_path.exists():
+                try:
+                    manifest = load_manifest(manifest_path, self._hub_root)
+                except ManifestError:
+                    manifest = None
+                if manifest is not None:
+                    for repo in manifest.repos:
+                        if not repo.enabled:
+                            continue
+                        add_root(self._hub_root / repo.path, repo_id=repo.id)
         return (
             roots,
             workspaces_by_repo_id,
