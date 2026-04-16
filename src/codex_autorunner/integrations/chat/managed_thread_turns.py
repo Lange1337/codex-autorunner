@@ -113,6 +113,11 @@ _DIRECT_RUN_EVENT_TYPES = (
     Started,
 )
 
+# Bound live timeline write pressure so one busy thread cannot starve hub requests
+# from other threads.
+_LIVE_TIMELINE_BATCH_MAX_EVENTS = 25
+_LIVE_TIMELINE_BATCH_MAX_DELAY_SECONDS = 5.0
+
 
 def _runtime_raw_event_message(raw_event: Any) -> dict[str, Any]:
     if not isinstance(raw_event, dict):
@@ -1402,6 +1407,10 @@ async def finalize_managed_thread_execution(
     timeline_events: list[Any] = []
     live_timeline_count = 0
     live_timeline_error_logged = False
+    live_timeline_pending_events: list[Any] = []
+    live_timeline_pending_started_at: float | None = None
+    live_timeline_flush_task: asyncio.Task[None] | None = None
+    live_timeline_flush_epoch = 0
     final_trace_manifest_id: Optional[str] = None
 
     log_event(
@@ -1425,15 +1434,16 @@ async def finalize_managed_thread_execution(
         nonlocal live_timeline_error_logged
         if not events:
             return
+        if live_timeline_error_logged:
+            return
         if resolved_hub_client is None:
-            if not live_timeline_error_logged:
-                live_timeline_error_logged = True
-                logger.error(
-                    "%s Skipping live timeline persistence without a hub control-plane client (thread=%s turn=%s)",
-                    surface.log_label,
-                    managed_thread_id,
-                    managed_turn_id,
-                )
+            live_timeline_error_logged = True
+            logger.error(
+                "%s Skipping live timeline persistence without a hub control-plane client (thread=%s turn=%s)",
+                surface.log_label,
+                managed_thread_id,
+                managed_turn_id,
+            )
             return
         try:
             await _persist_execution_timeline_via_hub(
@@ -1463,26 +1473,111 @@ async def finalize_managed_thread_execution(
                 start_index=live_timeline_count + 1,
             )
         except asyncio.CancelledError:
-            if not live_timeline_error_logged:
-                live_timeline_error_logged = True
-                logger.warning(
-                    "Live %s thread timeline persistence cancelled; continuing without live persistence (thread=%s turn=%s)",
-                    surface.log_label,
-                    managed_thread_id,
-                    managed_turn_id,
-                    exc_info=True,
-                )
+            live_timeline_error_logged = True
+            logger.warning(
+                "Live %s thread timeline persistence cancelled; continuing without live persistence (thread=%s turn=%s)",
+                surface.log_label,
+                managed_thread_id,
+                managed_turn_id,
+                exc_info=True,
+            )
         except Exception:
-            if not live_timeline_error_logged:
-                live_timeline_error_logged = True
-                logger.exception(
-                    "Failed to persist live %s thread timeline via hub control plane (thread=%s turn=%s)",
-                    surface.log_label,
-                    managed_thread_id,
-                    managed_turn_id,
-                )
+            live_timeline_error_logged = True
+            logger.exception(
+                "Failed to persist live %s thread timeline via hub control plane (thread=%s turn=%s)",
+                surface.log_label,
+                managed_thread_id,
+                managed_turn_id,
+            )
         else:
             live_timeline_count += len(events)
+
+    async def _delayed_live_timeline_flush(captured_epoch: int) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+            if live_timeline_pending_started_at is None:
+                return
+            deadline = (
+                live_timeline_pending_started_at
+                + _LIVE_TIMELINE_BATCH_MAX_DELAY_SECONDS
+            )
+            await asyncio.sleep(max(0.0, deadline - loop.time()))
+            if captured_epoch != live_timeline_flush_epoch:
+                return
+            await _flush_live_timeline_buffer(force=False)
+        except asyncio.CancelledError:
+            raise
+
+    def _schedule_live_timeline_delayed_flush_if_needed() -> None:
+        nonlocal live_timeline_flush_task
+        if live_timeline_error_logged:
+            return
+        if not live_timeline_pending_events:
+            return
+        if len(live_timeline_pending_events) >= _LIVE_TIMELINE_BATCH_MAX_EVENTS:
+            return
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        if live_timeline_pending_started_at is None:
+            return
+        if _live_timeline_flush_due(now):
+            return
+        if live_timeline_flush_task is not None and not live_timeline_flush_task.done():
+            return
+        live_timeline_flush_task = loop.create_task(
+            _delayed_live_timeline_flush(live_timeline_flush_epoch)
+        )
+
+    def _live_timeline_flush_due(now: float) -> bool:
+        if not live_timeline_pending_events:
+            return False
+        if len(live_timeline_pending_events) >= _LIVE_TIMELINE_BATCH_MAX_EVENTS:
+            return True
+        if live_timeline_pending_started_at is None:
+            return False
+        return (
+            now - live_timeline_pending_started_at
+            >= _LIVE_TIMELINE_BATCH_MAX_DELAY_SECONDS
+        )
+
+    async def _flush_live_timeline_buffer(*, force: bool = False) -> None:
+        nonlocal live_timeline_pending_events
+        nonlocal live_timeline_pending_started_at
+        nonlocal live_timeline_flush_task
+        nonlocal live_timeline_flush_epoch
+        if force:
+            live_timeline_flush_epoch += 1
+            t = live_timeline_flush_task
+            live_timeline_flush_task = None
+            if t is not None and not t.done():
+                t.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await t
+        if not live_timeline_pending_events:
+            return
+        if not force:
+            loop_now = asyncio.get_running_loop().time()
+            if not _live_timeline_flush_due(loop_now):
+                return
+        live_timeline_flush_epoch += 1
+        if live_timeline_flush_task is asyncio.current_task():
+            live_timeline_flush_task = None
+        pending = live_timeline_pending_events
+        live_timeline_pending_events = []
+        live_timeline_pending_started_at = None
+        await _persist_live_timeline_events(pending)
+
+    async def _enqueue_live_timeline_events(events: list[Any]) -> None:
+        nonlocal live_timeline_pending_started_at
+        if not events:
+            return
+        if live_timeline_error_logged:
+            return
+        live_timeline_pending_events.extend(events)
+        if live_timeline_pending_started_at is None:
+            live_timeline_pending_started_at = asyncio.get_running_loop().time()
+        await _flush_live_timeline_buffer(force=False)
+        _schedule_live_timeline_delayed_flush_if_needed()
 
     async def _persist_final_timeline_with_cold_trace(
         *,
@@ -1654,7 +1749,7 @@ async def finalize_managed_thread_execution(
                                 content_summary=content_summary,
                             )
                     timeline_events.extend(run_events)
-                    await _persist_live_timeline_events(run_events)
+                    await _enqueue_live_timeline_events(run_events)
                     if on_progress_event is None:
                         continue
                     for run_event in run_events:
@@ -1785,6 +1880,8 @@ async def finalize_managed_thread_execution(
                     )
                 else:
                     raise exc
+
+    await _flush_live_timeline_buffer(force=True)
 
     recovered_outcome = recover_post_completion_outcome(outcome, event_state)
     recovered_after_completion = recovered_outcome is not outcome
