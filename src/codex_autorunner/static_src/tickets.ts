@@ -17,10 +17,10 @@ import { subscribe } from "./bus.js";
 import { isRepoHealthy } from "./health.js";
 import { closeTicketEditor, initTicketEditor, openTicketEditor, TicketData } from "./ticketEditor.js";
 import { parseAppServerEvent, resetOpenCodeEventState, type AgentEvent, type ParsedAgentEvent } from "./agentEvents.js";
-import { summarizeEvents, renderCompactSummary, COMPACT_MAX_TEXT_LENGTH } from "./eventSummarizer.js";
 import { refreshBell, renderMarkdown } from "./messages.js";
 import { preserveScroll } from "./preserve.js";
 import { createSmartRefresh } from "./smartRefresh.js";
+import { summarizeEvents, renderCompactSummary, COMPACT_MAX_TEXT_LENGTH } from "./eventSummarizer.js";
 
 type FlowEvent = {
   seq?: number;
@@ -170,7 +170,8 @@ let lastActivityTime: Date | null = null;
 let lastActivityTimerId: ReturnType<typeof setInterval> | null = null;
 let lastKnownEventSeq: number | null = null;
 let lastKnownEventAt: Date | null = null;
-let liveOutputDetailExpanded = false; // Start with summary view, one click for full
+let liveOutputPanelExpanded = false; // Entire panel body hidden when collapsed
+let liveOutputDetailExpanded = false; // Summary (compact) vs full detail when panel is open
 let liveOutputBuffer: string[] = [];
 const MAX_OUTPUT_LINES = 200;
 const LIVE_EVENT_MAX = 50;
@@ -746,7 +747,7 @@ function renderLiveOutputCompact(): void {
   if (!compactEl) return;
   const text = renderCompactLiveOutputText();
   const newText = text || "Waiting for agent output...";
-  
+
   if (compactEl.textContent !== newText) {
     compactEl.textContent = newText;
   }
@@ -799,18 +800,36 @@ function compactLiveOutputBufferText(): string {
   return compactLines.slice(-3).join(" ").replace(/\s+/g, " ").trim();
 }
 
-function updateLiveOutputViewToggle(): void {
-  const viewToggle = document.getElementById("ticket-live-output-view-toggle");
-  if (!viewToggle) return;
-  
+function updateLiveOutputPanelToggle(): void {
+  const panelToggle = document.getElementById("ticket-live-output-panel-toggle");
+  const panel = document.getElementById("ticket-live-output-panel");
+  const chevron = document.getElementById("ticket-live-output-chevron");
+  if (!panelToggle) return;
+
+  panel?.classList.toggle("collapsed", !liveOutputPanelExpanded);
+  panelToggle.classList.toggle("active", liveOutputPanelExpanded);
+  panelToggle.setAttribute("aria-expanded", String(liveOutputPanelExpanded));
+  panelToggle.setAttribute(
+    "title",
+    liveOutputPanelExpanded ? "Hide agent output" : "Show agent output"
+  );
+  if (chevron) {
+    chevron.textContent = liveOutputPanelExpanded ? "▴" : "▾";
+  }
+}
+
+function updateLiveOutputDetailToggle(): void {
+  const detailToggle = document.getElementById("ticket-live-output-detail-toggle");
+  if (!detailToggle) return;
+
   if (liveOutputDetailExpanded) {
-    if (!viewToggle.classList.contains("active")) viewToggle.classList.add("active");
-    if (viewToggle.textContent !== "≡") viewToggle.textContent = "≡";
-    if (viewToggle.title !== "Show summary") viewToggle.title = "Show summary";
+    if (!detailToggle.classList.contains("active")) detailToggle.classList.add("active");
+    if (detailToggle.textContent !== "≡") detailToggle.textContent = "≡";
+    if (detailToggle.title !== "Show summary") detailToggle.title = "Show summary";
   } else {
-    if (viewToggle.classList.contains("active")) viewToggle.classList.remove("active");
-    if (viewToggle.textContent !== "⋯") viewToggle.textContent = "⋯";
-    if (viewToggle.title !== "Show full output") viewToggle.title = "Show full output";
+    if (detailToggle.classList.contains("active")) detailToggle.classList.remove("active");
+    if (detailToggle.textContent !== "⋯") detailToggle.textContent = "⋯";
+    if (detailToggle.title !== "Show full output") detailToggle.title = "Show full output";
   }
 }
 
@@ -818,20 +837,21 @@ function renderLiveOutputView(): void {
   const compactEl = document.getElementById("ticket-live-output-compact");
   const detailEl = document.getElementById("ticket-live-output-detail");
   const eventsEl = document.getElementById("ticket-live-output-events");
-  
+
   if (compactEl) {
-    compactEl.classList.toggle("hidden", liveOutputDetailExpanded);
+    compactEl.classList.toggle("hidden", liveOutputDetailExpanded || !liveOutputPanelExpanded);
   }
   if (detailEl) {
-    detailEl.classList.toggle("hidden", !liveOutputDetailExpanded);
+    detailEl.classList.toggle("hidden", !liveOutputDetailExpanded || !liveOutputPanelExpanded);
   }
   if (eventsEl) {
-    eventsEl.classList.toggle("hidden", !liveOutputDetailExpanded);
+    eventsEl.classList.toggle("hidden", !liveOutputDetailExpanded || !liveOutputPanelExpanded);
   }
-  
+
   renderLiveOutputCompact();
   renderLiveOutputEvents();
-  updateLiveOutputViewToggle();
+  updateLiveOutputPanelToggle();
+  updateLiveOutputDetailToggle();
 }
 
 function clearLiveOutput(): void {
@@ -982,20 +1002,38 @@ function disconnectEventStream(): void {
 }
 
 function initLiveOutputPanel(): void {
-  const viewToggleBtn = document.getElementById("ticket-live-output-view-toggle");
-  
-  // Toggle between summary and full view (one click)
-  const toggleView = () => {
+  const panelToggleBtn = document.getElementById("ticket-live-output-panel-toggle");
+  const detailToggleBtn = document.getElementById("ticket-live-output-detail-toggle");
+
+  const panel = document.getElementById("ticket-live-output-panel");
+  if (panel) {
+    liveOutputPanelExpanded = !panel.classList.contains("collapsed");
+  }
+  const detailEl = document.getElementById("ticket-live-output-detail");
+  if (detailEl) {
+    liveOutputDetailExpanded = !detailEl.classList.contains("hidden");
+  }
+
+  const togglePanel = () => {
+    liveOutputPanelExpanded = !liveOutputPanelExpanded;
+    renderLiveOutputView();
+  };
+
+  const toggleDetail = () => {
     liveOutputDetailExpanded = !liveOutputDetailExpanded;
     renderLiveOutputView();
   };
-  
-  if (viewToggleBtn) {
-    viewToggleBtn.addEventListener("click", toggleView);
+
+  if (panelToggleBtn) {
+    panelToggleBtn.addEventListener("click", togglePanel);
   }
-  
-  // Initial render
-  updateLiveOutputViewToggle();
+  if (detailToggleBtn) {
+    detailToggleBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      toggleDetail();
+    });
+  }
+
   renderLiveOutputView();
 }
 
@@ -1034,6 +1072,7 @@ function initReasonModal(): void {
 export const __ticketFlowTest = {
   clearLiveOutput(): void {
     clearLiveOutput();
+    liveOutputPanelExpanded = false;
     liveOutputDetailExpanded = false;
     flowStartedAt = null;
     renderLiveOutputView();

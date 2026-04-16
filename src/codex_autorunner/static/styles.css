@@ -3905,7 +3905,7 @@ button.icon-btn {
   display: inline;
 }
 
-/* Live Agent Output Panel - Compact inline design */
+/* Live Agent Output Panel */
 .ticket-live-output-panel {
   margin-top: 6px;
   border: 1px solid var(--border);
@@ -3922,6 +3922,38 @@ button.icon-btn {
   background: rgba(255, 255, 255, 0.02);
   user-select: none;
   border-bottom: 1px solid var(--border);
+}
+
+.ticket-live-output-panel-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0;
+  margin: 0;
+  border: 0;
+  appearance: none;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+  text-transform: none;
+  letter-spacing: normal;
+  font: inherit;
+}
+
+.ticket-live-output-panel-toggle:hover {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.ticket-live-output-panel-toggle:focus-visible {
+  outline: 1px solid rgba(108, 245, 216, 0.45);
+  outline-offset: -1px;
+}
+
+.ticket-live-output-panel.collapsed .ticket-live-output-header {
+  border-bottom: 0;
 }
 
 .ticket-live-output-spacer {
@@ -3956,8 +3988,8 @@ button.icon-btn {
   animation: pulse-running 1.5s ease-in-out infinite;
 }
 
-/* Simple toggle button */
-.ticket-live-output-view-toggle {
+/* Summary vs full output toggle (⋯ / ≡) */
+.ticket-live-output-detail-toggle {
   background: none;
   border: 1px solid rgba(108, 245, 216, 0.25);
   border-radius: 4px;
@@ -3968,16 +4000,24 @@ button.icon-btn {
   transition: all 0.12s ease;
   flex-shrink: 0;
   line-height: 1.2;
+  text-transform: none;
+  letter-spacing: normal;
 }
 
-.ticket-live-output-view-toggle:hover {
+.ticket-live-output-detail-toggle:hover {
   background: rgba(108, 245, 216, 0.1);
   border-color: rgba(108, 245, 216, 0.4);
 }
 
-.ticket-live-output-view-toggle.active {
+.ticket-live-output-detail-toggle.active {
   background: rgba(108, 245, 216, 0.15);
   border-color: var(--accent);
+}
+
+.ticket-live-output-chevron {
+  font-size: 11px;
+  color: var(--accent);
+  flex-shrink: 0;
 }
 
 /* Compact summary - max 3 lines */
@@ -4006,7 +4046,6 @@ button.icon-btn {
   display: none;
 }
 
-/* Detail view (full output) */
 .ticket-live-output-detail {
   max-height: 280px;
   overflow: auto;
