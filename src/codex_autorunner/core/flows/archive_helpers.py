@@ -27,6 +27,7 @@ Canonical vs compatibility
 from __future__ import annotations
 
 import logging
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Optional
@@ -47,6 +48,7 @@ from ..archive_retention import (
 )
 from ..config import ConfigError, load_repo_config
 from ..pma_thread_store import PmaThreadStore
+from ..sqlite_utils import connect_sqlite
 from .models import FlowRunStatus
 from .store import FlowStore
 
@@ -87,6 +89,35 @@ def _next_archive_dir(base_dir: Path) -> Path:
         return base_dir
     suffix = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return base_dir.parent / f"{base_dir.name}_{suffix}"
+
+
+def _checkpoint_and_vacuum_flow_db(
+    *,
+    store: FlowStore,
+    db_path: Path,
+    repo_root: Path,
+    vacuum: bool,
+) -> None:
+    """Best-effort WAL truncate and optional VACUUM after bulk deletes.
+
+    Deletes are already committed; if another writer holds ``flows.db``, these
+    operations may fail with ``SQLITE_BUSY``. That should not fail the archive
+    command after the destructive work is done.
+    """
+    store.close()
+    try:
+        conn = connect_sqlite(db_path, durable=_get_durable_writes(repo_root.resolve()))
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            if vacuum:
+                conn.execute("VACUUM")
+        finally:
+            conn.close()
+    except sqlite3.OperationalError as exc:
+        logger.warning(
+            "flows.db checkpoint/vacuum skipped after archive (database may be busy): %s",
+            exc,
+        )
 
 
 def build_flow_archive_entries(
@@ -391,6 +422,8 @@ def archive_terminal_flow_runs(
     store: FlowStore,
     exclude_run_ids: frozenset[str] | None = None,
     delete_run: bool = True,
+    vacuum: bool = True,
+    maintain_db: bool = True,
 ) -> dict[str, Any]:
     excluded = exclude_run_ids or frozenset()
     records = [
@@ -436,6 +469,13 @@ def archive_terminal_flow_runs(
             )
         if delete_run and store.delete_flow_run(record.id):
             deleted_run_ids.append(record.id)
+    if maintain_db and deleted_run_ids:
+        _checkpoint_and_vacuum_flow_db(
+            store=store,
+            db_path=repo_root / ".codex-autorunner" / "flows.db",
+            repo_root=repo_root,
+            vacuum=vacuum,
+        )
     return {
         "archived_run_ids": archived_run_ids,
         "archived_run_count": len(archived_run_ids),
@@ -455,6 +495,7 @@ def archive_flow_run_artifacts(
     run_id: str,
     force: bool,
     delete_run: bool,
+    vacuum: bool = True,
     force_attestation: Mapping[str, object] | None = None,
 ) -> dict[str, Any]:
     repo_root = repo_root.resolve()
@@ -555,13 +596,26 @@ def archive_flow_run_artifacts(
             )
 
         if delete_run:
-            summary["deleted_run"] = bool(store.delete_flow_run(record.id))
+            deleted_any = bool(store.delete_flow_run(record.id))
+            summary["deleted_run"] = deleted_any
             summary["related_terminal_cleanup"] = archive_terminal_flow_runs(
                 repo_root,
                 store=store,
                 exclude_run_ids=frozenset({record.id}),
                 delete_run=True,
+                vacuum=vacuum,
+                maintain_db=False,
             )
+            deleted_any = deleted_any or bool(
+                summary["related_terminal_cleanup"].get("deleted_run_count")
+            )
+            if deleted_any:
+                _checkpoint_and_vacuum_flow_db(
+                    store=store,
+                    db_path=db_path,
+                    repo_root=repo_root,
+                    vacuum=vacuum,
+                )
 
         # Preserve the historical archive scan contract for callers that inspect
         # the active-thread query parameters during cleanup.
