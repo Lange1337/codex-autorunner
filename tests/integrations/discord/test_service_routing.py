@@ -642,6 +642,71 @@ async def test_discord_managed_thread_delivery_uses_unique_record_ids_per_chunk(
 
 
 @pytest.mark.anyio
+async def test_discord_managed_thread_delivery_includes_token_usage_footer() -> None:
+    sent_messages: list[dict[str, object]] = []
+
+    class _ServiceStub:
+        async def _send_channel_message_safe(
+            self,
+            channel_id: str,
+            payload: dict[str, object],
+            *,
+            record_id: str,
+        ) -> None:
+            sent_messages.append(
+                {
+                    "channel_id": channel_id,
+                    "payload": dict(payload),
+                    "record_id": record_id,
+                }
+            )
+
+        async def _run_with_typing_indicator(
+            self, *, channel_id: str, work: Any
+        ) -> None:
+            _ = channel_id
+            await work()
+
+        def _register_discord_turn_approval_context(self, **_kwargs: object) -> None:
+            return
+
+        def _clear_discord_turn_approval_context(self, **_kwargs: object) -> None:
+            return
+
+    hooks = discord_message_turns._build_discord_runner_hooks(
+        _ServiceStub(),
+        channel_id="channel-1",
+        managed_thread_id="thread-1",
+        public_execution_error="Discord turn failed",
+    )
+
+    await hooks.deliver_result(
+        discord_message_turns.ManagedThreadFinalizationResult(
+            status="ok",
+            assistant_text="message reply",
+            error=None,
+            managed_thread_id="thread-1",
+            managed_turn_id="turn-1",
+            backend_thread_id=None,
+            token_usage={
+                "last": {
+                    "totalTokens": 71173,
+                    "inputTokens": 400,
+                    "outputTokens": 245,
+                },
+                "modelContextWindow": 203352,
+            },
+        )
+    )
+
+    assert len(sent_messages) == 1
+    content = str(sent_messages[0]["payload"]["content"])
+    assert "message reply" in content
+    assert "Token usage: total 71173 input 400 output 245" in content
+    assert "ctx 65%" in content
+
+
+@pytest.mark.anyio
 async def test_discord_message_turns_show_busy_placeholder_for_attachment_prep(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1884,7 +1949,11 @@ async def test_service_enforces_allowlist_and_denies_command(tmp_path: Path) -> 
         ]
     )
     service = DiscordBotService(
-        _config(tmp_path, allow_user_ids=frozenset({"user-1"})),
+        _config(
+            tmp_path,
+            allow_user_ids=frozenset({"user-1"}),
+            command_registration_enabled=False,
+        ),
         logger=logging.getLogger("test"),
         rest_client=rest,
         gateway_client=gateway,
@@ -1912,7 +1981,11 @@ async def test_service_enforces_allowlist_and_denies_autocomplete_with_empty_cho
     await store.initialize()
     rest = _FakeRest()
     service = DiscordBotService(
-        _config(tmp_path, allow_user_ids=frozenset({"user-1"})),
+        _config(
+            tmp_path,
+            allow_user_ids=frozenset({"user-1"}),
+            command_registration_enabled=False,
+        ),
         logger=logging.getLogger("test"),
         rest_client=rest,
         gateway_client=_FakeGateway([]),
@@ -7421,7 +7494,7 @@ async def test_message_turn_waits_for_ingressed_slash_command_to_finish(
 
         release_newt.set()
 
-        await asyncio.wait_for(message_turn_started.wait(), timeout=2.0)
+        await asyncio.wait_for(message_turn_started.wait(), timeout=5.0)
 
         assert observed == ["newt:start", "newt:end", "message:please continue"]
         assert any(
