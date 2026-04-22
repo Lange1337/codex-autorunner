@@ -17,6 +17,7 @@ class _TopicQueueEntry:
     work: Callable[[], Awaitable[Any]]
     future: Optional[asyncio.Future[Any]] = None
     item_id: Optional[str] = None
+    item_label: Optional[str] = None
 
 
 class TopicQueue:
@@ -29,6 +30,20 @@ class TopicQueue:
 
     def pending(self) -> int:
         return self._queue.qsize()
+
+    def pending_items(self) -> list[dict[str, str]]:
+        items: list[dict[str, str]] = []
+        for item in list(getattr(self._queue, "_queue", ())):
+            if item is _QUEUE_STOP:
+                continue
+            entry = cast(_TopicQueueEntry, item)
+            if not isinstance(entry.item_id, str) or not entry.item_id:
+                continue
+            payload = {"item_id": entry.item_id}
+            if isinstance(entry.item_label, str) and entry.item_label:
+                payload["preview"] = entry.item_label
+            items.append(payload)
+        return items
 
     async def join_idle(self) -> None:
         """Block until the queue has no backlog and no in-flight work item."""
@@ -141,10 +156,13 @@ class TopicQueue:
         work: Callable[[], Awaitable[Any]],
         *,
         item_id: Optional[str] = None,
+        item_label: Optional[str] = None,
     ) -> Optional[str]:
         if self._closed:
             raise RuntimeError("topic queue is closed")
-        self._queue.put_nowait(_TopicQueueEntry(work=work, item_id=item_id))
+        self._queue.put_nowait(
+            _TopicQueueEntry(work=work, item_id=item_id, item_label=item_label)
+        )
         self._ensure_worker()
         return item_id
 

@@ -36,6 +36,7 @@ from .callbacks import (
 )
 from .models import ChatEvent, ChatInteractionEvent, ChatMessageEvent
 from .queue_control import ChatQueueControlStore
+from .queue_status import build_queue_item_preview
 
 DEFAULT_BYPASS_INTERACTION_PREFIXES = (
     "appr:",
@@ -639,12 +640,30 @@ class ChatDispatcher:
             except IndexError:
                 queued_context = None
         context = active_context or queued_context
+        pending_items: list[dict[str, str]] = []
+        if queue:
+            for event, _queued_context, _handler in queue:
+                if not isinstance(event, ChatMessageEvent):
+                    continue
+                message_id = str(event.message.message_id or "").strip()
+                if not message_id:
+                    continue
+                pending_items.append(
+                    {
+                        "item_id": message_id,
+                        "preview": build_queue_item_preview(
+                            event.text,
+                            fallback=f"Request {message_id}",
+                        ),
+                    }
+                )
         return {
             "conversation_id": conversation_id,
             "platform": context.platform if context is not None else None,
             "chat_id": context.chat_id if context is not None else None,
             "thread_id": context.thread_id if context is not None else None,
             "pending_count": len(queue) if queue is not None else 0,
+            "pending_items": pending_items,
             "active": active_context is not None,
             "active_update_id": (
                 active_context.update_id if active_context is not None else None
