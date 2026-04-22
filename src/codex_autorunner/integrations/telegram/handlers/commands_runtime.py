@@ -145,7 +145,10 @@ from .commands import (
     VoiceCommands,
     WorkspaceCommands,
 )
-from .commands.execution import _TurnRunFailure
+from .commands.execution import (
+    _abandon_pending_telegram_delivery,
+    _TurnRunFailure,
+)
 from .commands.shared import _RuntimeStub  # noqa: F401
 
 PROMPT_CONTEXT_RE = re.compile("\\bprompt\\b", re.IGNORECASE)
@@ -442,6 +445,13 @@ class TelegramCommandHandlers(
             )
         if _durable_handled:
             response_sent = True
+        elif response_sent:
+            _abandon_pending_telegram_delivery(
+                self,
+                delivery_id=getattr(outcome, "durable_delivery_id", None),
+                chat_id=message.chat_id,
+                thread_id=message.thread_id,
+            )
         if response_sent:
             key = await self._resolve_topic_key(message.chat_id, message.thread_id)
             log_event(
