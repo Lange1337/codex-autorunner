@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,8 +18,24 @@ from codex_autorunner.core.config import TicketFlowConfig
 from codex_autorunner.core.flows.models import FlowEventType
 from codex_autorunner.core.orchestration import ColdTraceStore
 from codex_autorunner.core.orchestration.turn_timeline import list_turn_timeline
+from codex_autorunner.core.pma_thread_store import PmaThreadStore
 from codex_autorunner.integrations.agents.agent_pool_impl import DefaultAgentPool
 from codex_autorunner.tickets.agent_pool import AgentTurnRequest
+
+
+async def _await_until(
+    predicate,
+    *,
+    timeout_s: float = 2.0,
+    poll_s: float = 0.01,
+) -> Any:
+    deadline = asyncio.get_running_loop().time() + timeout_s
+    while asyncio.get_running_loop().time() < deadline:
+        result = predicate()
+        if result:
+            return result
+        await asyncio.sleep(poll_s)
+    raise AssertionError("timed out waiting for async condition")
 
 
 @dataclass
@@ -277,6 +294,8 @@ def _make_pool(
         ),
     )
     pool = DefaultAgentPool(cfg)  # type: ignore[arg-type]
+    pool._hub_root = tmp_path.resolve()  # type: ignore[attr-defined]
+    pool._thread_store = PmaThreadStore(pool._hub_root)  # type: ignore[attr-defined]
     pool._agent_descriptors_override = descriptors or {  # type: ignore[attr-defined]
         "codex": _build_descriptor("codex"),
         "opencode": _build_descriptor("opencode"),
@@ -896,6 +915,13 @@ async def test_run_turn_persists_full_timeline_from_raw_events_after_partial_liv
             {"name": "shell", "result": {"stdout": str(tmp_path)}},
         ),
     ]
+    stream_started_event = asyncio.Event()
+    stream_release_event = asyncio.Event()
+
+    async def _release_stream_after_first_chunk() -> None:
+        await stream_started_event.wait()
+        stream_release_event.set()
+
     harness = _FakeHarness(
         [
             _HarnessScript(
@@ -903,24 +929,41 @@ async def test_run_turn_persists_full_timeline_from_raw_events_after_partial_liv
                 raw_events=streamed_raw_events[1:],
                 streamed_raw_events=streamed_raw_events,
                 stream_pause_after=1,
-                stream_release_event=asyncio.Event(),
-                stream_started_event=asyncio.Event(),
+                stream_release_event=stream_release_event,
+                stream_started_event=stream_started_event,
             )
         ]
     )
     pool = _make_pool(tmp_path, harness, approval_mode="yolo")
 
-    result = await pool.run_turn(
-        AgentTurnRequest(
-            agent_id="codex",
-            prompt="main",
-            workspace_root=tmp_path,
+    release_task = asyncio.create_task(_release_stream_after_first_chunk())
+    try:
+        result = await pool.run_turn(
+            AgentTurnRequest(
+                agent_id="codex",
+                prompt="main",
+                workspace_root=tmp_path,
+            )
         )
-    )
+    finally:
+        release_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await release_task
 
-    timeline = list_turn_timeline(
-        tmp_path,
-        execution_id=str(result.raw["execution_id"]),
+    execution_id = str(result.raw["execution_id"])
+    timeline = await _await_until(
+        lambda: (
+            entries
+            if len(
+                entries := list_turn_timeline(
+                    tmp_path,
+                    execution_id=execution_id,
+                )
+            )
+            >= 3
+            else None
+        ),
+        timeout_s=2.0,
     )
 
     assert [entry["event_type"] for entry in timeline] == [
@@ -929,9 +972,7 @@ async def test_run_turn_persists_full_timeline_from_raw_events_after_partial_liv
         "turn_completed",
     ]
     assert timeline[1]["event"]["result"] == {"stdout": str(tmp_path)}
-    checkpoint = ColdTraceStore(tmp_path).load_checkpoint(
-        str(result.raw["execution_id"])
-    )
+    checkpoint = ColdTraceStore(tmp_path).load_checkpoint(execution_id)
     assert checkpoint is not None
     assert checkpoint.trace_manifest_id
     manifest = ColdTraceStore(tmp_path).get_manifest_by_trace_id(
@@ -1192,7 +1233,21 @@ async def test_run_turn_uses_profile_aware_runtime_resolution_for_hermes_queue_d
     )
     await first_started.wait()
 
-    thread = pool._thread_store.list_threads(agent="hermes", limit=1)[0]
+    thread = await _await_until(
+        lambda: next(
+            (
+                candidate
+                for candidate in pool._thread_store.list_threads(
+                    agent="hermes", limit=1
+                )
+                if candidate.get("name") == "ticket-flow:hermes@m4-pma"
+                and isinstance(candidate.get("metadata"), dict)
+                and candidate["metadata"].get("agent_profile") == "m4-pma"
+            ),
+            None,
+        ),
+        timeout_s=2.0,
+    )
     thread_id = str(thread["managed_thread_id"])
     assert thread["name"] == "ticket-flow:hermes@m4-pma"
     assert thread["metadata"]["agent_profile"] == "m4-pma"
@@ -1211,10 +1266,12 @@ async def test_run_turn_uses_profile_aware_runtime_resolution_for_hermes_queue_d
             )
         )
     )
-    await asyncio.sleep(0)
-
     service = pool._get_orchestration_service()  # type: ignore[attr-defined]
     assert service.get_running_execution(thread_id) is not None
+    await _await_until(
+        lambda: len(service.list_queued_executions(thread_id)) >= 1,
+        timeout_s=2.0,
+    )
     assert len(service.list_queued_executions(thread_id)) == 1
 
     release_first.set()
@@ -1304,10 +1361,12 @@ async def test_run_turn_queues_busy_delegated_thread_and_shows_active_work(
             )
         )
     )
-    await asyncio.sleep(0)
-
     service = pool._get_orchestration_service()  # type: ignore[attr-defined]
     assert service.get_running_execution(thread_id) is not None
+    await _await_until(
+        lambda: len(service.list_queued_executions(thread_id)) >= 1,
+        timeout_s=2.0,
+    )
     assert len(service.list_queued_executions(thread_id)) == 1
     assert harness.calls[0]["conversation_id"] == "session-1"
 

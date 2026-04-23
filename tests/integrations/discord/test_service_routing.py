@@ -13,6 +13,8 @@ from typing import Any
 import httpx
 import pytest
 
+pytestmark = pytest.mark.integration
+
 from codex_autorunner.core.filebox import (
     inbox_dir,
     outbox_dir,
@@ -4634,6 +4636,11 @@ async def test_car_model_rejects_invalid_opencode_model_name(tmp_path: Path) -> 
         outbox_manager=_FakeOutboxManager(),
     )
 
+    async def _no_model_items(**_kw: Any) -> list[tuple[str, str]] | None:
+        return None
+
+    service._list_model_items_for_binding = _no_model_items  # type: ignore[assignment]
+
     try:
         await service._handle_car_model(
             interaction_id="inter-1",
@@ -6422,6 +6429,225 @@ async def test_car_newt_resets_current_workspace_branch_and_session(
         assert "Model: default" in content
         assert "Effort: default" in content
     finally:
+        await store.close()
+
+
+@pytest.mark.anyio
+async def test_dispatch_deferred_slash_commands_ack_before_prior_handler_finishes(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    store = DiscordStateStore(tmp_path / "discord_state.sqlite3")
+    await store.initialize()
+    await store.upsert_binding(
+        channel_id="channel-1",
+        guild_id="guild-1",
+        workspace_path=str(workspace),
+        repo_id="repo-1",
+    )
+
+    first = _interaction(name="newt", options=[])
+    first["id"] = "inter-1"
+    first["token"] = "token-1"
+    second = _interaction(name="newt", options=[])
+    second["id"] = "inter-2"
+    second["token"] = "token-2"
+
+    rest = _FakeRest()
+    gateway = _FakeGateway([first, second])
+    service = DiscordBotService(
+        _config(tmp_path, allow_user_ids=frozenset({"user-1"})),
+        logger=logging.getLogger("test"),
+        rest_client=rest,
+        gateway_client=gateway,
+        state_store=store,
+        outbox_manager=_FakeOutboxManager(),
+    )
+
+    started: list[str] = []
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def _fake_handle_newt(
+        interaction_id: str,
+        interaction_token: str,
+        *,
+        channel_id: str,
+        guild_id: str | None,
+    ) -> None:
+        _ = interaction_token, channel_id, guild_id
+        started.append(interaction_id)
+        if interaction_id == "inter-1":
+            first_started.set()
+            await release_first.wait()
+
+    service._handle_car_newt = _fake_handle_newt  # type: ignore[assignment]
+
+    task = asyncio.create_task(service.run_forever())
+    try:
+        for _ in range(100):
+            if len(rest.interaction_responses) >= 2:
+                break
+            await asyncio.sleep(0.002)
+
+        assert [item["interaction_id"] for item in rest.interaction_responses] == [
+            "inter-1",
+            "inter-2",
+        ]
+        assert [item["payload"]["type"] for item in rest.interaction_responses] == [
+            5,
+            5,
+        ]
+        await asyncio.wait_for(first_started.wait(), timeout=1.0)
+        assert started == ["inter-1"]
+
+        release_first.set()
+        await asyncio.wait_for(task, timeout=1.0)
+        assert started == ["inter-1", "inter-2"]
+    finally:
+        release_first.set()
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        await store.close()
+
+
+@pytest.mark.anyio
+async def test_message_turn_waits_for_ingressed_slash_command_to_finish(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    store = DiscordStateStore(tmp_path / "discord_state.sqlite3")
+    await store.initialize()
+    await store.upsert_binding(
+        channel_id="channel-1",
+        guild_id="guild-1",
+        workspace_path=str(workspace),
+        repo_id="repo-1",
+    )
+
+    rest = _FakeRest()
+    service = DiscordBotService(
+        _config(tmp_path, allow_user_ids=frozenset({"user-1"})),
+        logger=logging.getLogger("test"),
+        rest_client=rest,
+        gateway_client=_FakeGateway([]),
+        state_store=store,
+        outbox_manager=_FakeOutboxManager(),
+    )
+
+    release_newt = asyncio.Event()
+    message_turn_started = asyncio.Event()
+    observed: list[str] = []
+
+    async def _fake_handle_newt(
+        interaction_id: str,
+        interaction_token: str,
+        *,
+        channel_id: str,
+        guild_id: str | None,
+    ) -> None:
+        _ = interaction_id, interaction_token, channel_id, guild_id
+        observed.append("newt:start")
+        await release_newt.wait()
+        observed.append("newt:end")
+
+    async def _fake_run_turn(
+        self,
+        *,
+        workspace_root: Path,
+        prompt_text: str,
+        input_items: list[dict[str, Any]] | None = None,
+        source_message_id: str | None = None,
+        agent: str,
+        model_override: str | None,
+        reasoning_effort: str | None,
+        session_key: str,
+        orchestrator_channel_key: str,
+        managed_thread_surface_key: str | None = None,
+        chat_ux_snapshot: Any = None,
+    ) -> DiscordMessageTurnResult:
+        _ = (
+            workspace_root,
+            input_items,
+            source_message_id,
+            agent,
+            model_override,
+            reasoning_effort,
+            session_key,
+            orchestrator_channel_key,
+            managed_thread_surface_key,
+            chat_ux_snapshot,
+        )
+        observed.append(f"message:{prompt_text}")
+        message_turn_started.set()
+        return DiscordMessageTurnResult(final_message="message reply")
+
+    service._handle_car_newt = _fake_handle_newt  # type: ignore[assignment]
+    service._run_agent_turn_for_message = _fake_run_turn.__get__(  # type: ignore[method-assign]
+        service,
+        DiscordBotService,
+    )
+
+    interaction = _interaction(name="newt", options=[])
+    interaction["id"] = "inter-1"
+    interaction["token"] = "token-1"
+    message_payload = {
+        "id": "m-1",
+        "channel_id": "channel-1",
+        "guild_id": "guild-1",
+        "content": "please continue",
+        "author": {"id": "user-1", "bot": False},
+        "attachments": [],
+    }
+
+    try:
+        await service._on_dispatch("INTERACTION_CREATE", interaction)
+        await service._on_dispatch("MESSAGE_CREATE", message_payload)
+
+        for _ in range(100):
+            if any(
+                "Queued (waiting for available worker...)"
+                in item["payload"].get("content", "")
+                for item in rest.channel_messages
+            ):
+                break
+            await asyncio.sleep(0.002)
+
+        assert observed == ["newt:start"]
+        assert message_turn_started.is_set() is False
+        queued_notice = next(
+            (
+                item["payload"]
+                for item in rest.channel_messages
+                if "Queued requests (1) behind /car newt"
+                in item["payload"].get("content", "")
+            ),
+            None,
+        )
+        assert queued_notice is not None
+        assert [
+            button["custom_id"]
+            for button in queued_notice["components"][0]["components"]
+        ] == ["queue_cancel:m-1"]
+
+        release_newt.set()
+
+        await asyncio.wait_for(message_turn_started.wait(), timeout=5.0)
+
+        assert observed == ["newt:start", "newt:end", "message:please continue"]
+        assert any(
+            "message reply" in item["payload"].get("content", "")
+            for item in rest.channel_messages
+        )
+    finally:
+        release_newt.set()
+        await service._shutdown()
         await store.close()
 
 
@@ -9731,7 +9957,7 @@ async def test_typing_indicator_can_remain_visible_briefly_after_local_end(
         assert rest.typing_calls[:2] == ["channel-1", "channel-1"]
         assert not await service._typing_session_active("channel-1")
         assert rest.typing_visible("channel-1")
-        await asyncio.sleep(0.15)
+        await asyncio.sleep(0.10)
         assert not rest.typing_visible("channel-1")
     finally:
         await store.close()
