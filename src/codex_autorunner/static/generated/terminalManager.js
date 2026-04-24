@@ -1,16 +1,16 @@
 // GENERATED FILE - do not edit directly. Source: static_src/
-import { flash, isMobileViewport } from "./utils.js?v=d636841caa7dd973f2c785ff2cd6199585023d519a2eb5a61d2f799a9872679f";
-import { getSelectedAgent, getSelectedProfile, getSelectedModel, getSelectedReasoning, initAgentControls, } from "./agentControls.js?v=d636841caa7dd973f2c785ff2cd6199585023d519a2eb5a61d2f799a9872679f";
-import { getSavedSessionId as getSessionId, setSavedSessionId as setSessionId, clearSavedSessionId as clearSessionId, markSessionActive as sessionMarkActive, buildConnectQuery, createTerminalSocket, teardownSocket as sessionTeardownSocket, SocketHeartbeat, ReconnectScheduler, } from "./terminalSession.js?v=d636841caa7dd973f2c785ff2cd6199585023d519a2eb5a61d2f799a9872679f";
-import { createReplayState, resetReplayState, initReplayForConnect, bufferReplayChunk, handleReplayEnd, consumeLiveReset, } from "./terminalReplay.js?v=d636841caa7dd973f2c785ff2cd6199585023d519a2eb5a61d2f799a9872679f";
-import { createTranscriptState, resetTranscript, restoreTranscript, hydrateTerminalFromTranscript, appendTranscriptChunk, isAltBufferActive, } from "./terminalTranscript.js?v=d636841caa7dd973f2c785ff2cd6199585023d519a2eb5a61d2f799a9872679f";
-import { TEXT_INPUT_STORAGE_KEYS, createTextInputState, readBoolFromStorage, safeFocus, captureTextInputSelection, updateTextInputSendUi, persistTextInputDraft, restoreTextInputDraft, loadPendingTextInput, sendPendingTextInputChunk, handleTextInputAck, sendFromTextarea, setTextInputEnabled, updateComposerSticky, registerTextInputHook, hasTextInputHookFired, markTextInputHookFired, migrateTextInputHookSession, handleImageFiles, } from "./terminalTextInput.js?v=d636841caa7dd973f2c785ff2cd6199585023d519a2eb5a61d2f799a9872679f";
-import { createMobileState, updateViewportInsets, captureTerminalScrollState, restoreTerminalScrollState, scrollToBottomIfNearBottom, setMobileViewActive, scheduleMobileViewRender, initMobileControls, installWheelScroll, installTouchScroll, } from "./terminalMobile.js?v=d636841caa7dd973f2c785ff2cd6199585023d519a2eb5a61d2f799a9872679f";
-import { createVoiceState, initTerminalVoice, handleVoiceHotkeyDown, handleVoiceHotkeyUp, } from "./terminalVoice.js?v=d636841caa7dd973f2c785ff2cd6199585023d519a2eb5a61d2f799a9872679f";
+import { flash, isMobileViewport } from "./utils.js?v=672f0b14d26680ec4c346e9b1c1cd1ec3bab19c20c06c2593893e8ee4601afcd";
+import { getSelectedAgent, getSelectedProfile, getSelectedModel, getSelectedReasoning, initAgentControls, } from "./agentControls.js?v=672f0b14d26680ec4c346e9b1c1cd1ec3bab19c20c06c2593893e8ee4601afcd";
+import { getSavedSessionId as getSessionId, setSavedSessionId as setSessionId, clearSavedSessionId as clearSessionId, markSessionActive as sessionMarkActive, buildConnectQuery, createTerminalSocket, teardownSocket as sessionTeardownSocket, SocketHeartbeat, ReconnectScheduler, } from "./terminalSession.js?v=672f0b14d26680ec4c346e9b1c1cd1ec3bab19c20c06c2593893e8ee4601afcd";
+import { createReplayState, resetReplayState, initReplayForConnect, bufferReplayChunk, handleReplayEnd, consumeLiveReset, } from "./terminalReplay.js?v=672f0b14d26680ec4c346e9b1c1cd1ec3bab19c20c06c2593893e8ee4601afcd";
+import { createTranscriptState, resetTranscript, restoreTranscript, hydrateTerminalFromTranscript, appendTranscriptChunk, isAltBufferActive, } from "./terminalTranscript.js?v=672f0b14d26680ec4c346e9b1c1cd1ec3bab19c20c06c2593893e8ee4601afcd";
+import { TEXT_INPUT_STORAGE_KEYS, createTextInputState, readBoolFromStorage, safeFocus, captureTextInputSelection, updateTextInputSendUi, persistTextInputDraft, restoreTextInputDraft, loadPendingTextInput, sendPendingTextInputChunk, handleTextInputAck, sendFromTextarea, setTextInputEnabled, updateComposerSticky, registerTextInputHook, hasTextInputHookFired, markTextInputHookFired, migrateTextInputHookSession, handleImageFiles, } from "./terminalTextInput.js?v=672f0b14d26680ec4c346e9b1c1cd1ec3bab19c20c06c2593893e8ee4601afcd";
+import { createMobileState, updateViewportInsets, captureTerminalScrollState, restoreTerminalScrollState, scrollToBottomIfNearBottom, setMobileViewActive, scheduleMobileViewRender, initMobileControls, installWheelScroll, installTouchScroll, } from "./terminalMobile.js?v=672f0b14d26680ec4c346e9b1c1cd1ec3bab19c20c06c2593893e8ee4601afcd";
+import { createVoiceState, initTerminalVoice, handleVoiceHotkeyDown, handleVoiceHotkeyUp, } from "./terminalVoice.js?v=672f0b14d26680ec4c346e9b1c1cd1ec3bab19c20c06c2593893e8ee4601afcd";
 const textEncoder = new TextEncoder();
-import { CONSTANTS } from "./constants.js?v=d636841caa7dd973f2c785ff2cd6199585023d519a2eb5a61d2f799a9872679f";
-import { subscribe } from "./bus.js?v=d636841caa7dd973f2c785ff2cd6199585023d519a2eb5a61d2f799a9872679f";
-import { REPO_ID, BASE_PATH } from "./env.js?v=d636841caa7dd973f2c785ff2cd6199585023d519a2eb5a61d2f799a9872679f";
+import { CONSTANTS } from "./constants.js?v=672f0b14d26680ec4c346e9b1c1cd1ec3bab19c20c06c2593893e8ee4601afcd";
+import { subscribe } from "./bus.js?v=672f0b14d26680ec4c346e9b1c1cd1ec3bab19c20c06c2593893e8ee4601afcd";
+import { REPO_ID, BASE_PATH } from "./env.js?v=672f0b14d26680ec4c346e9b1c1cd1ec3bab19c20c06c2593893e8ee4601afcd";
 const TOUCH_OVERRIDE = (() => {
     try {
         const params = new URLSearchParams(window.location.search);

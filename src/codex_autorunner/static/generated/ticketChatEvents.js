@@ -1,5 +1,5 @@
 // GENERATED FILE - do not edit directly. Source: static_src/
-import { ticketChat } from "./ticketChatActions.js?v=d636841caa7dd973f2c785ff2cd6199585023d519a2eb5a61d2f799a9872679f";
+import { ticketChat } from "./ticketChatActions.js?v=672f0b14d26680ec4c346e9b1c1cd1ec3bab19c20c06c2593893e8ee4601afcd";
 // This module now delegates to docChatCore for rendering and event parsing.
 export function applyTicketEvent(payload) {
     ticketChat.applyAppEvent(payload);

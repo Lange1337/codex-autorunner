@@ -1,7 +1,7 @@
 // GENERATED FILE - do not edit directly. Source: static_src/
-import { api, confirmModal, flash, resolvePath, openModal } from "./utils.js?v=d636841caa7dd973f2c785ff2cd6199585023d519a2eb5a61d2f799a9872679f";
-import { initTemplateReposSettings, loadTemplateRepos, } from "./templateReposSettings.js?v=d636841caa7dd973f2c785ff2cd6199585023d519a2eb5a61d2f799a9872679f";
-import { handleSystemUpdate, loadUpdateTargetOptions, } from "./systemUpdateUi.js?v=d636841caa7dd973f2c785ff2cd6199585023d519a2eb5a61d2f799a9872679f";
+import { api, confirmModal, flash, resolvePath, openModal } from "./utils.js?v=672f0b14d26680ec4c346e9b1c1cd1ec3bab19c20c06c2593893e8ee4601afcd";
+import { initTemplateReposSettings, loadTemplateRepos, } from "./templateReposSettings.js?v=672f0b14d26680ec4c346e9b1c1cd1ec3bab19c20c06c2593893e8ee4601afcd";
+import { handleSystemUpdate, loadUpdateTargetOptions, } from "./systemUpdateUi.js?v=672f0b14d26680ec4c346e9b1c1cd1ec3bab19c20c06c2593893e8ee4601afcd";
 const ui = {
     settingsBtn: document.getElementById("repo-settings"),
     threadList: document.getElementById("thread-tools-list"),
