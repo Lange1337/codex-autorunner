@@ -61,6 +61,33 @@ def _normalize_delivery_target(value: Any) -> Optional[dict[str, str]]:
     }
 
 
+def _repo_scoped_subscription_warning(
+    *,
+    hub_root: Path,
+    repo_id: Optional[str],
+    thread_id: Optional[str],
+) -> Optional[str]:
+    normalized_repo_id = _normalize_text(repo_id)
+    normalized_thread_id = _normalize_text(thread_id)
+    if normalized_repo_id is None or normalized_thread_id is not None:
+        return None
+    thread_count = (
+        PmaThreadStore(hub_root)
+        .count_threads_by_repo(status="active")
+        .get(
+            normalized_repo_id,
+            0,
+        )
+    )
+    if thread_count <= 1:
+        return None
+    return (
+        "thread_id omitted; this subscription is repo-scoped and may match any of "
+        f"{thread_count} active managed threads in repo {normalized_repo_id}. "
+        "Pass thread_id to scope it to one managed thread."
+    )
+
+
 def _resolve_subscription_max_matches(
     *,
     max_matches: Any,
@@ -1373,6 +1400,7 @@ class PmaAutomationStore:
                         max_matches=_resolve_subscription_max_matches(
                             max_matches=max_matches,
                             notify_once=notify_once,
+                            metadata=resolved_metadata,
                         ),
                         metadata=resolved_metadata,
                     )
@@ -1455,7 +1483,19 @@ class PmaAutomationStore:
             origin_thread_id=normalized_origin_thread_id,
             origin_lane_id=normalized_origin_lane_id,
         )
-        return {"subscription": created.to_dict(), "deduped": deduped}
+        result = {"subscription": created.to_dict(), "deduped": deduped}
+        scope_warning = _repo_scoped_subscription_warning(
+            hub_root=self._hub_root,
+            repo_id=normalized_repo_id,
+            thread_id=normalized_thread_id,
+        )
+        if scope_warning:
+            existing = result.get("warning")
+            if isinstance(existing, str) and existing.strip():
+                result["warning"] = f"{existing}\n{scope_warning}"
+            else:
+                result["warning"] = scope_warning
+        return result
 
     def cancel_subscription(self, subscription_id: str) -> bool:
         target_id = _normalize_text(subscription_id)

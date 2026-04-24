@@ -39,6 +39,7 @@ from codex_autorunner.core.ports.run_event import (
     TokenUsage,
 )
 from codex_autorunner.core.sse import format_sse
+from codex_autorunner.core.utils import canonicalize_path
 from codex_autorunner.integrations.app_server.client import (
     CodexAppServerDisconnected,
 )
@@ -54,6 +55,12 @@ from codex_autorunner.integrations.chat.collaboration_policy import (
 )
 from codex_autorunner.integrations.chat.compaction import build_compact_seed_prompt
 from codex_autorunner.integrations.chat.dispatcher import build_dispatch_context
+from codex_autorunner.integrations.chat.managed_thread_turns import (
+    ManagedThreadQueueWorkerHooks,
+)
+from codex_autorunner.integrations.discord.managed_thread_routing import (
+    _build_discord_runner_hooks,
+)
 from codex_autorunner.integrations.discord.service import (
     DISCORD_QUEUED_PLACEHOLDER_TEXT as QUEUED_PLACEHOLDER_TEXT,
 )
@@ -80,6 +87,33 @@ from tests.support.discord_turn_fakes import (
 )
 
 pytestmark = pytest.mark.slow
+
+
+def _discord_test_queue_worker_hooks(
+    service: Any,
+    *,
+    channel_id: str,
+    managed_thread_id: str,
+    public_execution_error: str,
+) -> ManagedThreadQueueWorkerHooks:
+    """Match production queue-worker hooks except durable_delivery (tests only)."""
+    workspace_root = canonicalize_path(
+        Path(getattr(getattr(service, "_config", None), "root", Path(".")))
+    )
+    runner_hooks = _build_discord_runner_hooks(
+        service,
+        channel_id=channel_id,
+        managed_thread_id=managed_thread_id,
+        workspace_root=workspace_root,
+        public_execution_error=public_execution_error,
+    )
+    queue_hooks = runner_hooks.queue_worker_hooks()
+    return ManagedThreadQueueWorkerHooks(
+        durable_delivery=None,
+        deliver_result=queue_hooks.deliver_result,
+        run_with_indicator=queue_hooks.run_with_indicator,
+        execution_hooks=queue_hooks.execution_hooks,
+    )
 
 
 def test_sanitize_runtime_thread_result_error_preserves_sanitized_detail() -> None:
@@ -8214,7 +8248,7 @@ async def test_discord_managed_thread_queue_worker_sends_placeholder_for_empty_r
         ),
         managed_thread_id="managed-thread-1",
         spawn_task=service._spawn_task,
-        hooks=discord_message_turns_module._build_discord_queue_worker_hooks(
+        hooks=_discord_test_queue_worker_hooks(
             service,
             channel_id="channel-1",
             managed_thread_id="managed-thread-1",
@@ -8331,7 +8365,7 @@ async def test_discord_managed_thread_queue_worker_formats_local_file_links(
         ),
         managed_thread_id="managed-thread-1",
         spawn_task=service._spawn_task,
-        hooks=discord_message_turns_module._build_discord_queue_worker_hooks(
+        hooks=_discord_test_queue_worker_hooks(
             service,
             channel_id="channel-1",
             managed_thread_id="managed-thread-1",
