@@ -131,6 +131,23 @@ def _surface_binding_from_lane_id(
     return surface_kind, surface_key
 
 
+def _lane_delivery_target_from_context(
+    context_payload: Optional[Mapping[str, Any]],
+) -> Optional[tuple[str, str]]:
+    if not isinstance(context_payload, Mapping):
+        return None
+    wake_up = context_payload.get("wake_up")
+    if isinstance(wake_up, Mapping):
+        target = _surface_binding_from_lane_id(
+            _normalize_optional_text(wake_up.get("lane_id"))
+        )
+        if target is not None:
+            return target
+    return _surface_binding_from_lane_id(
+        _normalize_optional_text(context_payload.get("lane_id"))
+    )
+
+
 def build_pma_dispatch_decision(
     *,
     message: str,
@@ -159,8 +176,13 @@ def build_pma_dispatch_decision(
 
     attempts: list[PmaDispatchAttempt] = []
     normalized_target = _normalize_pma_delivery_target(delivery_target)
-    if normalized_target is not None:
-        surface_kind, surface_key = normalized_target
+    lane_target = _surface_binding_from_lane_id(
+        lane_id
+    ) or _lane_delivery_target_from_context(context_payload)
+    explicit_target = normalized_target or lane_target
+    if explicit_target is not None:
+        target_requires_known_binding = normalized_target is not None
+        surface_kind, surface_key = explicit_target
         explicit_target_thread_ids = _explicit_delivery_target_thread_ids(
             managed_thread_id=managed_thread_id,
             context_payload=context_payload,
@@ -188,7 +210,9 @@ def build_pma_dispatch_decision(
                 requested_delivery="suppressed_duplicate",
                 suppress_publish=True,
             )
-        if explicit_target_thread_ids and target_matches_known_binding:
+        if not target_requires_known_binding or (
+            explicit_target_thread_ids and target_matches_known_binding
+        ):
             attempts.append(
                 PmaDispatchAttempt(
                     route="explicit",

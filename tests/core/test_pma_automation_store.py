@@ -753,6 +753,38 @@ def test_enqueue_wakeup_persists_dispatch_decision(tmp_path) -> None:
     assert isinstance(decision["attempts"], list)
 
 
+def test_notify_transition_uses_lane_delivery_target_in_dispatch_decision(
+    tmp_path,
+) -> None:
+    store = PmaAutomationStore(tmp_path, durable=False)
+    thread_id = _create_managed_thread(tmp_path)
+
+    store.create_subscription(
+        {
+            "event_type": "managed_thread_completed",
+            "thread_id": thread_id,
+            "lane_id": "discord:1497177978256232530",
+        }
+    )
+
+    store.notify_transition(
+        {
+            "event_type": "managed_thread_completed",
+            "thread_id": thread_id,
+            "from_state": "running",
+            "to_state": "completed",
+            "transition_id": f"{thread_id}:completed",
+        }
+    )
+
+    pending = store.list_pending_wakeups(limit=10)
+    assert len(pending) == 1
+    decision = pending[0]["metadata"]["dispatch_decision"]
+    assert decision["attempts"][0]["route"] == "explicit"
+    assert decision["attempts"][0]["surface_kind"] == "discord"
+    assert decision["attempts"][0]["surface_key"] == "1497177978256232530"
+
+
 def test_compute_dispatch_decision_for_wakeup_passes_lane_id(
     tmp_path, monkeypatch
 ) -> None:
@@ -796,6 +828,7 @@ def test_enqueue_wakeup_dispatch_decision_uses_wakeup_lane_id_surface_key(
         (attempt["route"], attempt["surface_kind"]): attempt.get("surface_key")
         for attempt in decision["attempts"]
     }
+    assert attempts_by_surface[("explicit", "discord")] == "12345"
     assert attempts_by_surface[("primary_pma", "discord")] == "12345"
     assert attempts_by_surface[("primary_pma", "telegram")] is None
 

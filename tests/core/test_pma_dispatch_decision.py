@@ -255,6 +255,37 @@ def test_build_pma_dispatch_decision_skips_explicit_without_binding_thread_ids(
     assert any(a.route == "primary_pma" for a in decision.attempts)
 
 
+def test_build_pma_dispatch_decision_uses_wake_up_lane_delivery_target_without_binding(
+    tmp_path: Path,
+) -> None:
+    decision = build_pma_dispatch_decision(
+        message="Lane target",
+        requested_delivery="auto",
+        source_kind="managed_thread_completed",
+        repo_id="repo-a",
+        workspace_root=tmp_path / "repo-a",
+        managed_thread_id="watched-thread",
+        delivery_target=None,
+        context_payload={
+            "wake_up": {
+                "lane_id": "discord:1497177978256232530",
+            }
+        },
+        binding_metadata_by_thread={},
+        preferred_bound_surface_kinds=("discord", "telegram"),
+    )
+
+    assert [attempt.route for attempt in decision.attempts] == [
+        "explicit",
+        "primary_pma",
+        "primary_pma",
+        "bound",
+        "bound",
+    ]
+    assert decision.attempts[0].surface_kind == "discord"
+    assert decision.attempts[0].surface_key == "1497177978256232530"
+
+
 def test_build_pma_dispatch_decision_resolves_discord_lane_surface_key(
     tmp_path: Path,
 ) -> None:
@@ -277,6 +308,7 @@ def test_build_pma_dispatch_decision_resolves_discord_lane_surface_key(
         for attempt in decision.attempts
     }
 
+    assert attempts_by_surface[("explicit", "discord")] == "12345"
     assert attempts_by_surface[("primary_pma", "discord")] == "12345"
     assert attempts_by_surface[("primary_pma", "telegram")] is None
     assert attempts_by_surface[("bound", "discord")] == "12345"
@@ -305,6 +337,7 @@ def test_build_pma_dispatch_decision_resolves_telegram_lane_surface_key(
         for attempt in decision.attempts
     }
 
+    assert attempts_by_surface[("explicit", "telegram")] == "chat-id"
     assert attempts_by_surface[("primary_pma", "discord")] is None
     assert attempts_by_surface[("primary_pma", "telegram")] == "chat-id"
     assert attempts_by_surface[("bound", "discord")] is None
