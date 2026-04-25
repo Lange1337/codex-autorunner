@@ -56,6 +56,7 @@ from codex_autorunner.integrations.chat.collaboration_policy import (
 from codex_autorunner.integrations.chat.compaction import build_compact_seed_prompt
 from codex_autorunner.integrations.chat.dispatcher import build_dispatch_context
 from codex_autorunner.integrations.chat.managed_thread_turns import (
+    ManagedThreadExecutionHooks,
     ManagedThreadQueueWorkerHooks,
 )
 from codex_autorunner.integrations.discord.managed_thread_routing import (
@@ -202,6 +203,118 @@ def test_resolve_discord_turn_policies_prefers_explicit_binding_values() -> None
         default_approval_policy="never",
         default_sandbox_policy="dangerFullAccess",
     ) == ("on-failure", "workspaceWrite")
+
+
+@pytest.mark.asyncio
+async def test_queue_worker_start_clears_stale_queued_progress_placeholder(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store = DiscordStateStore(tmp_path / "discord_state.sqlite3")
+    await store.initialize()
+    rest = _FakeRest()
+
+    class _Service:
+        def __init__(self) -> None:
+            self._config = _config(tmp_path)
+            self._store = store
+            self._rest = rest
+            self._logger = logging.getLogger(__name__)
+            self.approval_contexts: list[tuple[str, str]] = []
+
+        def _register_discord_turn_approval_context(
+            self,
+            *,
+            started_execution: Any,
+            channel_id: str,
+        ) -> None:
+            execution = getattr(started_execution, "execution", None)
+            execution_id = str(getattr(execution, "execution_id", "") or "").strip()
+            self.approval_contexts.append((channel_id, execution_id))
+
+        def _clear_discord_turn_approval_context(self, **kwargs: Any) -> None:
+            _ = kwargs
+
+        async def _delete_channel_message_safe(
+            self,
+            channel_id: str,
+            message_id: str,
+            *,
+            record_id: Optional[str] = None,
+        ) -> bool:
+            _ = record_id
+            await rest.delete_channel_message(
+                channel_id=channel_id,
+                message_id=message_id,
+            )
+            return True
+
+    monkeypatch.setattr(
+        "codex_autorunner.integrations.discord.managed_thread_routing.build_managed_thread_surface_queue_execution_hooks",
+        lambda **kwargs: ManagedThreadExecutionHooks(
+            on_execution_started=lambda started_execution: _run_queue_execution_start(
+                kwargs, started_execution
+            ),
+            on_execution_finished=kwargs["base_hooks"].on_execution_finished,
+        ),
+    )
+
+    await store.upsert_turn_progress_lease(
+        lease_id="lease-1",
+        managed_thread_id="thread-1",
+        execution_id="turn-1",
+        channel_id="channel-1",
+        message_id="queued-msg-1",
+        source_message_id="source-1",
+        state="active",
+        progress_label="queued",
+    )
+    service = _Service()
+    runner_hooks = _build_discord_runner_hooks(
+        service,
+        channel_id="channel-1",
+        managed_thread_id="thread-1",
+        workspace_root=tmp_path,
+        public_execution_error="Discord PMA turn failed",
+    )
+    started_execution = SimpleNamespace(
+        execution=SimpleNamespace(execution_id="turn-1")
+    )
+
+    try:
+        assert runner_hooks.queue_execution_hooks is not None
+        await runner_hooks.queue_execution_hooks.on_execution_started(started_execution)
+
+        assert service.approval_contexts == [("channel-1", "turn-1")]
+        assert rest.deleted_channel_messages == [
+            {"channel_id": "channel-1", "message_id": "queued-msg-1"}
+        ]
+        assert (
+            await store.list_turn_progress_leases(
+                managed_thread_id="thread-1",
+                execution_id="turn-1",
+            )
+            == []
+        )
+    finally:
+        await store.close()
+
+
+async def _run_queue_execution_start(
+    kwargs: dict[str, Any],
+    started_execution: Any,
+) -> None:
+    base_hooks = kwargs["base_hooks"]
+    on_execution_started = getattr(base_hooks, "on_execution_started", None)
+    if on_execution_started is not None:
+        result = on_execution_started(started_execution)
+        if asyncio.iscoroutine(result):
+            await result
+    on_progress_session_started = kwargs.get("on_progress_session_started")
+    if on_progress_session_started is not None:
+        result = on_progress_session_started(started_execution)
+        if asyncio.iscoroutine(result):
+            await result
 
 
 @pytest.mark.asyncio

@@ -456,6 +456,13 @@ def _build_discord_runner_hooks(
             on_execution_started=_on_execution_started,
             on_execution_finished=_on_execution_finished,
         ),
+        on_progress_session_started=lambda started_execution: (
+            _cleanup_stale_queued_progress_placeholder(
+                service,
+                managed_thread_id=managed_thread_id,
+                started_execution=started_execution,
+            )
+        ),
     )
 
     async def _deliver_result(finalized: ManagedThreadFinalizationResult) -> None:
@@ -514,3 +521,32 @@ def _build_discord_runner_hooks(
         run_with_indicator=_run_with_discord_typing_indicator,
         queue_execution_hooks=queue_execution_hooks,
     )
+
+
+async def _cleanup_stale_queued_progress_placeholder(
+    service: Any,
+    *,
+    managed_thread_id: str,
+    started_execution: Any,
+) -> None:
+    from .progress_leases import cleanup_discord_terminal_progress_leases
+
+    execution = getattr(started_execution, "execution", None)
+    execution_id = str(getattr(execution, "execution_id", "") or "").strip()
+    if not execution_id:
+        return
+    try:
+        await cleanup_discord_terminal_progress_leases(
+            service,
+            managed_thread_id=managed_thread_id,
+            execution_id=execution_id,
+            note="Status: this queued turn moved into active work.",
+            record_prefix="discord:queued-progress-transition",
+        )
+    except Exception:
+        _logger.debug(
+            "Failed to clear stale queued Discord progress placeholder for thread=%s execution=%s",
+            managed_thread_id,
+            execution_id,
+            exc_info=True,
+        )
