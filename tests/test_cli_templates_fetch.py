@@ -129,9 +129,11 @@ def test_templates_fetch_disabled(hub_env) -> None:
     assert "Templates are disabled." in result.output
 
 
+@pytest.mark.integration
 def test_templates_fetch_network_unavailable_includes_details(
     hub_env, tmp_path: Path
 ) -> None:
+    """Exercises real git remote access; latency and failure mode depend on the network."""
     _write_templates_config(
         hub_env.hub_root,
         enabled=True,
