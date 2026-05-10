@@ -393,6 +393,11 @@ function rollupGroupStatus(group: PmaChatRunGroup): WorkStatus {
   return 'idle';
 }
 
+function chatCountsDoneForRun(chat: PmaChatSummary): boolean {
+  if (chat.status === 'failed' || chat.status === 'invalid') return false;
+  return chat.ticketDone === true || chat.status === 'done';
+}
+
 export function buildPmaChatListEntries(
   chats: PmaChatSummary[],
   options: {
@@ -450,7 +455,7 @@ export function buildPmaChatListEntries(
       if (isUnread(chat, lastSeen)) group.unreadCount += 1;
       if (chat.status === 'running') group.activeCount += 1;
       else if (chat.status === 'waiting' || chat.status === 'blocked') group.waitingCount += 1;
-      else if (chat.status === 'done') group.doneCount += 1;
+      else if (chatCountsDoneForRun(chat)) group.doneCount += 1;
       else if (chat.status === 'failed' || chat.status === 'invalid') group.failedCount += 1;
       if (chat.updatedAt && (!group.updatedAt || chat.updatedAt > group.updatedAt)) {
         group.updatedAt = chat.updatedAt;
@@ -522,7 +527,7 @@ export function filterPmaChatEntries(
       if (isUnread(chat, lastSeen)) trimmed.unreadCount += 1;
       if (chat.status === 'running') trimmed.activeCount += 1;
       else if (chat.status === 'waiting' || chat.status === 'blocked') trimmed.waitingCount += 1;
-      else if (chat.status === 'done') trimmed.doneCount += 1;
+      else if (chatCountsDoneForRun(chat)) trimmed.doneCount += 1;
       else if (chat.status === 'failed' || chat.status === 'invalid') trimmed.failedCount += 1;
       if (chat.updatedAt && (!trimmed.updatedAt || chat.updatedAt > trimmed.updatedAt)) {
         trimmed.updatedAt = chat.updatedAt;
