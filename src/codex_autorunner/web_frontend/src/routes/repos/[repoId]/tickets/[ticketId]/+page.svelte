@@ -45,9 +45,9 @@
   async function loadPickerSupport(): Promise<void> {
     const result = await pmaApi.pma.listAgents();
     if (!result.ok) return;
-    agents = result.data;
+    agents = result.data.agents;
     const entries = await Promise.all(
-      result.data
+      result.data.agents
         .filter((agent) => agentCanListModels(agent))
         .map(async (agent) => {
           const id = agentId(agent);

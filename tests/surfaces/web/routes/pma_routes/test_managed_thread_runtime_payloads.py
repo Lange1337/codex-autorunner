@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 from fastapi import HTTPException
@@ -108,6 +109,65 @@ def test_resolve_message_options_preserves_runtime_cwd_in_prompt(
 
     assert f"Hub root: `{hub_root.resolve()}`." in options.execution_prompt
     assert f"Runtime cwd: `{workspace_root.resolve()}`." in options.execution_prompt
+
+
+def test_resolve_message_options_uses_thread_metadata_profile(tmp_path: Path) -> None:
+    hub_root = tmp_path / "hub"
+    workspace_root = tmp_path / "repo"
+    hub_root.mkdir()
+    workspace_root.mkdir()
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(config=SimpleNamespace(root=hub_root, raw={}))
+        )
+    )
+
+    options = resolve_managed_thread_message_options(
+        request,
+        ManagedThreadMessageRequest(message="hello"),
+        managed_thread_id="thread-1",
+        thread={
+            "agent": "hermes",
+            "workspace_root": str(workspace_root),
+            "metadata": {"agent_profile": "alpha"},
+        },
+        service=SimpleNamespace(),
+    )
+
+    assert options.agent_profile == "alpha"
+
+
+@patch(
+    "codex_autorunner.surfaces.web.routes.pma_routes.managed_thread_runtime_payloads.resolve_requested_agent_profile",
+    return_value="gamma",
+)
+def test_resolve_message_options_explicit_profile(
+    mock_resolve: object, tmp_path: Path
+) -> None:
+    hub_root = tmp_path / "hub"
+    workspace_root = tmp_path / "repo"
+    hub_root.mkdir()
+    workspace_root.mkdir()
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(config=SimpleNamespace(root=hub_root, raw={}))
+        )
+    )
+
+    options = resolve_managed_thread_message_options(
+        request,
+        ManagedThreadMessageRequest(message="hello", profile="gamma"),
+        managed_thread_id="thread-1",
+        thread={
+            "agent": "hermes",
+            "workspace_root": str(workspace_root),
+            "metadata": {"agent_profile": "alpha"},
+        },
+        service=SimpleNamespace(),
+    )
+
+    assert getattr(mock_resolve, "call_count", 0) == 1
+    assert options.agent_profile == "gamma"
 
 
 class TestBuildInterruptFailurePayload:

@@ -39,6 +39,7 @@ const baseChat: PmaChatSummary = {
   title: 'Repo repair',
   status: 'running',
   agentId: 'codex',
+  agentProfile: null,
   model: 'gpt-5.2',
   repoId: 'repo-1',
   worktreeId: 'repo-1--pma',
@@ -854,6 +855,12 @@ describe('PMA chat view helpers', () => {
       name: 'New PMA chat',
       scope_urn: 'hub'
     });
+    expect(buildManagedThreadCreatePayload('hermes', local, 'New PMA chat', '', 'planning')).toEqual({
+      agent: 'hermes',
+      name: 'New PMA chat',
+      profile: 'planning',
+      scope_urn: 'hub'
+    });
   });
 
   it('labels existing chat scopes from durable backend fields', () => {
@@ -941,6 +948,14 @@ describe('PMA chat view helpers', () => {
       model: 'gpt-5.2',
       reasoning: undefined,
       busy_policy: 'queue'
+    });
+    expect(buildManagedThreadMessagePayload('Continue', 'gpt-5.2', false, [], '', 'planning')).toEqual({
+      message: 'Continue',
+      attachments: undefined,
+      model: 'gpt-5.2',
+      reasoning: undefined,
+      profile: 'planning',
+      busy_policy: undefined
     });
     expect(buildManagedThreadMessagePayload('Continue', 'gpt-5.2', false, [], 'high')).toMatchObject({
       message: 'Continue',

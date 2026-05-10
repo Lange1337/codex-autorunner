@@ -61,10 +61,22 @@ describe('view model mappers', () => {
       title: 'Repo fix',
       status: 'idle',
       agentId: 'codex',
+      agentProfile: null,
       model: 'gpt-5.2',
       repoId: 'repo-1',
       updatedAt: '2026-05-04T00:00:00Z'
     });
+  });
+
+  it('maps managed thread agent_profile into chat summaries', () => {
+    const vm = mapPmaChatSummary({
+      managed_thread_id: 'thread-h',
+      name: 'Hermes chat',
+      agent: 'hermes',
+      agent_profile: 'planning',
+      normalized_status: 'idle'
+    });
+    expect(vm.agentProfile).toBe('planning');
   });
 
   it('falls back to status_changed_at when updated_at is absent from list payloads', () => {

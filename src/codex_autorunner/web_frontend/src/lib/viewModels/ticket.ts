@@ -935,6 +935,7 @@ function syntheticChat(ticket: TicketDetail, run: PmaRunProgress): PmaChatSummar
     title: ticket.title,
     status: run.status,
     agentId: ticket.agentId,
+    agentProfile: null,
     model: null,
     repoId: ticket.repoId,
     worktreeId: ticket.worktreeId,

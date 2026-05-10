@@ -862,6 +862,20 @@ def build_managed_thread_runtime_routes(
             service=service,
         )
 
+        if payload.profile_explicit:
+            meta = thread.get("metadata")
+            if not isinstance(meta, dict):
+                meta = {}
+            prior_profile = normalize_optional_text(
+                thread.get("agent_profile") or meta.get("agent_profile")
+            )
+            next_profile = normalize_optional_text(options.agent_profile)
+            if prior_profile != next_profile:
+                thread_store.update_thread_metadata(
+                    managed_thread_id,
+                    {"agent_profile": options.agent_profile},
+                )
+
         if str(thread.get("lifecycle_status") or "").strip().lower() == "archived":
             return JSONResponse(
                 status_code=409,

@@ -66,3 +66,27 @@ export function pickerModelState(
 export function pickerReasoningOptions(catalog: PickerRecord[], selectedModel: string): string[] {
   return modelReasoningOptions(modelRecordForValue(catalog, selectedModel));
 }
+
+export type AgentProfileOption = { id: string; label: string };
+
+/** Hermes profile rows from `/hub/pma/agents` catalog (`profiles[].id` / `display_name`). */
+export function agentProfileEntriesForRecord(agent: PickerRecord | null): AgentProfileOption[] {
+  if (!agent || agentId(agent) !== 'hermes') return [];
+  const raw = agent.profiles;
+  if (!Array.isArray(raw)) return [];
+  const out: AgentProfileOption[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object') continue;
+    const rec = entry as Record<string, unknown>;
+    const id = stringField(rec, 'id');
+    if (!id) continue;
+    const label =
+      stringField(rec, 'display_name') ??
+      stringField(rec, 'displayName') ??
+      stringField(rec, 'label') ??
+      id;
+    out.push({ id, label });
+  }
+  out.sort((left, right) => left.id.localeCompare(right.id));
+  return out;
+}

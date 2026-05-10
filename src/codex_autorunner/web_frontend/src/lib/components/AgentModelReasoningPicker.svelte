@@ -4,6 +4,7 @@
     agentCanListModels,
     agentId,
     agentLabel,
+    agentProfileEntriesForRecord,
     agentRecordForId,
     type PickerRecord
   } from '$lib/viewModels/modelPickers';
@@ -14,6 +15,7 @@
     agents = [],
     fallbackAgentIds = [],
     agentValue = $bindable(''),
+    profileValue = $bindable(''),
     models = [],
     modelValue = $bindable(''),
     reasoningValue = $bindable(''),
@@ -25,12 +27,14 @@
     emptyModelLabel = 'Configured model',
     defaultReasoningLabel = undefined,
     showAgent = undefined,
+    enableHermesProfile = true,
     onAgentChange = undefined,
     onchange = undefined
   }: {
     agents?: PickerRecord[];
     fallbackAgentIds?: string[];
     agentValue?: string;
+    profileValue?: string;
     models?: PickerRecord[];
     modelValue?: string;
     reasoningValue?: string;
@@ -42,12 +46,15 @@
     emptyModelLabel?: string;
     defaultReasoningLabel?: string;
     showAgent?: boolean;
+    /** When false, suppress Hermes profile dropdown (e.g. ticket settings until profile is persisted). */
+    enableHermesProfile?: boolean;
     onAgentChange?: (() => void) | undefined;
     onchange?: (() => void) | undefined;
   } = $props();
 
   const rowClass = $derived(variant === 'ticket' ? 'ticket-inline-field' : 'start-picker-row');
   const agentSpanLabel = $derived(variant === 'ticket' ? 'Agent' : 'agent');
+  const profileSpanLabel = $derived(variant === 'ticket' ? 'Profile' : 'profile');
   const modelLabelText = $derived(variant === 'ticket' ? 'Model' : 'model');
   const reasoningLabelText = $derived(variant === 'ticket' ? 'Reasoning' : 'effort');
   const reasoningAriaLabel = $derived(variant === 'ticket' ? 'Reasoning' : 'Effort');
@@ -68,12 +75,30 @@
     Boolean(selectedAgentCanListModels && (loading || models.length > 0 || Boolean(modelCatalogError)))
   );
 
+  const profilePickerEntries = $derived(agentProfileEntriesForRecord(selectedAgentRecord));
+  const showHermesProfilePicker = $derived.by(() => {
+    if (!enableHermesProfile) return false;
+    if ((agentValue || '').toLowerCase() !== 'hermes') return false;
+    if (profilePickerEntries.length > 0) return true;
+    return Boolean(profileValue.trim());
+  });
+
+  $effect(() => {
+    if ((agentValue || '').toLowerCase() !== 'hermes') {
+      profileValue = '';
+    }
+  });
+
   function handleAgentSelectChange(): void {
     onAgentChange?.();
     onchange?.();
   }
 
   function handleModelReasoningChange(): void {
+    onchange?.();
+  }
+
+  function handleProfileChange(): void {
     onchange?.();
   }
 </script>
@@ -86,6 +111,21 @@
         <option value={agentValue}>{agentValue}</option>
       {/if}
       {#each agentPickerEntries as entry (entry.id)}
+        <option value={entry.id}>{entry.label}</option>
+      {/each}
+    </select>
+  </label>
+{/if}
+
+{#if showHermesProfilePicker}
+  <label class={rowClass}>
+    <span>{profileSpanLabel}</span>
+    <select aria-label="Hermes profile" bind:value={profileValue} onchange={handleProfileChange}>
+      <option value="">Default</option>
+      {#if profileValue && !profilePickerEntries.some((entry) => entry.id === profileValue)}
+        <option value={profileValue}>{profileValue}</option>
+      {/if}
+      {#each profilePickerEntries as entry (entry.id)}
         <option value={entry.id}>{entry.label}</option>
       {/each}
     </select>

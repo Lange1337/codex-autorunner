@@ -32,6 +32,7 @@ class ManagedThreadMessageInput:
     defer_execution: bool
     model: Optional[str]
     reasoning: Optional[str]
+    agent_profile: Optional[str]
     attachments: Any
     defaults: dict[str, Any]
     thread: dict[str, Any]
@@ -90,9 +91,7 @@ def resolve_managed_thread_message_options(
     metadata = input.thread.get("metadata")
     if not isinstance(metadata, dict):
         metadata = {}
-    agent_profile = _normalize_optional_text(
-        input.thread.get("agent_profile") or metadata.get("agent_profile")
-    )
+    agent_profile = _normalize_optional_text(input.agent_profile)
     context_profile = normalize_car_context_profile(
         input.thread.get("context_profile") or metadata.get("context_profile"),
         default=default_managed_thread_context_profile(),

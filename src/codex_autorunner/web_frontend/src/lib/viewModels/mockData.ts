@@ -47,6 +47,7 @@ export const mockChatSummary: PmaChatSummary = {
   title: 'Hub rewrite foundation',
   status: 'running',
   agentId: 'codex',
+  agentProfile: null,
   model: 'configured model',
   repoId: 'codex-autorunner',
   worktreeId: null,

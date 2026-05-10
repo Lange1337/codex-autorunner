@@ -540,6 +540,7 @@
           variant="ticket"
           {agents}
           fallbackAgentIds={agentOptions}
+          enableHermesProfile={false}
           bind:agentValue={editAgent}
           bind:modelValue={editModel}
           bind:reasoningValue={editReasoning}

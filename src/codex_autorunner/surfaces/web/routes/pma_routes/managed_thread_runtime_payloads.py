@@ -39,6 +39,7 @@ from ...services.pma.common import pma_config_from_raw as shared_pma_config_from
 from ...services.pma.managed_thread_followup import (
     resolve_managed_thread_followup_policy,
 )
+from ..agent_profile_validation import resolve_requested_agent_profile
 
 
 def normalize_managed_thread_attachments(value: Any) -> list[dict[str, Any]]:
@@ -135,6 +136,25 @@ def resolve_managed_thread_message_options(
         or ""
     )
     approval_policy, sandbox_policy = _resolve_managed_thread_policies(thread)
+    metadata = thread.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    agent_id = (
+        _normalize_optional_text(thread.get("agent") or thread.get("agent_id"))
+        or "codex"
+    )
+    thread_profile = _normalize_optional_text(
+        thread.get("agent_profile") or metadata.get("agent_profile")
+    )
+    if payload.profile_explicit:
+        effective_agent_profile = resolve_requested_agent_profile(
+            request,
+            agent_id,
+            _normalize_optional_text(payload.profile),
+            default_profile=thread_profile,
+        )
+    else:
+        effective_agent_profile = thread_profile
     try:
         return _core_resolve_managed_thread_message_options(
             ManagedThreadMessageInput(
@@ -147,6 +167,7 @@ def resolve_managed_thread_message_options(
                 defer_execution=bool(payload.defer_execution),
                 model=payload.model,
                 reasoning=payload.reasoning,
+                agent_profile=effective_agent_profile,
                 attachments=payload.attachments,
                 defaults=defaults,
                 thread=thread,

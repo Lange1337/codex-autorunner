@@ -62,6 +62,7 @@
     agentDisplayForChat,
     agentId,
     agentLabel,
+    agentProfileEntriesForRecord,
     agentRecordForId,
     firstModelValue,
     modelExists,
@@ -85,6 +86,7 @@
   let selectedAgent = $state('codex');
   let selectedModel = $state('');
   let selectedReasoning = $state('');
+  let selectedProfile = $state('');
   let selectedScopeId = $state('local');
   let newChatKind = $state<'pma' | 'agent'>('pma');
   let filter = $state<PmaChatFilter>('all');
@@ -212,6 +214,7 @@
   const selectedScope = $derived(scopeOptions.find((scope) => scope.id === selectedScopeId) ?? localPmaChatScopeOption());
   const selectedAgentRecord = $derived(agentRecordForId(agents, selectedAgent));
   const selectedAgentCanListModels = $derived(agentCanListModels(selectedAgentRecord));
+  const hermesProfileChoices = $derived(agentProfileEntriesForRecord(agentRecordForId(agents, 'hermes')));
   const selectedModelRecord = $derived(modelRecordForValue(models, selectedModel));
   const reasoningOptions = $derived(pickerReasoningOptions(models, selectedModel));
   const showAgentSelector = $derived(Boolean(activeChat && agents.length > 0));
@@ -241,6 +244,14 @@
   );
   const chatHasActivity = $derived(activeCards.length > 0 || showStatusBar);
   const showStartPicker = $derived(Boolean(activeChat) && !loadingActive && !activeError && !chatHasActivity);
+  const showComposerHermesProfile = $derived(
+    Boolean(
+      activeChat &&
+        !showStartPicker &&
+        selectedAgent === 'hermes' &&
+        (hermesProfileChoices.length > 0 || Boolean(selectedProfile.trim()))
+    )
+  );
   const selectedAgentLabel = $derived(selectedAgentRecord ? agentLabel(selectedAgentRecord) : selectedAgent || 'Agent');
   const selectedModelLabel = $derived(selectedModelRecord ? modelLabel(selectedModelRecord) : selectedModel || '');
   const selectedEffortLabel = $derived(selectedReasoning || 'default');
@@ -384,10 +395,15 @@
     if (!scopeOptions.some((scope) => scope.id === selectedScopeId)) selectedScopeId = 'local';
     if (!canStartCodingAgentChat) newChatKind = 'pma';
     if (agentResult.ok) {
-      agents = agentResult.data;
+      agents = agentResult.data.agents;
+      const defaults = agentResult.data.defaults;
+      const defaultProfile =
+        typeof defaults.profile === 'string' && defaults.profile.trim() ? defaults.profile.trim() : '';
       if (!activeChat?.agentId) {
-        selectedAgent =
-          agentResult.data[0] ? agentId(agentResult.data[0]) : selectedAgent;
+        selectedAgent = agentResult.data.agents[0] ? agentId(agentResult.data.agents[0]) : selectedAgent;
+        if (selectedAgent === 'hermes' && defaultProfile && !selectedProfile.trim()) {
+          selectedProfile = defaultProfile;
+        }
       }
       void loadModels(selectedAgent, activeChat?.model ?? selectedModel);
     }
@@ -663,11 +679,13 @@
     if (scopeId) selectedScopeId = scopeId;
     if (!chat?.agentId) return;
     selectedAgent = chat.agentId;
+    selectedProfile = chat.agentProfile ?? '';
     selectedReasoning = stringField(chat.raw, 'reasoning') ?? '';
     void loadModels(chat.agentId, chat.model ?? selectedModel);
   }
 
   function handleAgentChange(): void {
+    if (selectedAgent !== 'hermes') selectedProfile = '';
     void loadModels(selectedAgent);
   }
 
@@ -679,7 +697,9 @@
 
   async function ensureChatForSelectedAgent(): Promise<string | null> {
     if (!activeChat?.agentId || activeChat.agentId === selectedAgent) return activeChatId;
-    const result = await pmaApi.pma.createChat(buildManagedThreadCreatePayload(selectedAgent, selectedScope, newChatDisplayName(), selectedModel));
+    const result = await pmaApi.pma.createChat(
+      buildManagedThreadCreatePayload(selectedAgent, selectedScope, newChatDisplayName(), selectedModel, selectedProfile)
+    );
     if (!result.ok) {
       composeError = result.error;
       return null;
@@ -741,7 +761,9 @@
   async function createChat(): Promise<void> {
     creating = true;
     composeError = null;
-    const result = await pmaApi.pma.createChat(buildManagedThreadCreatePayload(selectedAgent, selectedScope, newChatDisplayName(), selectedModel));
+    const result = await pmaApi.pma.createChat(
+      buildManagedThreadCreatePayload(selectedAgent, selectedScope, newChatDisplayName(), selectedModel, selectedProfile)
+    );
     if (result.ok) {
       chats = [result.data, ...chats.filter((chat) => chat.id !== result.data.id)];
       await selectChat(result.data.id);
@@ -812,12 +834,23 @@
     const targetIsRunning = targetChatId === activeChatId && activeChat?.status === 'running';
     const result = await pmaApi.pma.sendMessage(
       targetChatId,
-      buildManagedThreadMessagePayload(message, selectedModel, targetIsRunning, attachmentsForMessage, selectedReasoning)
+      buildManagedThreadMessagePayload(
+        message,
+        selectedModel,
+        targetIsRunning,
+        attachmentsForMessage,
+        selectedReasoning,
+        selectedProfile
+      )
     );
     if (result.ok) {
       await refreshActive(targetChatId, { quiet: true });
       removeOptimistic();
       pendingAttachments = [];
+      if (selectedAgent === 'hermes' && selectedProfile.trim()) {
+        const stamped = selectedProfile.trim();
+        chats = chats.map((row) => (row.id === targetChatId ? { ...row, agentProfile: stamped } : row));
+      }
     } else {
       restoreDraft();
       composeError = result.error;
@@ -1255,6 +1288,7 @@
           <AgentModelReasoningPicker
             {agents}
             bind:agentValue={selectedAgent}
+            bind:profileValue={selectedProfile}
             bind:modelValue={selectedModel}
             bind:reasoningValue={selectedReasoning}
             {models}
@@ -1271,6 +1305,7 @@
 
     <form
       class="composer"
+      class:composer-has-hermes-profile={showComposerHermesProfile}
       onpaste={handlePaste}
       onsubmit={(event) => {
         event.preventDefault();
@@ -1335,6 +1370,22 @@
               <button type="button" aria-label={`Remove ${attachment.title}`} onclick={() => removeAttachment(attachment.id)}>x</button>
             </span>
           {/each}
+        </div>
+      {/if}
+      {#if showComposerHermesProfile}
+        <div class="composer-hermes-profile">
+          <label class="start-picker-row">
+            <span>profile</span>
+            <select aria-label="Hermes profile" bind:value={selectedProfile}>
+              <option value="">Default</option>
+              {#if selectedProfile && !hermesProfileChoices.some((entry) => entry.id === selectedProfile)}
+                <option value={selectedProfile}>{selectedProfile}</option>
+              {/if}
+              {#each hermesProfileChoices as entry (entry.id)}
+                <option value={entry.id}>{entry.label}</option>
+              {/each}
+            </select>
+          </label>
         </div>
       {/if}
       <textarea

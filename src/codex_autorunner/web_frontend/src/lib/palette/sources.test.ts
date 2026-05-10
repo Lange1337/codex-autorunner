@@ -27,6 +27,7 @@ describe('threadSource', () => {
         title: 'Fix login bug',
         status: 'idle',
         agentId: 'codex',
+        agentProfile: null,
         model: null,
         repoId: null,
         worktreeId: null,

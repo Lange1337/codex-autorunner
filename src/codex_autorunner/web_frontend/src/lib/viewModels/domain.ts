@@ -8,6 +8,8 @@ export type PmaChatSummary = {
   title: string;
   status: WorkStatus;
   agentId: string | null;
+  /** Hermes (and similar) runtime profile when set on the managed thread. */
+  agentProfile: string | null;
   model: string | null;
   repoId: string | null;
   worktreeId: string | null;
@@ -220,6 +222,7 @@ export function mapPmaChatSummary(raw: JsonRecord): PmaChatSummary {
     title: readableThreadTitle(raw, id, ticketId),
     status,
     agentId: nullableString(raw.agent_id ?? raw.agent),
+    agentProfile: nullableString(raw.agent_profile ?? raw.agentProfile),
     model: nullableString(raw.model ?? latest.model),
     repoId,
     worktreeId,

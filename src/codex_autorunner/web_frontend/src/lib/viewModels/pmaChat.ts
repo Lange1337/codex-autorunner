@@ -116,6 +116,7 @@ export type PmaStatusBar = {
 export type ManagedThreadCreatePayload = {
   agent?: string;
   model?: string;
+  profile?: string;
   name: string;
   scope_urn: string;
 };
@@ -153,6 +154,7 @@ export type ManagedThreadMessagePayload = {
   attachments?: DocumentFileIntentPayload[];
   model?: string;
   reasoning?: string;
+  profile?: string;
   busy_policy?: 'queue';
 };
 
@@ -1364,15 +1366,18 @@ export function buildManagedThreadCreatePayload(
   agent: string,
   scope: PmaChatScopeOption = localPmaChatScopeOption(),
   name = 'New PMA chat',
-  model = ''
+  model = '',
+  profile = ''
 ): ManagedThreadCreatePayload {
   const base: Pick<ManagedThreadCreatePayload, 'agent' | 'name' | 'model'> = {
     agent: agent || undefined,
     name
   };
   if (model) base.model = model;
+  const trimmedProfile = profile.trim();
   return {
     ...base,
+    ...(trimmedProfile ? { profile: trimmedProfile } : {}),
     scope_urn: scope.scopeUrn
   };
 }
@@ -1537,13 +1542,16 @@ export function buildManagedThreadMessagePayload(
   model: string,
   isRunning: boolean,
   attachments: PendingAttachment[] = [],
-  reasoning = ''
+  reasoning = '',
+  profile = ''
 ): ManagedThreadMessagePayload {
+  const trimmed = profile.trim();
   return {
     message,
     attachments: attachments.length ? attachments.map(pendingAttachmentToIntent) : undefined,
     model: model || undefined,
     reasoning: reasoning || undefined,
+    ...(trimmed ? { profile: trimmed } : {}),
     busy_policy: isRunning ? 'queue' : undefined
   };
 }

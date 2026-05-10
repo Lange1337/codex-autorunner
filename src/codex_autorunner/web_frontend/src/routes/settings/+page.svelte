@@ -58,7 +58,7 @@
       return;
     }
 
-    const agentRows = agents.ok ? agents.data : [];
+    const agentRows = agents.ok ? agents.data.agents : [];
     const modelCatalogs: Record<string, JsonRecord[] | null> = {};
     await Promise.all(
       agentRows.map(async (agent) => {

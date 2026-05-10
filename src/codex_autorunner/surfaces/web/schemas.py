@@ -853,6 +853,7 @@ class ManagedThreadMessageRequest(Payload):
     )
     model: Optional[str] = None
     reasoning: Optional[str] = None
+    profile: Optional[str] = None
     defer_execution: bool = Field(
         default=False,
         validation_alias=AliasChoices("defer_execution", "deferExecution"),
@@ -881,6 +882,7 @@ class ManagedThreadMessageRequest(Payload):
     terminal_followup_explicit: bool = Field(default=False, exclude=True)
     notify_lane_explicit: bool = Field(default=False, exclude=True)
     notify_once_explicit: bool = Field(default=False, exclude=True)
+    profile_explicit: bool = Field(default=False, exclude=True)
 
     @model_validator(mode="before")
     @classmethod
@@ -900,6 +902,7 @@ class ManagedThreadMessageRequest(Payload):
         payload["notify_once_explicit"] = any(
             key in value for key in ("notify_once", "notifyOnce")
         )
+        payload["profile_explicit"] = "profile" in value
         return payload
 
 

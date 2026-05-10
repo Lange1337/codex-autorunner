@@ -3,6 +3,8 @@ import {
   agentCanListModels,
   agentDisplayForChat,
   agentId,
+  agentLabel,
+  agentProfileEntriesForRecord,
   agentRecordForId,
   firstModelValue,
   modelExists,
@@ -56,5 +58,25 @@ describe('model picker helpers', () => {
         'zai-coding-plan/glm-4.7'
       )
     ).toEqual([]);
+  });
+
+  it('normalizes Hermes profile rows from PMA /agents payloads', () => {
+    const hermes = {
+      id: 'hermes',
+      name: 'Hermes',
+      profiles: [
+        { id: 'planning', display_name: 'Planning mode' },
+        { id: 'global', display_name: 'global' }
+      ],
+      capability_projection: {
+        actions: { list_models: { allowed: false, missing_capabilities: ['model_listing'] } }
+      }
+    };
+    expect(agentProfileEntriesForRecord(hermes)).toEqual([
+      { id: 'global', label: 'global' },
+      { id: 'planning', label: 'Planning mode' }
+    ]);
+    expect(agentProfileEntriesForRecord(agents[0])).toEqual([]);
+    expect(agentLabel(hermes)).toBe('Hermes');
   });
 });
