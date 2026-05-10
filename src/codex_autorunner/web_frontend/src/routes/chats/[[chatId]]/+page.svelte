@@ -335,10 +335,13 @@
     Boolean(
       statusBar &&
         statusBar.state !== 'idle' &&
-        statusBar.state !== 'done' &&
-        ((progress?.elapsedSeconds !== null && progress?.elapsedSeconds !== undefined) ||
-          (progress?.queueDepth ?? 0) > 0 ||
-          ['running', 'waiting', 'blocked', 'failed'].includes(statusBar.state))
+        (statusBar.state === 'done'
+          ? Boolean(statusBar.tokenUsageLabel || statusBar.contextRemainingLabel)
+          : (progress?.elapsedSeconds !== null && progress?.elapsedSeconds !== undefined) ||
+            (progress?.queueDepth ?? 0) > 0 ||
+            statusBar.tokenUsageLabel ||
+            statusBar.contextRemainingLabel ||
+            ['running', 'waiting', 'blocked', 'failed'].includes(statusBar.state))
     )
   );
   const chatHasActivity = $derived(activeCards.length > 0 || showStatusBar);
@@ -1709,21 +1712,6 @@
                 <span class="chat-header-scope">{headerScopeLine}</span>
               {/if}
             </span>
-            {#if showStatusBar && statusBar}
-              <div class={`pma-status-bar ${statusBar.state}`} aria-label="Turn status">
-                <span class="status-dot" aria-hidden="true"></span>
-                <strong>{statusLabel(statusBar.state)}</strong>
-                {#if statusBar.phase && statusBar.phase.toLowerCase() !== statusLabel(statusBar.state).toLowerCase()}
-                  <span>{statusBar.phase}</span>
-                {/if}
-                {#if progress?.elapsedSeconds !== null && progress?.elapsedSeconds !== undefined}
-                  <span>{statusBar.elapsedLabel}</span>
-                {/if}
-                {#if (progress?.queueDepth ?? 0) > 0}
-                  <span>{statusBar.queueDepthLabel}</span>
-                {/if}
-              </div>
-            {/if}
           </div>
           <p class="chat-header-subtitle">
             <span class={`chat-kind-badge ${activeChatKind}`}>{chatAgentDisplayLabel}</span>
@@ -1810,6 +1798,33 @@
         <ChatTranscriptCards cards={activeCards} assistantLabel={chatAgentDisplayLabel} />
       {/if}
     </div>
+
+    {#if showStatusBar && statusBar}
+      <div class={`pma-status-bar composer-status-bar ${statusBar.state}`} aria-label="Turn status">
+        <span class="status-dot" aria-hidden="true"></span>
+        <strong>{statusLabel(statusBar.state)}</strong>
+        {#if statusBar.phase && statusBar.phase.toLowerCase() !== statusLabel(statusBar.state).toLowerCase()}
+          <span>{statusBar.phase}</span>
+        {/if}
+        {#if progress?.elapsedSeconds !== null && progress?.elapsedSeconds !== undefined}
+          <span>{statusBar.elapsedLabel}</span>
+        {/if}
+        {#if (progress?.queueDepth ?? 0) > 0}
+          <span>{statusBar.queueDepthLabel}</span>
+        {/if}
+        {#if statusBar.tokenUsageLabel}
+          <span>{statusBar.tokenUsageLabel}</span>
+        {/if}
+        {#if statusBar.contextRemainingLabel && statusBar.contextRemainingPercent !== null}
+          <span class="context-meter" title="Context remaining">
+            <span class="context-meter-label">{statusBar.contextRemainingLabel}</span>
+            <span class="context-meter-track" aria-hidden="true">
+              <span style={`width: ${statusBar.contextRemainingPercent}%`}></span>
+            </span>
+          </span>
+        {/if}
+      </div>
+    {/if}
 
     <form
       class="composer"
