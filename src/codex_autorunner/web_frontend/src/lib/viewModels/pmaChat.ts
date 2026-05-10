@@ -221,6 +221,195 @@ export function summarizeFilterCounts(
   };
 }
 
+/**
+ * A "run group" key for ticket-flow chats. Ticket-flow chats sharing the same
+ * worktree (or repo, for repo-scoped flows) belong to the same operator-visible
+ * run; they collapse into a single row on chat lists.
+ */
+export type PmaChatRunGroup = {
+  key: string;
+  scopeKind: 'worktree' | 'repo';
+  scopeId: string;
+  scopeLabel: string;
+  chats: PmaChatSummary[];
+  totalCount: number;
+  unreadCount: number;
+  activeCount: number;
+  waitingCount: number;
+  doneCount: number;
+  failedCount: number;
+  agents: string[];
+  status: WorkStatus;
+  updatedAt: string | null;
+};
+
+export type PmaChatListEntry =
+  | { kind: 'group'; group: PmaChatRunGroup }
+  | { kind: 'chat'; chat: PmaChatSummary };
+
+export function pmaChatRunGroupKey(chat: PmaChatSummary): string | null {
+  if (!chat.ticketId) return null;
+  if (chat.worktreeId) return `worktree:${chat.worktreeId}`;
+  if (chat.repoId) return `repo:${chat.repoId}`;
+  return null;
+}
+
+function isUnread(chat: PmaChatSummary, lastSeen: Record<string, string>): boolean {
+  if (!chat.updatedAt) return false;
+  const seen = lastSeen[chat.id];
+  return !seen || chat.updatedAt > seen;
+}
+
+function rollupGroupStatus(group: PmaChatRunGroup): WorkStatus {
+  if (group.waitingCount > 0) return 'waiting';
+  if (group.activeCount > 0) return 'running';
+  if (group.failedCount > 0) return 'failed';
+  if (group.totalCount > 0 && group.doneCount === group.totalCount) return 'done';
+  return 'idle';
+}
+
+export function buildPmaChatListEntries(
+  chats: PmaChatSummary[],
+  options: {
+    lastSeen?: Record<string, string>;
+    repoLabel?: (repoId: string) => string | null;
+    worktreeLabel?: (worktreeId: string) => string | null;
+    groupRuns?: boolean;
+  } = {}
+): PmaChatListEntry[] {
+  const lastSeen = options.lastSeen ?? {};
+  if (options.groupRuns === false) {
+    return sortChatsWaitingFirst(chats).map((chat) => ({ kind: 'chat', chat }) as PmaChatListEntry);
+  }
+  const groups = new Map<string, PmaChatRunGroup>();
+  const standalone: PmaChatSummary[] = [];
+
+  for (const chat of chats) {
+    const key = pmaChatRunGroupKey(chat);
+    if (!key) {
+      standalone.push(chat);
+      continue;
+    }
+    let group = groups.get(key);
+    if (!group) {
+      const scopeKind: 'worktree' | 'repo' = chat.worktreeId ? 'worktree' : 'repo';
+      const scopeId = (scopeKind === 'worktree' ? chat.worktreeId : chat.repoId) ?? '';
+      const labelLookup = scopeKind === 'worktree' ? options.worktreeLabel : options.repoLabel;
+      group = {
+        key,
+        scopeKind,
+        scopeId,
+        scopeLabel: labelLookup?.(scopeId) ?? scopeId,
+        chats: [],
+        totalCount: 0,
+        unreadCount: 0,
+        activeCount: 0,
+        waitingCount: 0,
+        doneCount: 0,
+        failedCount: 0,
+        agents: [],
+        status: 'idle',
+        updatedAt: null
+      };
+      groups.set(key, group);
+    }
+    group.chats.push(chat);
+  }
+
+  for (const group of groups.values()) {
+    group.chats = sortChatsWaitingFirst(group.chats);
+    group.totalCount = group.chats.length;
+    const agentSet = new Set<string>();
+    for (const chat of group.chats) {
+      if (chat.agentId) agentSet.add(chat.agentId);
+      if (isUnread(chat, lastSeen)) group.unreadCount += 1;
+      if (chat.status === 'running') group.activeCount += 1;
+      else if (chat.status === 'waiting' || chat.status === 'blocked') group.waitingCount += 1;
+      else if (chat.status === 'done') group.doneCount += 1;
+      else if (chat.status === 'failed' || chat.status === 'invalid') group.failedCount += 1;
+      if (chat.updatedAt && (!group.updatedAt || chat.updatedAt > group.updatedAt)) {
+        group.updatedAt = chat.updatedAt;
+      }
+    }
+    group.agents = [...agentSet].sort();
+    group.status = rollupGroupStatus(group);
+  }
+
+  type Sortable = { entry: PmaChatListEntry; waitingRank: number; sort: string };
+  const sortables: Sortable[] = [];
+  for (const group of groups.values()) {
+    sortables.push({
+      entry: { kind: 'group', group },
+      waitingRank: group.waitingCount > 0 ? 0 : group.activeCount > 0 ? 1 : 2,
+      sort: group.updatedAt ?? ''
+    });
+  }
+  for (const chat of standalone) {
+    sortables.push({
+      entry: { kind: 'chat', chat },
+      waitingRank: chat.status === 'waiting' || chat.status === 'blocked' ? 0 : chat.status === 'running' ? 1 : 2,
+      sort: chat.updatedAt ?? ''
+    });
+  }
+  sortables.sort((a, b) => {
+    if (a.waitingRank !== b.waitingRank) return a.waitingRank - b.waitingRank;
+    return (b.sort || '').localeCompare(a.sort || '');
+  });
+  return sortables.map((item) => item.entry);
+}
+
+/** Filter entries against a single PMA chat filter while preserving group structure. */
+export function filterPmaChatEntries(
+  entries: PmaChatListEntry[],
+  filter: PmaChatFilter,
+  search: string,
+  lastSeen: Record<string, string> = {}
+): PmaChatListEntry[] {
+  const out: PmaChatListEntry[] = [];
+  for (const entry of entries) {
+    if (entry.kind === 'chat') {
+      const filtered = filterPmaChats([entry.chat], filter, search, lastSeen);
+      if (filtered.length) out.push(entry);
+      continue;
+    }
+    const matchedChats = filterPmaChats(entry.group.chats, filter, search, lastSeen);
+    if (!matchedChats.length) continue;
+    if (matchedChats.length === entry.group.chats.length) {
+      out.push(entry);
+      continue;
+    }
+    // Rebuild a slimmer group containing only matched chats so counts stay honest.
+    const trimmed: PmaChatRunGroup = {
+      ...entry.group,
+      chats: matchedChats,
+      totalCount: matchedChats.length,
+      unreadCount: 0,
+      activeCount: 0,
+      waitingCount: 0,
+      doneCount: 0,
+      failedCount: 0,
+      agents: [],
+      updatedAt: null
+    };
+    const agentSet = new Set<string>();
+    for (const chat of matchedChats) {
+      if (chat.agentId) agentSet.add(chat.agentId);
+      if (isUnread(chat, lastSeen)) trimmed.unreadCount += 1;
+      if (chat.status === 'running') trimmed.activeCount += 1;
+      else if (chat.status === 'waiting' || chat.status === 'blocked') trimmed.waitingCount += 1;
+      else if (chat.status === 'done') trimmed.doneCount += 1;
+      else if (chat.status === 'failed' || chat.status === 'invalid') trimmed.failedCount += 1;
+      if (chat.updatedAt && (!trimmed.updatedAt || chat.updatedAt > trimmed.updatedAt)) {
+        trimmed.updatedAt = chat.updatedAt;
+      }
+    }
+    trimmed.agents = [...agentSet].sort();
+    trimmed.status = rollupGroupStatus(trimmed);
+    out.push({ kind: 'group', group: trimmed });
+  }
+  return out;
+}
+
 export function chooseActiveChatId(
   chats: PmaChatSummary[],
   currentId: string | null,

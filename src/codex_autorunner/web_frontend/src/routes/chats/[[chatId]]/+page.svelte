@@ -20,13 +20,14 @@
   } from '$lib/viewModels/domain';
   import {
     buildManagedThreadCreatePayload,
+    buildPmaChatListEntries,
     buildPmaChatScopeOptions,
     buildManagedThreadMessagePayload,
     buildPmaTranscriptCards,
     buildPmaStatusBar,
     chooseActiveChatId,
     composeMessageWithAttachments,
-    filterPmaChats,
+    filterPmaChatEntries,
     formatBytes,
     formatRelativeTime,
     localPmaChatScopeOption,
@@ -38,12 +39,13 @@
     progressPercent,
     reconcilePmaTimeline,
     removePendingAttachment,
-    sortChatsWaitingFirst,
     statusLabel,
     summarizeFilterCounts,
     type PendingAttachment,
     type PmaCard,
     type PmaChatFilter,
+    type PmaChatListEntry,
+    type PmaChatRunGroup,
     type PmaChatScopeOption
   } from '$lib/viewModels/pmaChat';
   import {
@@ -151,8 +153,60 @@
       ? chats.find((chat) => chat.id === activeChatId) ?? null
       : null
   );
-  const filteredChats = $derived(sortChatsWaitingFirst(filterPmaChats(chats, filter, search, lastSeenMap)));
+  let expandedRunGroups = $state<Record<string, boolean>>({});
+  const chatListEntries = $derived(
+    buildPmaChatListEntries(chats, {
+      lastSeen: lastSeenMap,
+      repoLabel: repoLabelForRepoId,
+      worktreeLabel: (wid) => worktreeScopeOption(wid)?.label ?? null,
+      groupRuns: true
+    })
+  );
+  const filteredEntries = $derived(filterPmaChatEntries(chatListEntries, filter, search, lastSeenMap));
   const filterCounts = $derived(summarizeFilterCounts(chats, lastSeenMap));
+
+  function isGroupExpanded(group: PmaChatRunGroup): boolean {
+    if (group.key in expandedRunGroups) return expandedRunGroups[group.key];
+    // Default-expanded when there is something demanding attention.
+    if (group.unreadCount > 0 || group.waitingCount > 0) return true;
+    // Default-expanded if the active chat lives inside this group.
+    if (activeChatId && group.chats.some((chat) => chat.id === activeChatId)) return true;
+    return false;
+  }
+
+  function toggleGroup(group: PmaChatRunGroup): void {
+    expandedRunGroups = { ...expandedRunGroups, [group.key]: !isGroupExpanded(group) };
+  }
+
+  function markGroupRead(group: PmaChatRunGroup): void {
+    let next = lastSeenMap;
+    const now = new Date().toISOString();
+    for (const chat of group.chats) {
+      if (!chat.updatedAt && !next[chat.id]) {
+        next = markChatRead(next, chat.id, now);
+        continue;
+      }
+      const stamp = chat.updatedAt ?? now;
+      if (next[chat.id] && next[chat.id] >= stamp) continue;
+      next = markChatRead(next, chat.id, stamp);
+    }
+    if (next === lastSeenMap) return;
+    lastSeenMap = next;
+    saveLastSeenMap(next);
+  }
+
+  function groupBadgeClass(group: PmaChatRunGroup): string {
+    return `chat-run-status-pill ${group.status}`;
+  }
+
+  function groupSummaryParts(group: PmaChatRunGroup): string[] {
+    const parts: string[] = [];
+    if (group.waitingCount > 0) parts.push(`${group.waitingCount} waiting`);
+    if (group.activeCount > 0) parts.push(`${group.activeCount} active`);
+    if (group.failedCount > 0) parts.push(`${group.failedCount} failed`);
+    parts.push(`${group.doneCount}/${group.totalCount} done`);
+    return parts;
+  }
   const activeCards = $derived<PmaCard[]>(buildPmaTranscriptCards(timeline, activeChat, artifacts, progress));
   const statusBar = $derived(buildPmaStatusBar(progress, activeChat));
   const selectedScope = $derived(scopeOptions.find((scope) => scope.id === selectedScopeId) ?? localPmaChatScopeOption());
@@ -911,6 +965,94 @@
       {/if}
     </div>
 
+    {#snippet chatRow(chat: import('$lib/viewModels/domain').PmaChatSummary, nested: boolean)}
+      {@const scopeTags = pmaChatScopeTagView(chat, {
+        repoLabel: repoLabelForRepoId,
+        worktreeLabel: (wid) => worktreeScopeOption(wid)?.label ?? null
+      })}
+      {@const listScopeAccent = chatListScopeAccentLabel(chat, scopeTags)}
+      {@const listScopeAccentHex = listScopeAccent ? repoAccent(listScopeAccent) : null}
+      {@const listAgentLabel = agentDisplayForChat(agents, chat)}
+      <button
+        class:active={chat.id === activeChatId}
+        class:nested
+        class={`chat-card status-${chat.status}`}
+        type="button"
+        onclick={() => selectChat(chat.id)}
+      >
+        {#if listScopeAccent && listScopeAccentHex}
+          <span
+            class="chat-row-glyph repo-mini-glyph"
+            style={`--glyph-accent: ${listScopeAccentHex}`}
+            aria-hidden="true"
+          >{repoInitials(listScopeAccent)}</span>
+        {:else}
+          <span class="chat-row-glyph pma-glyph" aria-hidden="true">P</span>
+        {/if}
+        <span class="chat-card-main">
+          <span class="chat-title-row">
+            <span class="chat-title-cluster">
+              {#if isChatUnread(chat, lastSeenMap)}
+                <span class="chat-unread-dot" aria-label="Unread"></span>
+              {/if}
+              <span class="chat-title-text-badge">
+                <strong>{nested && chat.ticketId ? chat.ticketId : chat.title}</strong>
+                {#if !nested}
+                  <span class={`chat-scope-kind-tag ${scopeTags.kindKey}`}>{scopeTags.kindLabel}</span>
+                {/if}
+                <span class={`chat-kind-badge ${pmaChatKind(chat)}`}>{pmaChatKindLabel(pmaChatKind(chat))}</span>
+              </span>
+            </span>
+            <span class="chat-title-trailing">
+              {#if chat.status !== 'idle' && chat.status !== 'done'}
+                <span class={`status-pill ${chat.status}`}>{statusLabel(chat.status)}</span>
+              {/if}
+              {#if chat.updatedAt}
+                <span class="updated-at">{formatRelativeTime(chat.updatedAt)}</span>
+              {/if}
+            </span>
+          </span>
+          <span class="chat-meta-row">
+            {#if !nested}
+              <span class="chat-scope-tags">
+                <span
+                  class="chat-scope-detail-tag"
+                  style={listScopeAccentHex ? `color: ${listScopeAccentHex}` : undefined}
+                  title={scopeTags.detailFull ?? scopeTags.detail}
+                >{scopeTags.detail}</span>
+              </span>
+              {#if chat.ticketId}
+                <span class="chat-meta-dot" aria-hidden="true">·</span>
+                <code>{chat.ticketId}</code>
+              {/if}
+            {:else if chat.title && chat.title !== chat.ticketId}
+              <span class="chat-nested-title" title={chat.title}>{chat.title}</span>
+            {/if}
+            {#if listAgentLabel || chat.model}
+              {#if !nested || (chat.title && chat.title !== chat.ticketId)}
+                <span class="chat-meta-dot" aria-hidden="true">·</span>
+              {/if}
+              <span class="chat-agent-model">
+                {#if listAgentLabel}<span class="chat-agent">{listAgentLabel}</span>{/if}
+                {#if listAgentLabel && chat.model}<span class="chat-meta-dot" aria-hidden="true">·</span>{/if}
+                {#if chat.model}<span class="chat-model">{chat.model}</span>{/if}
+              </span>
+            {/if}
+          </span>
+          {#if chat.progressPercent !== null && Number.isFinite(chat.progressPercent)}
+            <span class="chat-card-footer">
+              <span
+                class={`progress-track status-${chat.status}`}
+                aria-label={`${Math.round(chat.progressPercent)} percent complete`}
+              >
+                <span style={`width: ${progressPercent(chat)}%`}></span>
+              </span>
+            </span>
+          {/if}
+        </span>
+      </button>
+    {/snippet}
+
     <div class="chat-list-scroll">
       {#if loadingChats}
         <div class="state-panel loading-state">
@@ -925,85 +1067,82 @@
           <button type="button" onclick={loadInitial}>Retry</button>
         </div>
       {:else}
-        {#each filteredChats as chat (chat.id)}
-          {@const scopeTags = pmaChatScopeTagView(chat, {
-            repoLabel: repoLabelForRepoId,
-            worktreeLabel: (wid) => worktreeScopeOption(wid)?.label ?? null
-          })}
-          {@const listScopeAccent = chatListScopeAccentLabel(chat, scopeTags)}
-          {@const listScopeAccentHex = listScopeAccent ? repoAccent(listScopeAccent) : null}
-          {@const listAgentLabel = agentDisplayForChat(agents, chat)}
-          <button
-            class:active={chat.id === activeChatId}
-            class={`chat-card status-${chat.status}`}
-            type="button"
-            onclick={() => selectChat(chat.id)}
-          >
-            {#if listScopeAccent && listScopeAccentHex}
-              <span
-                class="chat-row-glyph repo-mini-glyph"
-                style={`--glyph-accent: ${listScopeAccentHex}`}
-                aria-hidden="true"
-              >{repoInitials(listScopeAccent)}</span>
-            {:else}
-              <span class="chat-row-glyph pma-glyph" aria-hidden="true">P</span>
-            {/if}
-            <span class="chat-card-main">
-              <span class="chat-title-row">
-                <span class="chat-title-cluster">
-                  {#if isChatUnread(chat, lastSeenMap)}
-                    <span class="chat-unread-dot" aria-label="Unread"></span>
-                  {/if}
-                  <span class="chat-title-text-badge">
-                    <strong>{chat.title}</strong>
-                    <span class={`chat-scope-kind-tag ${scopeTags.kindKey}`}>{scopeTags.kindLabel}</span>
-                    <span class={`chat-kind-badge ${pmaChatKind(chat)}`}>{pmaChatKindLabel(pmaChatKind(chat))}</span>
+        {#each filteredEntries as entry (entry.kind === 'group' ? `group:${entry.group.key}` : `chat:${entry.chat.id}`)}
+          {#if entry.kind === 'chat'}
+            {@render chatRow(entry.chat, false)}
+          {:else}
+            {@const group = entry.group}
+            {@const expanded = isGroupExpanded(group)}
+            {@const accentHex = repoAccent(group.scopeLabel)}
+            <div class={`chat-run-group status-${group.status}`} class:expanded>
+              <button
+                class="chat-run-group-header"
+                type="button"
+                aria-expanded={expanded}
+                aria-controls={`run-group-children-${group.key}`}
+                onclick={() => toggleGroup(group)}
+              >
+                <span
+                  class="chat-row-glyph repo-mini-glyph chat-run-glyph"
+                  style={`--glyph-accent: ${accentHex}`}
+                  aria-hidden="true"
+                >{repoInitials(group.scopeLabel)}</span>
+                <span class="chat-run-group-main">
+                  <span class="chat-title-row">
+                    <span class="chat-title-cluster">
+                      {#if group.unreadCount > 0}
+                        <span class="chat-unread-dot" aria-label={`${group.unreadCount} unread`}></span>
+                      {/if}
+                      <span class="chat-title-text-badge">
+                        <strong>Run · {group.scopeLabel}</strong>
+                        <span class={`chat-scope-kind-tag ${group.scopeKind}`}>{group.scopeKind === 'worktree' ? 'WORKTREE' : 'REPO'}</span>
+                        <span class="chat-run-count-chip"><strong>{group.totalCount}</strong> {group.totalCount === 1 ? 'chat' : 'chats'}</span>
+                      </span>
+                    </span>
+                    <span class="chat-title-trailing">
+                      {#if group.status !== 'idle' && group.status !== 'done'}
+                        <span class={groupBadgeClass(group)}>{statusLabel(group.status)}</span>
+                      {/if}
+                      {#if group.updatedAt}
+                        <span class="updated-at">{formatRelativeTime(group.updatedAt)}</span>
+                      {/if}
+                      <span class="chat-run-chevron" aria-hidden="true">{expanded ? '▾' : '▸'}</span>
+                    </span>
+                  </span>
+                  <span class="chat-meta-row chat-run-meta">
+                    {#each groupSummaryParts(group) as part, i}
+                      {#if i > 0}<span class="chat-meta-dot" aria-hidden="true">·</span>{/if}
+                      <span>{part}</span>
+                    {/each}
+                    {#if group.unreadCount > 0}
+                      <span class="chat-meta-dot" aria-hidden="true">·</span>
+                      <span class="chat-run-unread-text">{group.unreadCount} unread</span>
+                    {/if}
+                    {#if group.agents.length > 0}
+                      <span class="chat-meta-dot" aria-hidden="true">·</span>
+                      <span class="chat-agent">{group.agents.join(', ')}</span>
+                    {/if}
                   </span>
                 </span>
-                <span class="chat-title-trailing">
-                  {#if chat.status !== 'idle' && chat.status !== 'done'}
-                    <span class={`status-pill ${chat.status}`}>{statusLabel(chat.status)}</span>
+              </button>
+              {#if expanded}
+                <div id={`run-group-children-${group.key}`} class="chat-run-group-children">
+                  {#each group.chats as chat (chat.id)}
+                    {@render chatRow(chat, true)}
+                  {/each}
+                  {#if group.unreadCount > 0}
+                    <button
+                      type="button"
+                      class="chat-run-mark-read"
+                      onclick={(event) => { event.stopPropagation(); markGroupRead(group); }}
+                    >Mark run as read</button>
                   {/if}
-                  {#if chat.updatedAt}
-                    <span class="updated-at">{formatRelativeTime(chat.updatedAt)}</span>
-                  {/if}
-                </span>
-              </span>
-              <span class="chat-meta-row">
-                <span class="chat-scope-tags">
-                  <span
-                    class="chat-scope-detail-tag"
-                    style={listScopeAccentHex ? `color: ${listScopeAccentHex}` : undefined}
-                    title={scopeTags.detailFull ?? scopeTags.detail}
-                  >{scopeTags.detail}</span>
-                </span>
-                {#if chat.ticketId}
-                  <span class="chat-meta-dot" aria-hidden="true">·</span>
-                  <code>{chat.ticketId}</code>
-                {/if}
-                {#if listAgentLabel || chat.model}
-                  <span class="chat-meta-dot" aria-hidden="true">·</span>
-                  <span class="chat-agent-model">
-                    {#if listAgentLabel}<span class="chat-agent">{listAgentLabel}</span>{/if}
-                    {#if listAgentLabel && chat.model}<span class="chat-meta-dot" aria-hidden="true">·</span>{/if}
-                    {#if chat.model}<span class="chat-model">{chat.model}</span>{/if}
-                  </span>
-                {/if}
-              </span>
-              {#if chat.progressPercent !== null && Number.isFinite(chat.progressPercent)}
-                <span class="chat-card-footer">
-                  <span
-                    class={`progress-track status-${chat.status}`}
-                    aria-label={`${Math.round(chat.progressPercent)} percent complete`}
-                  >
-                    <span style={`width: ${progressPercent(chat)}%`}></span>
-                  </span>
-                </span>
+                </div>
               {/if}
-            </span>
-          </button>
+            </div>
+          {/if}
         {/each}
-        {#if filteredChats.length === 0}
+        {#if filteredEntries.length === 0}
           <div class="state-panel empty-state compact-empty chat-filter-empty">
             <strong>No chats match this filter</strong>
             <p>Clear the search or choose another status.</p>

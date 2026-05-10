@@ -698,11 +698,70 @@
             <a class="chip-button" href={href(detail.codingAgentChatHref)} data-sveltekit-preload-data="tap">+ Coding agent</a>
           </div>
         </div>
-        {#if detail.chats.length > 0}
+        {#if detail.chatList.totalChatCount > 0}
           {@const accentHex = repoAccent(detail.title)}
           {@const initials = repoInitials(detail.title)}
           <div class="chat-row-list">
-            {#each detail.chats.slice(0, 5) as chat}
+            {#each detail.chatList.groups as group (group.key)}
+              <details class={`scoped-chat-run-group status-${group.status}`} open={group.waitingCount > 0 || group.activeCount > 0}>
+                <summary class="scoped-chat-run-summary">
+                  <span
+                    class="chat-row-glyph repo-mini-glyph"
+                    style={`--glyph-accent: ${accentHex}`}
+                    aria-hidden="true"
+                  >{initials}</span>
+                  <span class="scoped-chat-run-main">
+                    <span class="scoped-chat-run-title-row">
+                      <strong>Run · {group.scopeLabel}</strong>
+                      <span class="chat-run-count-chip"><strong>{group.totalCount}</strong> {group.totalCount === 1 ? 'chat' : 'chats'}</span>
+                      {#if group.status !== 'idle' && group.status !== 'done'}
+                        <span class={`status-pill ${group.status}`}>{statusLabel(group.status)}</span>
+                      {/if}
+                      <span class="scoped-chat-run-trailing">
+                        {#if group.updatedAt}
+                          <span class="updated-at">{rowRelativeTime({ updatedAt: group.updatedAt })}</span>
+                        {/if}
+                        <span class="scoped-chat-run-chevron" aria-hidden="true">▸</span>
+                      </span>
+                    </span>
+                    <span class="scoped-chat-run-meta">
+                      {#if group.waitingCount > 0}<span>{group.waitingCount} waiting</span><span class="chat-meta-dot" aria-hidden="true">·</span>{/if}
+                      {#if group.activeCount > 0}<span>{group.activeCount} active</span><span class="chat-meta-dot" aria-hidden="true">·</span>{/if}
+                      {#if group.failedCount > 0}<span>{group.failedCount} failed</span><span class="chat-meta-dot" aria-hidden="true">·</span>{/if}
+                      <span>{group.doneCount}/{group.totalCount} done</span>
+                      {#if group.agents.length > 0}
+                        <span class="chat-meta-dot" aria-hidden="true">·</span>
+                        <span class="chat-agent">{group.agents.join(', ')}</span>
+                      {/if}
+                    </span>
+                  </span>
+                </summary>
+                <div class="scoped-chat-run-children">
+                  {#each group.chats as chat (chat.id)}
+                    <a class={`scoped-chat-child-row status-${chat.status}`} href={href(chat.href)}>
+                      <span class={`status-dot status-${chat.status}`} aria-hidden="true"></span>
+                      <span class="scoped-chat-child-title">
+                        <strong>{chat.ticketId ?? chat.title}</strong>
+                        {#if chat.ticketId && chat.title && chat.title !== chat.ticketId}
+                          <span class="scoped-chat-child-subtitle">{chat.title}</span>
+                        {/if}
+                      </span>
+                      <span class="scoped-chat-child-meta">
+                        {#if chat.agentId}<span class="chat-agent">{chat.agentId}</span>{/if}
+                        {#if chat.agentId && chat.model}<span class="chat-meta-dot" aria-hidden="true">·</span>{/if}
+                        {#if chat.model}<span class="chat-model">{chat.model}</span>{/if}
+                        {#if chat.status !== 'idle' && chat.status !== 'done'}
+                          <span class={`status-pill ${chat.status}`}>{statusLabel(chat.status)}</span>
+                        {/if}
+                        {#if chat.updatedAt}<span class="updated-at">{rowRelativeTime({ updatedAt: chat.updatedAt })}</span>{/if}
+                        <span class="scoped-chat-child-arrow" aria-hidden="true">→</span>
+                      </span>
+                    </a>
+                  {/each}
+                </div>
+              </details>
+            {/each}
+            {#each detail.chatList.standaloneChats.slice(0, 5) as chat}
               {@const metaBits = [chat.agentId, chat.model].filter((p): p is string => typeof p === 'string' && p.length > 0)}
               <a class={`chat-row status-${chat.status}`} href={href(chat.href)}>
                 <span
@@ -741,8 +800,8 @@
                 </span>
               </a>
             {/each}
-            {#if detail.chats.length > 5}
-              <a class="row-overflow-link" href={href('/chats')}>+{detail.chats.length - 5} more chat{detail.chats.length - 5 === 1 ? '' : 's'}</a>
+            {#if detail.chatList.standaloneChats.length > 5}
+              <a class="row-overflow-link" href={href('/chats')}>+{detail.chatList.standaloneChats.length - 5} more chat{detail.chatList.standaloneChats.length - 5 === 1 ? '' : 's'}</a>
             {/if}
           </div>
         {/if}
@@ -1834,5 +1893,134 @@
   .ticket-overview-more:hover {
     color: var(--color-accent);
     border-color: var(--color-accent);
+  }
+
+  .scoped-chat-run-group {
+    border: 1px solid var(--color-border-subtle);
+    border-radius: 10px;
+    background: var(--color-surface);
+    overflow: hidden;
+    transition: border-color var(--transition-fast);
+  }
+  .scoped-chat-run-group:hover {
+    border-color: var(--color-border-strong);
+  }
+  .scoped-chat-run-group + .scoped-chat-run-group,
+  .scoped-chat-run-group + .chat-row,
+  .chat-row + .scoped-chat-run-group {
+    margin-top: var(--space-2);
+  }
+  .scoped-chat-run-summary {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    cursor: pointer;
+    list-style: none;
+  }
+  .scoped-chat-run-summary::-webkit-details-marker { display: none; }
+  .scoped-chat-run-group[open] > .scoped-chat-run-summary {
+    border-bottom: 1px solid var(--color-border-subtle);
+    background: var(--color-surface-muted);
+  }
+  .scoped-chat-run-group[open] .scoped-chat-run-chevron {
+    transform: rotate(90deg);
+  }
+  .scoped-chat-run-chevron {
+    color: var(--color-ink-faint);
+    font-size: 11px;
+    margin-left: var(--space-2);
+    transition: transform var(--transition-base) var(--ease-out);
+    display: inline-block;
+  }
+  .scoped-chat-run-main {
+    flex: 1;
+    min-width: 0;
+    display: grid;
+    gap: 4px;
+  }
+  .scoped-chat-run-title-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    font-size: var(--font-size-1);
+    color: var(--color-ink);
+    font-weight: 600;
+  }
+  .scoped-chat-run-trailing {
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    font-weight: 500;
+    color: var(--color-ink-faint);
+  }
+  .scoped-chat-run-meta {
+    display: inline-flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+    font-size: var(--font-size-0);
+    color: var(--color-ink-muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .scoped-chat-run-children {
+    display: flex;
+    flex-direction: column;
+    background: var(--color-surface-sunken);
+  }
+  .scoped-chat-child-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3) var(--space-2) calc(var(--space-3) + 28px + var(--space-2));
+    text-decoration: none;
+    color: var(--color-ink);
+    font-size: var(--font-size-1);
+    transition: background-color var(--transition-fast);
+    border-top: 1px solid var(--color-border-subtle);
+  }
+  .scoped-chat-child-row:first-child {
+    border-top: 0;
+  }
+  .scoped-chat-child-row:hover {
+    background: var(--color-surface-muted);
+  }
+  .scoped-chat-child-title {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-2);
+    overflow: hidden;
+  }
+  .scoped-chat-child-title strong {
+    font-weight: 600;
+    font-family: var(--font-mono);
+    font-size: var(--font-size-1);
+    color: var(--color-ink);
+  }
+  .scoped-chat-child-subtitle {
+    color: var(--color-ink-muted);
+    font-size: var(--font-size-0);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .scoped-chat-child-meta {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    color: var(--color-ink-faint);
+    font-size: var(--font-size-0);
+  }
+  .scoped-chat-child-arrow {
+    color: var(--color-ink-faint);
+    transition: transform var(--transition-fast), color var(--transition-fast);
+  }
+  .scoped-chat-child-row:hover .scoped-chat-child-arrow {
+    color: var(--color-ink-soft);
+    transform: translateX(2px);
   }
 </style>

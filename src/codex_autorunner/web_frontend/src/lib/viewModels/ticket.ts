@@ -1,5 +1,14 @@
 import type { PmaChatSummary, PmaRunProgress, PmaTimelineItem, SurfaceArtifact, TicketDetail, TicketSummary, WorkStatus } from './domain';
-import { buildPmaTranscriptCards, formatRelativeTime, progressPercent, statusLabel, type PmaCard } from './pmaChat';
+import {
+  buildPmaTranscriptCards,
+  formatRelativeTime,
+  pmaChatKind,
+  pmaChatKindLabel,
+  progressPercent,
+  statusLabel,
+  type PmaCard,
+  type PmaChatKind
+} from './pmaChat';
 import { repoRoute, repoTicketRoute, worktreeRoute, worktreeTicketRoute } from './routes';
 import {
   aliasesOverlap,
@@ -153,6 +162,18 @@ export type TicketArtifactRow = {
   createdAt: string | null;
 };
 
+export type TicketLinkedChat = {
+  id: string;
+  title: string;
+  status: WorkStatus;
+  agentId: string | null;
+  model: string | null;
+  href: string;
+  kind: PmaChatKind;
+  kindLabel: string;
+  updatedAt: string | null;
+};
+
 export type TicketDetailViewModel = {
   id: string;
   routeId: string;
@@ -193,6 +214,12 @@ export type TicketDetailViewModel = {
   artifacts: TicketArtifactRow[];
   chatTranscriptCards: PmaCard[];
   linkedChatId: string | null;
+  /**
+   * Every chat spawned for this ticket — typically one per agent
+   * (Codex, OpenCode, etc.). Surfaced as pills under the ticket header so the
+   * operator can jump to any of them without leaving the ticket page.
+   */
+  linkedChats: TicketLinkedChat[];
   chatHref: string | null;
   runHref: string | null;
   debugHref: string | null;
@@ -348,7 +375,8 @@ export function buildTicketDetailViewModel(
   now = new Date()
 ): TicketDetailViewModel {
   const run = findTicketRun(detail, source.runs);
-  const chat = findTicketChat(detail, source.chats, run);
+  const allLinkedChats = findTicketChats(detail, source.chats, run);
+  const chat = allLinkedChats[0] ?? null;
   const runArtifacts = [...detail.artifacts, ...source.artifacts, ...(run?.events ?? [])];
   const sections = parseTicketContract(detail.body);
   const goal = sectionText(sections, 'goal') || stringFromRaw(detail.raw, ['frontmatter.goal', 'goal']);
@@ -400,6 +428,7 @@ export function buildTicketDetailViewModel(
     artifacts: uniqueArtifacts(runArtifacts).slice(0, 8).map(artifactToRow),
     chatTranscriptCards,
     linkedChatId,
+    linkedChats: allLinkedChats.map(linkedChatToVm),
     chatHref,
     runHref,
     debugHref,
@@ -850,23 +879,46 @@ function finishSection(section: TicketContractSection): TicketContractSection {
   return { ...section, body: section.body.trim() };
 }
 
+function linkedChatToVm(chat: PmaChatSummary): TicketLinkedChat {
+  const kind = pmaChatKind(chat);
+  return {
+    id: chat.id,
+    title: chat.title,
+    status: chat.status,
+    agentId: chat.agentId,
+    model: chat.model,
+    href: `/chats?chat=${encodeURIComponent(chat.id)}`,
+    kind,
+    kindLabel: pmaChatKindLabel(kind),
+    updatedAt: chat.updatedAt
+  };
+}
+
 function findTicketRun(ticket: TicketSummary, runs: PmaRunProgress[]): PmaRunProgress | null {
   const aliases = ticketAliases(ticket);
   return runs.find((run) => aliasesOverlap(aliases, ticketAliasesFromRun(run))) ?? null;
 }
 
 function findTicketChat(ticket: TicketSummary, chats: PmaChatSummary[], run: PmaRunProgress | null): PmaChatSummary | null {
+  return findTicketChats(ticket, chats, run)[0] ?? null;
+}
+
+function findTicketChats(ticket: TicketSummary, chats: PmaChatSummary[], run: PmaRunProgress | null): PmaChatSummary[] {
   const aliases = ticketAliases(ticket);
-  if (run?.chatId) {
-    const byRun = chats.find((chat) => chat.id === run.chatId);
-    if (byRun) return byRun;
-  }
-  return chats.find((chat) => {
+  const matched = chats.filter((chat) => {
+    if (run?.chatId && chat.id === run.chatId) return true;
     const chatAliases = [chat.ticketId, stringFromRaw(chat.raw, ['chat_key', 'ticket_path', 'current_ticket'])]
       .filter((value): value is string => typeof value === 'string' && value.length > 0)
       .map(normalizeAlias);
     return chatAliases.some((alias) => aliases.has(alias));
-  }) ?? null;
+  });
+  // Active run's chat first, then by recency, with the active chat retained as the canonical primary.
+  return matched.sort((a, b) => {
+    const aRun = run?.chatId === a.id ? 0 : 1;
+    const bRun = run?.chatId === b.id ? 0 : 1;
+    if (aRun !== bRun) return aRun - bRun;
+    return (b.updatedAt ?? '').localeCompare(a.updatedAt ?? '');
+  });
 }
 
 function normalizeAlias(value: string): string {

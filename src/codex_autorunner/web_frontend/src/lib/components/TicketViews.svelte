@@ -595,6 +595,24 @@
         </div>
       </div>
 
+      {#if detail.linkedChats.length > 0}
+        <div class="ticket-chats-strip" aria-label="Chats spawned for this ticket">
+          <span class="ticket-chats-label">Chats</span>
+          <div class="ticket-chats-pills">
+            {#each detail.linkedChats as chat (chat.id)}
+              <a class={`ticket-chat-pill status-${chat.status}`} href={href(chat.href)} title={`Open chat · ${chat.title}`}>
+                <span class={`status-dot status-${chat.status}`} aria-hidden="true"></span>
+                <span class="ticket-chat-pill-agent">{chat.agentId ?? chat.kindLabel}</span>
+                {#if chat.status !== 'idle' && chat.status !== 'done'}
+                  <span class="ticket-chat-pill-status">{statusLabel(chat.status)}</span>
+                {/if}
+                <span class="ticket-chat-pill-arrow" aria-hidden="true">→</span>
+              </a>
+            {/each}
+          </div>
+        </div>
+      {/if}
+
       {#if detail.needsRepair && repairOpen}
         <div id="ticket-repair-panel" class="ticket-repair-banner" role="region" aria-label="Ticket repair details">
           <div class="ticket-repair-header">
@@ -1243,6 +1261,65 @@
       margin-left: 0;
       width: 100%;
     }
+  }
+
+  .ticket-chats-strip {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    margin-top: var(--space-2);
+  }
+  .ticket-chats-label {
+    font-size: var(--font-size-0);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--color-ink-muted);
+    font-weight: 600;
+  }
+  .ticket-chats-pills {
+    display: inline-flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+  }
+  .ticket-chat-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border: 1px solid var(--color-border-subtle);
+    border-radius: 999px;
+    background: var(--color-surface);
+    color: var(--color-ink-soft);
+    font-size: var(--font-size-0);
+    font-weight: 550;
+    text-decoration: none;
+    transition: border-color var(--transition-fast), background-color var(--transition-fast), color var(--transition-fast);
+  }
+  .ticket-chat-pill:hover {
+    border-color: var(--color-border-strong);
+    background: var(--color-surface-muted);
+    color: var(--color-ink);
+  }
+  .ticket-chat-pill .status-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+  }
+  .ticket-chat-pill-status {
+    color: var(--color-ink-muted);
+    font-size: 11px;
+    text-transform: lowercase;
+  }
+  .ticket-chat-pill-arrow {
+    color: var(--color-ink-faint);
+    font-size: 11px;
+    transition: transform var(--transition-fast), color var(--transition-fast);
+  }
+  .ticket-chat-pill:hover .ticket-chat-pill-arrow {
+    color: var(--color-ink-soft);
+    transform: translateX(2px);
   }
 
   .ticket-inline-path {

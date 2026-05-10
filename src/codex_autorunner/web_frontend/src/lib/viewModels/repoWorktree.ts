@@ -11,8 +11,8 @@ import type {
   WorktreeSummary,
   ContextspaceDocument
 } from './domain';
-import { formatRelativeTime, pmaChatKind, pmaChatKindLabel, progressPercent, statusLabel } from './pmaChat';
-import type { PmaChatKind } from './pmaChat';
+import { buildPmaChatListEntries, formatRelativeTime, pmaChatKind, pmaChatKindLabel, progressPercent, statusLabel } from './pmaChat';
+import type { PmaChatKind, PmaChatRunGroup } from './pmaChat';
 import { repoContextspaceRoute, repoRoute, repoTicketRoute, worktreeContextspaceRoute, worktreeRoute, worktreeTicketRoute } from './routes';
 import {
   aliasesOverlap,
@@ -109,6 +109,29 @@ export type RepoWorktreeTicketRow = {
   isCurrent: boolean;
 };
 
+export type RepoWorktreeChatRunGroup = {
+  key: string;
+  scopeKind: 'worktree' | 'repo';
+  scopeLabel: string;
+  status: WorkStatus;
+  totalCount: number;
+  activeCount: number;
+  waitingCount: number;
+  doneCount: number;
+  failedCount: number;
+  agents: string[];
+  updatedAt: string | null;
+  chats: RepoWorktreeChatRow[];
+  /** Single deep link to the chats page filtered/preselected to this group's first chat. */
+  href: string;
+};
+
+export type RepoWorktreeChatList = {
+  groups: RepoWorktreeChatRunGroup[];
+  standaloneChats: RepoWorktreeChatRow[];
+  totalChatCount: number;
+};
+
 export type RepoWorktreeChatRow = {
   id: string;
   title: string;
@@ -119,6 +142,8 @@ export type RepoWorktreeChatRow = {
   model: string | null;
   updatedAt: string | null;
   href: string;
+  /** Ticket id when this chat was spawned by ticket flow; null for ad-hoc chats. */
+  ticketId: string | null;
 };
 
 export type RepoWorktreeArtifactRow = {
@@ -214,6 +239,8 @@ export type RepoWorktreeDetailViewModel = {
   flowStatus: TicketFlowStatusViewModel;
   activity: RepoWorktreeArtifactRow[];
   chats: RepoWorktreeChatRow[];
+  /** Chats grouped by ticket-flow run for the new collapsed-by-default panel. */
+  chatList: RepoWorktreeChatList;
   contextspace: RepoWorktreeContextspaceRow[];
   contextspaceHref: string;
   currentTickets: RepoWorktreeTicketRow[];
@@ -367,6 +394,7 @@ export function buildRepoWorktreeDetailViewModel(
     chats: primaryChats
       .map((chat) => chatToRow(chat))
       .sort((a, b) => (b.updatedAt ?? '').localeCompare(a.updatedAt ?? '')),
+    chatList: buildScopedChatList(primaryChats, kind, id),
     contextspaceHref: kind === 'repo' ? repoContextspaceRoute(id) : worktreeContextspaceRoute(id, parentRepoId),
     contextspace: contextspaceRows(
       source.contextspaceDocs ?? [],
@@ -434,6 +462,7 @@ function missingDetailViewModel(kind: RepoWorktreeKind, id: string): RepoWorktre
     flowStatus: buildTicketFlowStatusViewModel([], []),
     activity: [],
     chats: [],
+    chatList: { groups: [], standaloneChats: [], totalChatCount: 0 },
     contextspace: [],
     contextspaceHref: kind === 'repo' ? '/repos' : '/worktrees',
     currentTickets: [],
@@ -661,6 +690,46 @@ function chatToCard(chat: PmaChatSummary, scopeKind: RepoWorktreeKind, scopeId: 
   };
 }
 
+function buildScopedChatList(
+  chats: PmaChatSummary[],
+  scopeKind: RepoWorktreeKind,
+  scopeId: string
+): RepoWorktreeChatList {
+  const entries = buildPmaChatListEntries(chats, { groupRuns: true });
+  const groups: RepoWorktreeChatRunGroup[] = [];
+  const standaloneChats: RepoWorktreeChatRow[] = [];
+  for (const entry of entries) {
+    if (entry.kind === 'chat') {
+      standaloneChats.push(chatToRow(entry.chat));
+      continue;
+    }
+    groups.push(scopedChatRunGroupToVm(entry.group));
+  }
+  // Suppress lone empty group for non-ticket worktrees; keep parity with chat count.
+  void scopeKind;
+  void scopeId;
+  return { groups, standaloneChats, totalChatCount: chats.length };
+}
+
+function scopedChatRunGroupToVm(group: PmaChatRunGroup): RepoWorktreeChatRunGroup {
+  const childChats = group.chats.map(chatToRow);
+  return {
+    key: group.key,
+    scopeKind: group.scopeKind,
+    scopeLabel: group.scopeLabel,
+    status: group.status,
+    totalCount: group.totalCount,
+    activeCount: group.activeCount,
+    waitingCount: group.waitingCount,
+    doneCount: group.doneCount,
+    failedCount: group.failedCount,
+    agents: group.agents,
+    updatedAt: group.updatedAt,
+    chats: childChats,
+    href: childChats[0]?.href ?? '/chats'
+  };
+}
+
 function chatToRow(chat: PmaChatSummary): RepoWorktreeChatRow {
   const kind = pmaChatKind(chat);
   return {
@@ -672,7 +741,8 @@ function chatToRow(chat: PmaChatSummary): RepoWorktreeChatRow {
     agentId: chat.agentId,
     model: chat.model,
     updatedAt: chat.updatedAt,
-    href: `/chats?chat=${encodeURIComponent(chat.id)}`
+    href: `/chats?chat=${encodeURIComponent(chat.id)}`,
+    ticketId: chat.ticketId
   };
 }
 
