@@ -1,58 +1,68 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
   import AutoDismissNotice from '$lib/components/AutoDismissNotice.svelte';
   import RepoWorktreeViews from '$lib/components/RepoWorktreeViews.svelte';
   import { confirmAndArchiveState, confirmAndCleanupWorktree, type ActionNotice } from '$lib/actions/repoWorktreeActions';
-  import { dataOr, partialPageIssue, pmaApi, type ApiError, type PartialPageIssue } from '$lib/api/client';
+  import { pmaApi, type ApiError, type PartialPageIssue } from '$lib/api/client';
+  import { readModelEntityStore, selectRepoSummaries, selectWorktreeSummaries } from '$lib/data';
   import {
     buildRepoWorktreeIndexViewModel,
     type RepoWorktreeIndexViewModel
   } from '$lib/viewModels/repoWorktree';
 
-  let index = $state<RepoWorktreeIndexViewModel | null>(null);
+  let readModelState = $state(readModelEntityStore.snapshot());
+  let unsubscribeReadModels: (() => void) | null = null;
+  const index = $derived<RepoWorktreeIndexViewModel | null>(
+    buildRepoWorktreeIndexViewModel(
+      {
+        repos: selectRepoSummaries(readModelState),
+        worktrees: selectWorktreeSummaries(readModelState),
+        runs: [],
+        chats: [],
+        tickets: [],
+        artifacts: [],
+        ticketsListLoaded: false
+      },
+      'worktree'
+    )
+  );
   let loading = $state(true);
   let error = $state<ApiError | null>(null);
   let sectionIssues = $state<PartialPageIssue[]>([]);
   let notice = $state<ActionNotice | null>(null);
 
   onMount(() => {
+    unsubscribeReadModels = readModelEntityStore.subscribe((state) => {
+      readModelState = state;
+    });
     void loadWorktrees();
+  });
+
+  onDestroy(() => {
+    unsubscribeReadModels?.();
   });
 
   async function loadWorktrees(): Promise<void> {
     loading = true;
     error = null;
     sectionIssues = [];
-    const [repos, worktrees, runs, chats, tickets] = await Promise.all([
-      pmaApi.hub.listRepos(),
-      pmaApi.hub.listWorktrees(),
-      pmaApi.ticketFlow.listRuns(),
-      pmaApi.pma.listChats(),
-      pmaApi.ticketFlow.listTickets()
+    const [topology, runtime] = await Promise.all([
+      pmaApi.readModels.repoWorktreeTopology('all', 200),
+      pmaApi.readModels.repoWorktreeRuntime('all', 200)
     ]);
-    const primaryError = !repos.ok ? repos.error : !worktrees.ok ? worktrees.error : null;
-    if (primaryError) {
-      error = primaryError;
+    if (!topology.ok) {
+      error = topology.error;
       loading = false;
       return;
     }
-    sectionIssues = [
-      !runs.ok ? partialPageIssue('current_run', 'Active runs unavailable', runs.error) : null,
-      !chats.ok ? partialPageIssue('current_run', 'Chats unavailable', chats.error) : null,
-      !tickets.ok ? partialPageIssue('tickets', 'Ticket queue unavailable', tickets.error) : null
-    ].filter((issue): issue is PartialPageIssue => Boolean(issue));
-    index = buildRepoWorktreeIndexViewModel(
-      {
-        repos: dataOr(repos, []),
-        worktrees: dataOr(worktrees, []),
-        runs: dataOr(runs, []),
-        chats: dataOr(chats, []),
-        tickets: dataOr(tickets, []),
-        artifacts: [],
-        ticketsListLoaded: tickets.ok
-      },
-      'worktree'
-    );
+    if (!runtime.ok) {
+      error = runtime.error;
+      loading = false;
+      return;
+    }
+    readModelEntityStore.applyRepoWorktreeTopologySnapshot(topology.data);
+    readModelEntityStore.applyRepoWorktreeRuntimeSnapshot(runtime.data);
+    sectionIssues = [];
     loading = false;
   }
 

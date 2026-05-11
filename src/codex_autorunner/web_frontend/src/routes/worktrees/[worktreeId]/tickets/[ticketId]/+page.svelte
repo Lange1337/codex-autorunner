@@ -3,8 +3,16 @@
   import { page } from '$app/state';
   import { onDestroy, onMount } from 'svelte';
   import TicketViews from '$lib/components/TicketViews.svelte';
-  import { dataOr, partialPageIssue, pmaApi, type ApiError, type JsonRecord, type PartialPageIssue } from '$lib/api/client';
+  import { pmaApi, type ApiError, type JsonRecord, type PartialPageIssue } from '$lib/api/client';
   import { openFlowRunEventSource, type StreamSubscription } from '$lib/api/streaming';
+  import {
+    pmaChatSummaryToChatIndexRow,
+    readModelEntityStore,
+    scopedOwnerKey,
+    selectPmaChats,
+    selectPmaRuns,
+    selectTicketSummaries
+  } from '$lib/data';
   import { stripRuntimeBasePath, withRuntimeBasePath as href } from '$lib/runtime/basePath';
   import {
     buildTicketWorkerActivity,
@@ -12,20 +20,31 @@
     buildTicketDetailViewModel,
     buildTicketRepairChatCreatePayload,
     buildTicketRepairPrompt,
-    mergeTicketRunProgress,
     resolveTicketRouteId,
     ticketDetailFromSummary,
     type TicketDetailViewModel,
     type TicketEditPayload
   } from '$lib/viewModels/ticket';
   import { legacyWorktreeRedirectPath } from '$lib/viewModels/routes';
-  import type { PmaChatSummary, PmaRunProgress, SurfaceArtifact, TicketDetail, TicketSummary } from '$lib/viewModels/domain';
+  import {
+    mapPmaChatSummary,
+    mapPmaRunProgress,
+    mapTicketDetail,
+    mapTicketSummary,
+    type PmaChatSummary,
+    type PmaRunProgress,
+    type SurfaceArtifact,
+    type TicketDetail,
+    type TicketSummary
+  } from '$lib/viewModels/domain';
   import { cachedTickets, rememberTickets } from '$lib/viewModels/ticketCache';
   import { agentCanListModels, agentId } from '$lib/viewModels/modelPickers';
   import { buildManagedThreadMessagePayload } from '$lib/viewModels/pmaChat';
 
   const worktreeId = $derived(page.params.worktreeId ?? 'unknown-worktree');
   const ticketId = $derived(page.params.ticketId ?? 'unknown-ticket');
+  let readModelState = $state(readModelEntityStore.snapshot());
+  let unsubscribeReadModels: (() => void) | null = null;
   let detail = $state<TicketDetailViewModel | null>(null);
   let loading = $state(true);
   let error = $state<ApiError | null>(null);
@@ -37,14 +56,15 @@
   let flowEvents = $state<JsonRecord[]>([]);
   let workerActivity = $derived(buildTicketWorkerActivity(dispatchHistory, flowEvents));
   let streamSubscription: StreamSubscription | null = null;
-  let refreshTimer: ReturnType<typeof setInterval> | null = null;
   let agents = $state<JsonRecord[]>([]);
   let modelCatalogs = $state<Record<string, JsonRecord[] | null>>({});
   // SvelteKit reuses this page while only route params change; slow refreshes must not repaint a previous ticket.
   let detailRequestSeq = 0;
 
   onMount(() => {
-    refreshTimer = setInterval(() => void loadTicketDetail(false), 10000);
+    unsubscribeReadModels = readModelEntityStore.subscribe((state) => {
+      readModelState = state;
+    });
     void loadPickerSupport();
   });
 
@@ -65,7 +85,7 @@
   }
 
   onDestroy(() => {
-    if (refreshTimer) clearInterval(refreshTimer);
+    unsubscribeReadModels?.();
     closeFlowStream();
   });
 
@@ -92,46 +112,44 @@
     sectionIssues = [];
     const cachedList = cachedTickets({ worktree: ownerId });
     if (showLoading && cachedList) renderCachedTicket(cachedList, ownerId, routeTicketId);
-    const [tickets, worktrees] = await Promise.all([pmaApi.ticketFlow.listTickets({ worktree: ownerId }), pmaApi.hub.listWorktrees()]);
+    const snapshot = await pmaApi.readModels.ticketDetail(routeTicketId, { kind: 'worktree', id: ownerId });
     if (!isCurrentRequest()) return;
-    if (!worktrees.ok) {
-      error = worktrees.error;
+    if (!snapshot.ok) {
+      error = snapshot.error;
       loading = false;
       return;
     }
-    const matchedWorktree = worktrees.data.find((worktree) => worktree.id === ownerId);
-    const redirectTo = legacyWorktreeRedirectPath(stripRuntimeBasePath(page.url.pathname), ownerId, matchedWorktree?.repoId ?? null);
+    const legacyTicket = (snapshot.data.legacyTicket ?? {}) as JsonRecord;
+    const parentRepoId = typeof legacyTicket.base_repo_id === 'string' ? legacyTicket.base_repo_id : null;
+    const redirectTo = legacyWorktreeRedirectPath(stripRuntimeBasePath(page.url.pathname), ownerId, parentRepoId);
     if (redirectTo) {
       await goto(href(redirectTo), { replaceState: true });
       return;
     }
-    const ticketList = dataOr(tickets, []);
-    if (tickets.ok) rememberTickets({ worktree: ownerId }, ticketList);
-    const selected = tickets.ok ? resolveTicketRouteId(ticketList, routeTicketId) : null;
-    if (!selected) {
-      error = tickets.ok
-        ? { kind: 'http', status: 404, code: 'ticket_not_found', message: `Ticket ${routeTicketId} was not found in worktree ${ownerId}.` }
-        : tickets.error;
-      loading = false;
-      return;
-    }
-    const ticketDetail = ticketDetailFromSummary(selected);
+    const loadedTicketList = (snapshot.data.scopedTickets ?? []).map(mapTicketSummary);
+    const loadedRuns = (snapshot.data.scopedRuns ?? []).map(mapPmaRunProgress);
+    const loadedChats = (snapshot.data.scopedChats ?? []).map(mapPmaChatSummary);
+    const ownerKey = scopedOwnerKey({ kind: 'worktree', id: ownerId, parentRepoId });
+    rememberTickets({ worktree: ownerId }, loadedTicketList);
+    readModelEntityStore.replaceScopedTicketSummaries(ownerKey, loadedTicketList);
+    readModelEntityStore.replaceScopedRuns(ownerKey, loadedRuns);
+    readModelEntityStore.upsertChatIndexRows(loadedChats.map(pmaChatSummaryToChatIndexRow));
+    const ticketList = selectTicketSummaries(readModelState, ownerKey);
+    const ticketDetail = mapTicketDetail(legacyTicket);
     detail = buildTicketDetailViewModel(ticketDetail, { tickets: ticketList, runs: [], chats: [], artifacts: [] });
     sectionIssues = [];
     loading = false;
-    const [runs, chats] = await Promise.all([pmaApi.ticketFlow.listRuns({ worktree: ownerId }), pmaApi.pma.listChats()]);
-    const baseIssues = [
-      !runs.ok ? partialPageIssue('timeline', 'Run state unavailable', runs.error) : null,
-      !chats.ok ? partialPageIssue('linked_chat', 'Chats unavailable', chats.error) : null
-    ].filter((issue): issue is PartialPageIssue => Boolean(issue));
+    const runs = selectPmaRuns(readModelState, ownerKey);
+    const chats = selectPmaChats(readModelState);
     if (!isCurrentRequest()) return;
-    await renderTicketDetail(ticketDetail, ticketList, dataOr(runs, []), dataOr(chats, []), baseIssues, ownerId, isCurrentRequest);
+    renderTicketDetail(ticketDetail, ticketList, runs, chats, snapshot.data.dispatches ?? [], [], ownerId, isCurrentRequest);
   }
 
   function renderCachedTicket(ticketList: TicketSummary[], ownerId: string, routeTicketId: string): void {
     if (ownerId !== worktreeId || routeTicketId !== ticketId) return;
     const selected = resolveTicketRouteId(ticketList, routeTicketId);
     if (!selected) return;
+    readModelEntityStore.replaceScopedTicketSummaries(scopedOwnerKey({ kind: 'worktree', id: ownerId }), ticketList);
     detail = buildTicketDetailViewModel(ticketDetailFromSummary(selected), {
       tickets: ticketList,
       runs: [],
@@ -141,15 +159,16 @@
     loading = false;
   }
 
-  async function renderTicketDetail(
+  function renderTicketDetail(
     ticketDetail: TicketDetail,
     ticketList: TicketSummary[],
     runs: PmaRunProgress[],
     chats: PmaChatSummary[],
+    dispatches: JsonRecord[],
     baseIssues: PartialPageIssue[],
     ownerId: string,
     isCurrentRequest = () => true
-  ): Promise<void> {
+  ): void {
     if (!isCurrentRequest()) return;
     const baseSource = { tickets: ticketList, runs, chats, artifacts: [] as SurfaceArtifact[] };
     const baseDetail = buildTicketDetailViewModel(ticketDetail, baseSource);
@@ -157,26 +176,11 @@
     detail = baseDetail;
     sectionIssues = baseIssues;
     loading = false;
-    const [dispatchResult, timelineResult, tailResult, statusResult] = await Promise.all([
-      currentRunId ? pmaApi.ticketFlow.getDispatchHistory(currentRunId, { worktree: ownerId }) : Promise.resolve(null),
-      baseDetail.linkedChatId ? pmaApi.pma.getTimeline(baseDetail.linkedChatId) : Promise.resolve(null),
-      baseDetail.linkedChatId ? pmaApi.pma.getTail(baseDetail.linkedChatId) : Promise.resolve(null),
-      baseDetail.linkedChatId ? pmaApi.pma.getStatus(baseDetail.linkedChatId) : Promise.resolve(null)
-    ]);
-    if (!isCurrentRequest()) return;
-    sectionIssues = [
-      ...baseIssues,
-      dispatchResult && !dispatchResult.ok ? partialPageIssue('timeline', 'Worker output unavailable', dispatchResult.error) : null,
-      timelineResult && !timelineResult.ok ? partialPageIssue('linked_chat', 'Ticket chat history unavailable', timelineResult.error) : null
-    ].filter((issue): issue is PartialPageIssue => Boolean(issue));
-    dispatchHistory = dispatchResult?.ok ? dispatchResult.data : [];
+    dispatchHistory = dispatches;
     if (currentRunId) connectFlowStream(currentRunId, ownerId);
-    const latestProgress = tailResult?.ok ? tailResult.data : statusResult?.ok ? statusResult.data : null;
     detail = buildTicketDetailViewModel(ticketDetail, {
       ...baseSource,
-      runs: mergeTicketRunProgress(runs, latestProgress),
-      artifacts: [],
-      timeline: timelineResult?.ok ? timelineResult.data : []
+      artifacts: []
     });
     loading = false;
   }
@@ -185,15 +189,28 @@
     closeFlowStream();
     streamSubscription = openFlowRunEventSource(runId, { worktree: ownerId }, {
       onEvent: (event) => {
-        flowEvents = [...flowEvents, { ...event.payload, seq: event.payload.seq ?? event.id }].slice(-120);
+        const payload = { ...event.payload, seq: event.payload.seq ?? event.id };
+        flowEvents = [...flowEvents, payload].slice(-120);
+        if (isTerminalFlowEvent(payload)) {
+          void loadTicketDetail(false, ownerId, ticketId);
+          closeFlowStream();
+        }
       },
-      onError: () => closeFlowStream()
+      onError: () => {
+        void loadTicketDetail(false, ownerId, ticketId);
+      }
     });
   }
 
   function closeFlowStream(): void {
     streamSubscription?.close();
     streamSubscription = null;
+  }
+
+  function isTerminalFlowEvent(payload: JsonRecord): boolean {
+    const status = String(payload.status ?? payload.flow_status ?? payload.state ?? '').toLowerCase();
+    const eventType = String(payload.event_type ?? payload.type ?? '').toLowerCase();
+    return ['completed', 'complete', 'done', 'failed', 'cancelled', 'canceled'].includes(status) || eventType.includes('terminal');
   }
 
   async function runCommand(command: 'resume' | 'bootstrap'): Promise<void> {
