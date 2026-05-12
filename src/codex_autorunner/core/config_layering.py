@@ -42,6 +42,9 @@ def _default_agents_section() -> Dict[str, Any]:
         "hermes": {
             "binary": "hermes",
         },
+        "claude": {
+            "binary": "claude",
+        },
     }
 
 
@@ -182,6 +185,7 @@ def _default_telegram_bot_section(
         config["agent_timeouts"] = {
             "codex": 7200,
             "opencode": 7200,
+            "claude": 7200,
         }
 
     return config

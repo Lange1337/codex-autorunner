@@ -14,6 +14,12 @@ from ..core.orchestration.catalog import KNOWN_CAPABILITIES
 from ..plugin_api import CAR_AGENT_ENTRYPOINT_GROUP, CAR_PLUGIN_API_VERSION
 from .aliased_harness import AliasedAgentHarness
 from .base import AgentHarness
+from .claude.harness import CLAUDE_CAPABILITIES, ClaudeHarness
+from .claude.supervisor import (
+    build_claude_supervisor_from_config,
+    claude_binary_available,
+    claude_runtime_preflight,
+)
 from .codex.harness import CodexHarness
 from .hermes.harness import HERMES_CAPABILITIES, HermesHarness
 from .hermes.supervisor import (
@@ -497,6 +503,57 @@ def _preflight_hermes_runtime(config: Any, target: AgentExecutionTarget) -> Any:
     )
 
 
+def _make_claude_harness(ctx: Any) -> AgentHarness:
+    cache = _runtime_supervisor_cache(ctx)
+    cache_key = ("claude", "claude", "")
+    supervisor = cache.get(cache_key)
+    if supervisor is None:
+        supervisor = getattr(ctx, "claude_supervisor", None)
+    if supervisor is None:
+        config = _resolve_runtime_agent_config(ctx)
+        if config is None:
+            raise RuntimeError("Claude harness unavailable: config missing")
+        logger = getattr(ctx, "logger", None)
+        supervisor = build_claude_supervisor_from_config(config, logger=logger)
+        if supervisor is None:
+            raise RuntimeError("Claude harness unavailable: binary not configured")
+        cache[cache_key] = supervisor
+        try:
+            ctx.claude_supervisor = supervisor
+        except AttributeError:
+            _logger.debug("claude_supervisor cache write skipped", exc_info=True)
+    return ClaudeHarness(supervisor)
+
+
+def _check_claude_health(ctx: Any) -> bool:
+    cache = _runtime_supervisor_cache(ctx)
+    supervisor = cache.get(("claude", "claude", ""))
+    if supervisor is None:
+        supervisor = getattr(ctx, "claude_supervisor", None)
+    if supervisor is not None:
+        return True
+    config = _resolve_runtime_agent_config(ctx)
+    if config is not None:
+        return claude_binary_available(config)
+    binary = getattr(ctx, "claude_binary", None)
+    if isinstance(binary, str) and binary.strip():
+        return claude_binary_available(
+            type(
+                "_InlineConfig",
+                (),
+                {
+                    "agent_binary": staticmethod(lambda _agent_id: binary.strip()),
+                },
+            )()
+        )
+    return False
+
+
+def _preflight_claude_runtime(config: Any, target: AgentExecutionTarget) -> Any:
+    _ = target
+    return claude_runtime_preflight(config)
+
+
 def wrap_requested_agent_context(
     delegate: Any, *, agent_id: str, profile: Optional[str] = None
 ) -> Any:
@@ -725,6 +782,15 @@ _BUILTIN_AGENTS: dict[str, AgentDescriptor] = {
         healthcheck=_check_hermes_health,
         runtime_preflight=_preflight_hermes_runtime,
         runtime_kind="hermes",
+    ),
+    "claude": AgentDescriptor(
+        id="claude",
+        name="Claude",
+        capabilities=CLAUDE_CAPABILITIES,
+        make_harness=_make_claude_harness,
+        healthcheck=_check_claude_health,
+        runtime_preflight=_preflight_claude_runtime,
+        runtime_kind="claude",
     ),
 }
 

@@ -421,6 +421,6 @@ def test_plugin_cannot_override_builtin() -> None:
     """Test that plugins cannot override built-in agent IDs."""
     agents = reload_agents()
 
-    builtin_ids = {"codex", "opencode", "hermes"}
+    builtin_ids = {"codex", "opencode", "hermes", "claude"}
     for builtin_id in builtin_ids:
         assert builtin_id in agents
