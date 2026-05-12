@@ -28,6 +28,7 @@ from ....core.git_utils import GitError, run_git
 from ....core.managed_processes import list_process_records
 from ....core.runtime import (
     DoctorReport,
+    claude_doctor_checks,
     doctor,
     hermes_doctor_checks,
     hub_destination_doctor_checks,
@@ -332,6 +333,7 @@ def register_doctor_commands(
                 + hub_worktree_checks
                 + hub_destination_checks
                 + hermes_doctor_checks(hub_config)
+                + claude_doctor_checks(hub_config)
                 + chat_checks
                 + chat_lab_checks
                 + timing_checks

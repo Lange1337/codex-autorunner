@@ -810,7 +810,7 @@ def _record_thread_compact_audit(
 
 def managed_thread_spawn(
     agent: Optional[str] = typer.Option(
-        None, "--agent", help="Thread agent to use (codex|opencode|hermes)"
+        None, "--agent", help="Thread agent to use (codex|opencode|hermes|claude)"
     ),
     scope: Optional[str] = typer.Option(
         None,

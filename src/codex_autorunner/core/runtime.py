@@ -969,7 +969,7 @@ def _configured_agent_ids(
                 for agent_id in raw_agents
                 if str(agent_id).strip()
             }
-    return {"codex", "opencode", "hermes"}
+    return {"codex", "opencode", "hermes", "claude"}
 
 
 def hub_worktree_doctor_checks(hub_config: HubConfig) -> list[DoctorCheck]:
@@ -1163,6 +1163,64 @@ def hub_destination_doctor_checks(hub_config: HubConfig) -> list[DoctorCheck]:
             )
         )
 
+    return checks
+
+
+def claude_doctor_checks(hub_config: HubConfig) -> list[DoctorCheck]:
+    """Report Claude Code CLI availability whenever a Claude agent is configured.
+
+    The check is intentionally lightweight (no alias/profile logic — Claude is a
+    single-binary agent) and uses the agent registry's runtime preflight.
+    """
+    checks: list[DoctorCheck] = []
+    configured_claude_agents: list[str] = []
+    for target in _configured_agent_execution_targets(hub_config):
+        descriptor = _get_agent_descriptor(target.runtime_agent_id, hub_config)
+        if descriptor is None:
+            continue
+        if _descriptor_runtime_kind(target.runtime_agent_id, descriptor) != "claude":
+            continue
+        configured_claude_agents.append(target.requested_agent_id)
+
+    configured_claude_agents = sorted(set(configured_claude_agents))
+    if not configured_claude_agents:
+        # No claude agent is configured for any repo — skip the check.
+        return checks
+
+    for agent_id in configured_claude_agents:
+        result = _run_agent_runtime_preflight(agent_id, context=hub_config)
+        check_name = (
+            "Claude runtime availability"
+            if agent_id == "claude"
+            else f"Claude runtime availability ({agent_id})"
+        )
+        check_id = (
+            "hub.claude.binary"
+            if agent_id == "claude"
+            else f"hub.claude.binary.{agent_id}"
+        )
+        if result.status == "ready":
+            detail = f" ({result.version})" if getattr(result, "version", None) else ""
+            checks.append(
+                DoctorCheck(
+                    name=check_name,
+                    passed=True,
+                    message=f"{result.message.rstrip('.')}{detail}.",
+                    severity="info",
+                    check_id=check_id,
+                )
+            )
+        else:
+            checks.append(
+                DoctorCheck(
+                    name=check_name,
+                    passed=False,
+                    message=result.message,
+                    severity="warning",
+                    check_id=check_id,
+                    fix=getattr(result, "fix", "") or "",
+                )
+            )
     return checks
 
 

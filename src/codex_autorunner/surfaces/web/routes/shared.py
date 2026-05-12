@@ -114,6 +114,19 @@ def build_hermes_terminal_cmd(binary: str) -> list[str]:
     return [binary]
 
 
+def build_claude_terminal_cmd(binary: str, model: Optional[str] = None) -> list[str]:
+    """Launch the Claude Code interactive CLI inside a PTY.
+
+    Claude's interactive mode starts when invoked with no ``--print`` flag.
+    A model alias can be passed through; everything else (workspace trust,
+    permission prompts, plugin loading) is handled by the binary itself.
+    """
+    cmd: list[str] = [binary]
+    if model:
+        cmd.extend(["--model", model])
+    return cmd
+
+
 def resolve_runner_status(engine, state) -> tuple[str, Optional[int], bool]:
     pid = state.runner_pid
     alive_pid = pid if pid and process_is_active(pid) else None
@@ -294,6 +307,7 @@ async def state_stream(
 __all__ = [
     "BYPASS_FLAGS",
     "SSE_HEADERS",
+    "build_claude_terminal_cmd",
     "build_codex_terminal_cmd",
     "build_hermes_terminal_cmd",
     "build_opencode_terminal_cmd",

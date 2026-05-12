@@ -248,6 +248,14 @@ class WorkspaceCommands(
             return False
         return resolve_opencode_binary(binary) is not None
 
+    def _claude_available(self) -> bool:
+        binary = self._config.agent_binaries.get("claude")
+        if not binary:
+            return False
+        from .....core.utils import resolve_executable
+
+        return bool(resolve_executable(binary))
+
     async def _fetch_model_list(
         self,
         record: Optional["TelegramTopicRecord"],

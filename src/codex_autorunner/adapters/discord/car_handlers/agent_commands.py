@@ -365,6 +365,11 @@ async def handle_car_model(
                     _fallback_model_text("No models found from OpenCode."),
                 )
                 return
+        elif current_agent == "claude":
+            # Claude's model list is static and known at the harness level.
+            from ....agents.claude.harness import _CLAUDE_MODELS  # type: ignore[attr-defined]
+
+            model_items = [(spec.id, spec.display_name) for spec in _CLAUDE_MODELS]
         else:
             try:
                 client = await service._client_for_workspace(

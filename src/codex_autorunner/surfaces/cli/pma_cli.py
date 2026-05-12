@@ -109,7 +109,7 @@ def _is_json_response_error(data: dict) -> Optional[str]:
 def pma_chat(
     message: str = typer.Argument(..., help="Message to send to PMA"),
     agent: Optional[str] = typer.Option(
-        None, "--agent", help="Agent to use (codex|opencode|hermes)"
+        None, "--agent", help="Agent to use (codex|opencode|hermes|claude)"
     ),
     model: Optional[str] = typer.Option(None, "--model", help="Model override"),
     reasoning: Optional[str] = typer.Option(
@@ -571,7 +571,7 @@ def pma_agents(
 
 @pma_app.command("models")
 def pma_models(
-    agent: str = typer.Argument(..., help="Agent ID (codex|opencode|hermes)"),
+    agent: str = typer.Argument(..., help="Agent ID (codex|opencode|hermes|claude)"),
     output_json: bool = typer.Option(False, "--json", help="Emit JSON output"),
     path: Optional[Path] = hub_root_path_option(),
 ):

@@ -84,7 +84,7 @@ class TestSurfaceSync:
 
 class TestAgentSync:
     def test_agent_dirs_exist_on_disk(self):
-        expected = {"codex", "opencode", "hermes", "acp"}
+        expected = {"codex", "opencode", "hermes", "claude", "acp"}
         actual = _actual_dirs(AGENTS_DIR)
         for name in expected:
             assert name in actual, f"Agent dir missing from disk: {name}"

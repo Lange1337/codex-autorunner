@@ -14,7 +14,7 @@ DEFAULT_CHAT_AGENT = "codex"
 AgentModelResetMode = Literal["clear", "agent_default"]
 CHAT_EFFORT_CAPABILITY = "review"
 
-VALID_CHAT_AGENT_VALUES: Tuple[str, ...] = ("codex", "opencode", "hermes")
+VALID_CHAT_AGENT_VALUES: Tuple[str, ...] = ("codex", "opencode", "hermes", "claude")
 
 
 @dataclass(frozen=True)
@@ -35,6 +35,7 @@ CHAT_AGENT_DEFINITIONS: tuple[ChatAgentDefinition, ...] = (
     ChatAgentDefinition(value="codex", description="Codex"),
     ChatAgentDefinition(value="opencode", description="OpenCode"),
     ChatAgentDefinition(value="hermes", description="Hermes"),
+    ChatAgentDefinition(value="claude", description="Claude"),
 )
 
 

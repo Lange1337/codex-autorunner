@@ -22,6 +22,7 @@ from ..pty_session import REPLAY_END, ActiveSession, PTYSession
 from ..schemas import VersionResponse
 from ..services import terminal as terminal_service
 from .shared import (
+    build_claude_terminal_cmd,
     build_codex_terminal_cmd,
     build_hermes_terminal_cmd,
     build_opencode_terminal_cmd,
@@ -240,6 +241,11 @@ def build_base_routes() -> APIRouter:
                 if agent == "opencode":
                     cmd = build_opencode_terminal_cmd(
                         engine.config.agent_binary("opencode"),
+                        model,
+                    )
+                elif agent == "claude":
+                    cmd = build_claude_terminal_cmd(
+                        engine.config.agent_binary("claude"),
                         model,
                     )
                 elif agent == "hermes":

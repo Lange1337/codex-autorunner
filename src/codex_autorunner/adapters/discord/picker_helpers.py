@@ -293,6 +293,11 @@ async def list_model_items_for_binding(
             service,
             workspace_path=binding.get("workspace_path"),
         )
+    if agent == "claude":
+        # Claude exposes a static set of model aliases; no remote lookup needed.
+        from ...agents.claude.harness import _CLAUDE_MODELS  # type: ignore[attr-defined]
+
+        return [(spec.id, spec.display_name) for spec in _CLAUDE_MODELS][: max(1, limit)]
     client = await service._client_for_workspace(binding.get("workspace_path"))
     if client is None:
         return None

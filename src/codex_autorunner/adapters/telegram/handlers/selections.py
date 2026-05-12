@@ -152,6 +152,14 @@ class TelegramSelectionHandlers(ChatSelectionHandlers):
                 "OpenCode binary not found. Install opencode or switch to /agent codex.",
             )
             return
+        if desired == "claude" and not self._claude_available():
+            await self._answer_callback(callback, "Claude missing")
+            await self._finalize_selection(
+                key,
+                callback,
+                "Claude binary not found. Install Claude Code (claude) or switch to /agent codex.",
+            )
+            return
         if (
             desired == "hermes"
             and self._hermes_profile_options()

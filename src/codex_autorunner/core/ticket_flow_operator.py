@@ -922,7 +922,7 @@ def ticket_flow_preflight(repo_root: Path, *, config: Any = None) -> PreflightRe
             )
 
     for agent in agents:
-        if agent in ("codex", "opencode", "user"):
+        if agent in ("codex", "opencode", "claude", "user"):
             continue
         agent_warnings.append(
             f"{agent}: availability not verified; ensure its backend is configured."

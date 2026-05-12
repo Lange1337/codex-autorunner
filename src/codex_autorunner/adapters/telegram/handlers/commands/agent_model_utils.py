@@ -132,6 +132,14 @@ async def _handle_agent_command(
             reply_to=message.message_id,
         )
         return
+    if desired == "claude" and not commands._claude_available():
+        await commands._send_message(
+            message.chat_id,
+            "Claude binary not found. Install Claude Code or switch to /agent codex.",
+            thread_id=message.thread_id,
+            reply_to=message.message_id,
+        )
+        return
     if desired == current:
         if desired != "hermes" or desired_profile == current_profile:
             await commands._send_message(
